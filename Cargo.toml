@@ -1,0 +1,35 @@
+[package]
+name = "ghitabrowser"
+version = "0.0.0"
+edition = "2021"
+authors = ["You"]
+description = "A lightweight Rust browser optimized faster than Chrome"
+license = "MIT"
+
+[dependencies]
+# Window management
+winit = { version = "0.29", features = ["serde"] }
+
+# Iced GUI framework - using tokio feature instead of async
+iced = { version = "0.12", features = ["tokio"] }
+
+# Image handling
+image = "0.24"
+
+# Raw window handle interop
+raw-window-handle = "0.5"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Utilities
+anyhow = "1.0"
+dirs = "5.0"
+
+[build-dependencies]
+winres = "0.1"
+
+[dev-dependencies]
+criterion = "0.5"
+rstest = "0.18"
