@@ -26,5 +26,5 @@ impl Profiler {
 }
 
 pub fn optimized_layout(root: &mut LayoutNode, viewport_width: u32, _profiler: &Profiler) {
-    super::layout::perform_layout(root, viewport_width);
+    super::layout::perform_layout(root, viewport_width as f64);
 }

@@ -1,52 +1,92 @@
-# GhitaBrowser
+# GhitaBrowser 🦀
 
-![GhitaBrowser Logo](file:///f:/Project%20of%20Ghita/GhitaBrowser/logo.png)
+![GhitaBrowser Logo](logo.png)
 
 A lightweight Rust browser optimized faster than Chrome, built from scratch with no external reference code or libraries.
 
 ## Overview
 
-GhitaBrowser is a complete web browser implementation written entirely in safe Rust. It includes:
+GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.0.1).
 
-- **HTML Parser**: Parses HTML into a DOM tree with attribute handling
-- **CSS Parser**: Computes styles for elements
-- **Layout Engine**: Box model layout with block/inline support
-- **Text Renderer**: ASCII art rendering of rendered content
-- **Image Loader**: Image caching system
-- **Window Manager**: Native window integration via winit
-- **UI Framework**: Iced widget toolkit integration
-- **Tab Management**: Multi-tab browsing with history navigation
-- **Storage**: Cookies and localStorage persistence
-- **JavaScript Engine**: Lightweight expression evaluator
-- **Performance Optimizations**: Profiling, caching, memory monitoring
+### v0.0.1 New Features
+
+- ✅ **Real HTTP/HTTPS networking** via `ureq` (was stub)
+- ✅ **HTML5 parser** with error recovery, script/style raw text, HTML entities, comments
+- ✅ **Advanced CSS engine** with class/ID/tag selectors, specificity, shorthand properties, 20+ CSS properties
+- ✅ **Layout engine** with text wrapping, auto-height, percentage widths, full box model
+- ✅ **JavaScript engine** with variables (`let`), functions, `if`/`while` control flow, `console.log`
+- ✅ **Persistent storage** via `serde`+`serde_json` for cookies & localStorage
+- ✅ **Full UI integration** connecting GUI with real Browser engine, cache, storage
+- ✅ **74 unit tests** across all modules
+- ✅ **Resource cache** with TTL-based expiry and hit/miss tracking
+
+### Core Components
+
+| Module | Description | Status |
+|--------|-------------|--------|
+| **Network** | Real HTTP/HTTPS via ureq, ResourceCache with TTL | ✅ v0.0.1 |
+| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.0.1 |
+| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.0.1 |
+| **Layout** | Box model, text wrapping, block/inline, auto-height | ✅ v0.0.1 |
+| **Renderer** | ASCII text rendering of layout tree | ✅ v0.0.1 |
+| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.0.1 |
+| **Storage** | CookieStore + LocalStorage with serde persistence | ✅ v0.0.1 |
+| **UI (Iced)** | Tab bar, navigation, URL bar, status bar, dev tools | ✅ v0.0.1 |
+| **Image Loader** | Image cache with memory management | ✅ v0.0.1 |
+| **Performance** | Profiler with per-phase timing | ✅ v0.0.1 |
+| **Window** | winit-based native window with icon | ✅ v0.0.0 |
 
 ## Architecture
 
-The project follows a 24-phase development plan spanning multiple areas:
+The project follows a phased development plan:
 
 | Phase | Area | Status |
 |-------|------|--------|
-| 1-2 | Project setup & HTTP fetching | ✅ Complete |
-| 3-4 | HTML parser with DOM construction | ✅ Complete |
-| 5-6 | CSS parser & style computation | ✅ Complete |
-| 7-8 | Layout engine for block elements | ✅ Complete |
-| 9-10 | Text rendering | ✅ Complete |
-| 11-12 | Image loading pipeline | ✅ Complete |
-| 13 | Window manager (winit) | ✅ Complete |
-| 14 | UI framework structure (Iced) | ✅ Complete |
-| 15-16 | Tab management system | ✅ Complete |
-| 17-18 | Storage (cookies, localStorage) | ✅ Complete |
-| 19-20 | JavaScript engine integration | ✅ Complete |
-| 21-22 | Performance optimization | ✅ Complete |
-| 23-24 | Testing & release documentation | ✅ Complete |
+| 1-2 | Project setup & HTTP fetching | ✅ v0.0.1 (Real ureq) |
+| 3-4 | HTML parser with DOM construction | ✅ v0.0.1 (Error recovery) |
+| 5-6 | CSS parser & style computation | ✅ v0.0.1 (Selectors, specificity) |
+| 7-8 | Layout engine with text wrapping | ✅ v0.0.1 (Box model) |
+| 9-10 | Text rendering | ✅ v0.0.1 |
+| 11-12 | Image loading pipeline | ✅ v0.0.1 |
+| 13 | Window manager (winit) | ✅ v0.0.0 |
+| 14 | UI framework (Iced) | ✅ v0.0.1 (Full integration) |
+| 15-16 | Tab management system | ✅ v0.0.1 |
+| 17-18 | Storage (cookies, localStorage) | ✅ v0.0.1 (Persistent) |
+| 19-20 | JavaScript engine | ✅ v0.0.1 (Variables, functions) |
+| 21-22 | Performance optimization | ✅ v0.0.1 |
+| 23-24 | Testing & release documentation | ✅ v0.0.1 (74 tests) |
 
-## Running the Application
+## Building
 
+```bash
+# Clone the repository
+git clone https://github.com/GhitaBrowser/ghitabrowser.git
+cd ghitabrowser
 
+# Build (release)
+cargo build --release
 
-## Module Structure
+# Run
+cargo run --release
 
+# Run tests
+cargo test
+```
 
+## Dependencies
+
+- **winit** 0.29 - Native window creation
+- **iced** 0.12 - GUI framework
+- **ureq** 2.9 - HTTP/HTTPS client
+- **serde** + **serde_json** - Serialization
+- **image** 0.24 - Image decoding
+- **chrono** 0.4 - Date/time for cookies
+- **url** 2.5 - URL parsing
+- **log** + **env_logger** - Logging
+
+## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 

@@ -5,7 +5,7 @@ use rstest::rstest;
 #[rstest]
 #[case("<html><title>Test</title></html>")]
 #[case("<div><h1>Hello</h1><p>World</p></div>")]
-#[case('<a href="https://example.com">Link</a>')]
+#[case("<a href='https://example.com'>Link</a>")]
 #[case("<p class=\"test\">Paragraph</p>")]
 fn test_parser_case(#[case] html: &str) {
     let element = parse_html(html);
@@ -44,8 +44,8 @@ fn test_find_tag(#[case] tag: &str) {
 }
 
 #[rstest]
-#[case('<a href="https://google.com">Google</a>', "Google", "https://google.com")]
-#[case('<a href="https://github.com">GitHub</a>', "GitHub", "https://github.com")]
+#[case("<a href='https://google.com'>Google</a>", "Google", "https://google.com")]
+#[case("<a href='https://github.com'>GitHub</a>", "GitHub", "https://github.com")]
 fn test_anchor_element(#[case] html: &str, #[case] expected_text: &str, #[case] expected_href: &str) {
     let element = parse_html(html);
     let anchors = element.find_all_tags("a");

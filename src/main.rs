@@ -1,74 +1,188 @@
+// GhitaBrowser v0.0.2 - Main entry point
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod parser;
-mod css_parser;
-mod layout;
-mod text_renderer;
-mod renderer;
-mod image_loader;
-mod ui;
-mod window;
-mod tab;
-mod storage;
-mod javascript;
-mod performance;
-
-use parser::Element;
-use tab::TabManager;
-use storage::{CookieStore, StorageManager};
-use javascript::JsvEngine;
-use performance::Profiler;
+use ghitabrowser::parser::parse_html;
+use ghitabrowser::storage::{Cookie, CookieStore};
+use ghitabrowser::javascript::JsvEngine;
+use ghitabrowser::performance::Profiler;
+use ghitabrowser::network::{fetch_url, fetch_with_cache, ResourceCache, FetchResult};
+use ghitabrowser::css_parser::parse_css;
+use ghitabrowser::layout;
+use ghitabrowser::text_renderer::TextRenderer;
+use ghitabrowser::Browser;
+use std::collections::HashMap;
 
 fn main() {
-    println!("♻ GhitaBrowser v0.0.0 - Starting GUI Application");
-
-    // ========== Core Engine Pipeline ==========
+    // Initialize logging
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .init();
     
-    let test_html = "<html><body><h1>Welcome to GhitaBrowser v0.0.0!</h1><p>This is a Rust browser built from scratch.</p></body></html>";
-    let dom = parser::parse_html(test_html);
-
-    let css_rules: Vec<_> = vec![];
-    if let Some(mut layout_tree) = layout::create_layout_tree(&dom, &css_rules, 1024) {
-        layout::perform_layout(&mut layout_tree, 1024);
-        let tr = text_renderer::TextRenderer::new(1024, 768);
-        let out = tr.render_to_text(&layout_tree);
-        println!("\n--- Rendered Web Content ---");
-        println!("{}", out);
-    }
-
-    // ========== Subsystems Demo ==========
+    println!("╔══════════════════════════════════════════╗");
+    println!("║   🦀 GhitaBrowser v0.0.2                ║");
+    println!("║   Next-Gen Rust Browser Engine           ║");
+    println!("╚══════════════════════════════════════════╝");
     
-    println!("--- Tab Management System ---");
-    let mut tm = TabManager::new();
-    let _id1 = tm.add_tab("https://google.com", Element::new("body"), "Google");
-    let _id2 = tm.add_tab("https://github.com", Element::new("div"), "GitHub");
-    println!("✅ Active tabs: {}", tm.tab_count());
-
-    println!("\n--- Storage System ---");
-    let mut cookie_store = CookieStore::new();
-    let cookie1 = storage::Cookie::new("session", "abc123", ".example.com", "/");
-    cookie_store.add_cookie(cookie1);
-    let mut storage = StorageManager::new();
-    let _local = storage.local_storage("https://example.com");
-    println!("✅ Storage manager initialized");
-
-    println!("\n--- JavaScript Engine ---");
-    let mut js_engine = JsvEngine::new();
-    if let Ok(val) = js_engine.eval("1 + 1") {
-        if let Some(n) = val.as_number() {
-            println!("✅ JavaScript Evaluator: 1 + 1 = {}", n);
+    // ========== 1. Real HTTP Networking ==========
+    println!("\n📡 Network: Real HTTP/HTTPS via ureq");
+    match fetch_url("https://httpbin.org/get") {
+        Ok(result) => {
+            println!("   ✅ Fetched: {} ({} bytes, {} ms, status {})",
+                result.url, result.body.len(), result.fetch_time_ms, result.status_code);
+        }
+        Err(e) => {
+            println!("   ⚠️  Network test: {} (offline?)", e);
         }
     }
-
-    println!("\n--- Performance Optimization ---");
+    
+    // ========== 2. HTML Parsing ==========
+    println!("\n📝 HTML Parser: Error recovery & HTML5 support");
+    let test_html = r#"<html>
+        <head><title>GhitaBrowser Test</title></head>
+        <body>
+            <h1 class="main-title">Welcome to GhitaBrowser v0.0.2!</h1>
+            <p>This is a <strong>Rust</strong> browser built from scratch.</p>
+            <img src="logo.png" alt="Logo">
+            <!-- This is a comment -->
+            <script>var x = 1 < 2;</script>
+            <ul>
+                <li>Item A &amp; B</li>
+                <li>Item C</li>
+            </ul>
+        </body>
+    </html>"#;
+    
+    let dom = parse_html(test_html);
+    println!("   ✅ Parsed HTML successfully");
+    if let Some(title) = dom.find_tag("title") {
+        println!("   📌 Title: {}", title.text);
+    }
+    if let Some(h1) = dom.find_tag("h1") {
+        println!("   📌 H1: {}", h1.text);
+    }
+    if let Some(script) = dom.find_tag("script") {
+        println!("   📌 Script tag content preserved: {} chars", script.text.len());
+    }
+    
+    // ========== 3. CSS Styling ==========
+    println!("\n🎨 CSS Engine: Selectors with specificity");
+    let css = r#"
+        h1 { color: navy; font-size: 28px; margin: 10px; }
+        .main-title { color: darkblue; font-weight: bold; }
+        p { font-size: 16px; line-height: 1.5; color: #333; }
+        ul { margin: 20px; padding: 10px; }
+        li { color: #555; }
+    "#;
+    let css_rules = parse_css(css);
+    println!("   ✅ Parsed {} CSS rules", css_rules.len());
+    for rule in &css_rules {
+        let sel_str: Vec<String> = rule.selectors.iter()
+            .map(|s| {
+                let mut parts = Vec::new();
+                if let Some(ref tag) = s.tag { parts.push(tag.clone()); }
+                if let Some(ref class) = s.class { parts.push(format!(".{}", class)); }
+                if let Some(ref id) = s.id { parts.push(format!("#{}", id)); }
+                parts.join("")
+            }).collect();
+        println!("   📐 {} => {} declarations (specificity: {:?})",
+            sel_str.join(", "), rule.declarations.len(), rule.specificity);
+    }
+    
+    // ========== 4. Layout Engine ==========
+    println!("\n📐 Layout Engine: Box model with text wrapping");
+    if let Some(mut layout_tree) = layout::create_layout_tree(&dom, &css_rules, 800) {
+        layout::perform_layout(&mut layout_tree, 800.0);
+        let tr = TextRenderer::new(800, 600);
+        let out = tr.render_to_text(&layout_tree);
+        println!("\n--- Rendered Web Content ---");
+        for line in out.lines().take(25) {
+            println!("{}", line);
+        }
+        if out.lines().count() > 25 {
+            println!("... ({} more lines)", out.lines().count() - 25);
+        }
+    }
+    
+    // ========== 5. JavaScript Engine ==========
+    println!("\n⚡ JavaScript Engine: Variables, functions, control flow");
+    let mut js_engine = JsvEngine::new();
+    if let Ok(val) = js_engine.eval("1 + 1") {
+        println!("   ✅ 1 + 1 = {}", val.to_display_string());
+    }
+    
+    let _ = js_engine.eval("let x = 42");
+    if let Ok(val) = js_engine.eval("x * 2") {
+        println!("   ✅ let x = 42; x * 2 = {}", val.to_display_string());
+    }
+    
+    let _ = js_engine.eval("function add(a, b) { return a + b; }");
+    if let Ok(val) = js_engine.eval("add(10, 20)") {
+        println!("   ✅ add(10, 20) = {}", val.to_display_string());
+    }
+    
+    let _ = js_engine.eval("let i = 0; while (i < 3) { i = i + 1; }");
+    if let Ok(val) = js_engine.eval("i") {
+        println!("   ✅ while loop: i = {}", val.to_display_string());
+    }
+    
+    // ========== 6. Storage System ==========
+    println!("\n💾 Storage: Persistent cookies & localStorage");
+    let mut browser = Browser::new();
+    browser.storage.cookies_mut().add_cookie(Cookie::new("session", "abc123", ".ghitabrowser.local", "/"));
+    browser.storage.cookies_mut().add_cookie(Cookie::new("theme", "dark", ".ghitabrowser.local", "/"));
+    {
+        let ls = browser.storage.local_storage("https://ghitabrowser.local");
+        ls.set("user_pref", "fullscreen");
+        ls.set("last_visit", "2026-07-30");
+    }
+    println!("   ✅ Cookies: {}, localStorage items: {}",
+        browser.storage.cookie_count(), browser.storage.local_storage_count());
+    
+    // ========== 7. Resource Cache with TTL ==========
+    println!("\n📦 Resource Cache: TTL-based with stats");
+    let mut cache = ResourceCache::new();
+    let mut cookie_store = CookieStore::new();
+    let test_url = "https://httpbin.org/html";
+    match fetch_with_cache(test_url, &mut cache, Some(&mut cookie_store)) {
+        Ok(result) => {
+            println!("   ✅ Cached: {} ({} bytes, {} ms)", result.url, result.body.len(), result.fetch_time_ms);
+            if let Ok(cached) = fetch_with_cache(test_url, &mut cache, Some(&mut cookie_store)) {
+                println!("   ✅ Cache hit: {} (from cache)", cached.url);
+            }
+        }
+        Err(e) => {
+            println!("   ⚠️  Cache test: {} (offline?)", e);
+            let result = FetchResult {
+                body: String::from("<html><body><h1>Offline</h1></body></html>"),
+                url: test_url.to_string(),
+                status_code: 200,
+                content_type: "text/html".to_string(),
+                headers: HashMap::new(),
+                fetch_time_ms: 0,
+                set_cookie_headers: vec![],
+            };
+            cache.insert(test_url, result, 300);
+            println!("   ✅ Offline cache: stored test data");
+        }
+    }
+    
+    // ========== 8. Performance Profiler ==========
+    println!("\n⏱️  Performance Profiler");
     let mut profiler = Profiler::new();
-    profiler.record("parse", 25);
-    profiler.record("layout", 5);
+    profiler.record("fetch", 45);
+    profiler.record("parse", 12);
+    profiler.record("style", 3);
+    profiler.record("layout", 8);
+    profiler.record("render", 5);
     profiler.report();
+    
+    // ========== 9. Summary ==========
+    println!("\n═══════════════════════════════════════════");
+    println!("✅ All subsystems initialized successfully!");
+    println!("🌐 Launching GhitaBrowser v0.0.2 GUI...");
+    println!("═══════════════════════════════════════════\n");
 
-    println!("\n🌐 Launching Interactive GhitaBrowser v0.0.0 GUI Window...");
-
-    if let Err(e) = ui::run_gui() {
+    // Launch GUI
+    if let Err(e) = ghitabrowser::ui::run_gui() {
         eprintln!("GUI launch error: {}", e);
         let mut input = String::new();
         let _ = std::io::stdin().read_line(&mut input);

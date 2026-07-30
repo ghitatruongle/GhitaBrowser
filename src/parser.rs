@@ -8,6 +8,8 @@ pub struct Element {
     pub attrs: HashMap<String, String>,
     pub children: Vec<Element>,
     pub text: String,
+    /// Whether this is a self-closing or void element
+    pub is_void: bool,
 }
 
 impl Element {
@@ -17,6 +19,7 @@ impl Element {
             attrs: HashMap::new(),
             children: Vec::new(),
             text: String::new(),
+            is_void: false,
         }
     }
 
@@ -56,13 +59,164 @@ impl Element {
         }
         results
     }
+    
+    /// Get element text content recursively
+    pub fn text_content(&self) -> String {
+        let mut result = String::new();
+        if !self.text.is_empty() {
+            result.push_str(&self.text);
+        }
+        for child in &self.children {
+            result.push_str(&child.text_content());
+        }
+        result
+    }
+    
+    /// Serialize back to HTML string (for debugging)
+    pub fn to_html(&self) -> String {
+        let mut html = String::new();
+        
+        if self.tag == "root" {
+            for child in &self.children {
+                html.push_str(&child.to_html());
+            }
+            return html;
+        }
+        
+        let mut attrs_str = String::new();
+        for (k, v) in &self.attrs {
+            attrs_str.push_str(&format!(" {}=\"{}\"", k, v));
+        }
+        
+        if self.is_void {
+            html.push_str(&format!("<{}{} />", self.tag, attrs_str));
+        } else {
+            html.push_str(&format!("<{}{}>", self.tag, attrs_str));
+            if !self.text.is_empty() {
+                html.push_str(&escape_html(&self.text));
+            }
+            for child in &self.children {
+                html.push_str(&child.to_html());
+            }
+            html.push_str(&format!("</{}>", self.tag));
+        }
+        
+        html
+    }
 }
 
-/// Simple HTML parser that constructs a real DOM tree
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Decode HTML character references
+fn decode_html_entities(text: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    
+    while i < len {
+        if chars[i] == '&' {
+            let start = i;
+            while i < len && chars[i] != ';' {
+                i += 1;
+            }
+            if i < len && chars[i] == ';' {
+                let entity: String = chars[start + 1..i].iter().collect();
+                    let decoded: String = match entity.as_str() {
+                        "amp" => "&".to_string(),
+                        "lt" => "<".to_string(),
+                        "gt" => ">".to_string(),
+                        "quot" => "\"".to_string(),
+                        "apos" => "'".to_string(),
+                        "nbsp" => " ".to_string(),
+                        "copy" => "©".to_string(),
+                        "reg" => "®".to_string(),
+                        "trade" => "™".to_string(),
+                        _ => {
+                            // Try numeric character reference
+                            if let Some(hex) = entity.strip_prefix("#x") {
+                                if let Ok(codepoint) = u32::from_str_radix(hex, 16) {
+                                    if let Some(c) = char::from_u32(codepoint) {
+                                        c.to_string()
+                                    } else {
+                                        format!("&{};", entity)
+                                    }
+                                } else {
+                                    format!("&{};", entity)
+                                }
+                            } else if let Some(dec) = entity.strip_prefix('#') {
+                                if let Ok(codepoint) = dec.parse::<u32>() {
+                                    if let Some(c) = char::from_u32(codepoint) {
+                                        c.to_string()
+                                    } else {
+                                        format!("&{};", entity)
+                                    }
+                                } else {
+                                    format!("&{};", entity)
+                                }
+                            } else {
+                                format!("&{};", entity)
+                            }
+                        }
+                    };
+                    result.push_str(&decoded);
+                i += 1; // skip ';'
+            } else {
+                result.push(chars[start]);
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    
+    result
+}
+
+/// Tags that are always self-closing/void in HTML5
+fn is_void_tag(tag: &str) -> bool {
+    matches!(tag,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
+        | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    )
+}
+
+/// Tags that contain raw text (no inner HTML parsing)
+fn is_raw_text_tag(tag: &str) -> bool {
+    matches!(tag, "script" | "style" | "textarea" | "pre")
+}
+
+/// Tags that don't need closing (optional closing tags in HTML5)
+fn is_optional_closing_tag(tag: &str) -> bool {
+    matches!(tag, "p" | "li" | "dt" | "dd" | "option" | "thead" | "tbody" | "tfoot" | "tr" | "th" | "td")
+}
+
+/// Autoclose mapping: when we encounter an opening tag, some parent tags should auto-close
+fn should_auto_close_parent(parent_tag: &str, child_tag: &str) -> bool {
+    matches!(
+        (parent_tag, child_tag),
+        ("p", "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "div" | "ul" | "ol" | "dl" | "table" | "form" | "section" | "article" | "header" | "footer" | "nav" | "main" | "aside")
+            | ("li", "li")
+            | ("dt" | "dd", "dt" | "dd")
+            | ("option", "option")
+            | ("tr", "tr" | "th" | "td")
+            | ("th" | "td", "th" | "td")
+            | ("thead" | "tbody" | "tfoot", "thead" | "tbody" | "tfoot" | "tr")
+    )
+}
+
+/// Improved HTML parser with error recovery and raw text support
 pub fn parse_html(html: &str) -> Element {
     let html = html.trim();
     if html.is_empty() {
-        return Element::new("body");
+        let mut body = Element::new("body");
+        body.text = String::new();
+        return body;
     }
 
     let mut stack: Vec<Element> = Vec::new();
@@ -82,41 +236,93 @@ pub fn parse_html(html: &str) -> Element {
                 while pos < len && chars[pos] != '>' {
                     pos += 1;
                 }
-                let _close_tag: String = chars[start..pos].iter().collect();
+                let close_tag: String = chars[start..pos].iter().collect();
+                let close_tag = close_tag.trim().to_lowercase();
                 pos += 1; // skip '>'
 
+                // Pop stack until we find matching tag (error recovery)
                 if stack.len() > 1 {
-                    let completed = stack.pop().unwrap();
-                    if let Some(parent) = stack.last_mut() {
-                        parent.add_child(completed);
+                    let mut found = false;
+                    for depth in (0..stack.len()).rev() {
+                        if stack[depth].tag == close_tag {
+                            // Pop elements down to and including the match
+                            while stack.len() > depth + 1 {
+                                let completed = stack.pop().unwrap();
+                                if let Some(parent) = stack.last_mut() {
+                                    parent.add_child(completed);
+                                }
+                            }
+                            let completed = stack.pop().unwrap();
+                            if let Some(parent) = stack.last_mut() {
+                                parent.add_child(completed);
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    // If no matching open tag, silently ignore (HTML5 error recovery)
+                    if !found && is_optional_closing_tag(&close_tag) {
+                        // Just continue - it'll be handled by auto-close
                     }
                 }
             } else if pos + 1 < len && (chars[pos + 1] == '!' || chars[pos + 1] == '?') {
-                // Comment or doctype: skip until '>'
-                while pos < len && chars[pos] != '>' {
-                    pos += 1;
-                }
-                if pos < len {
-                    pos += 1;
+                // Comment or doctype or processing instruction
+                if pos + 3 < len && &html[pos..pos+4] == "<!--" {
+                    // HTML comment: skip until -->
+                    pos += 4;
+                    while pos + 2 < len && !(chars[pos] == '-' && chars[pos+1] == '-' && chars[pos+2] == '>') {
+                        pos += 1;
+                    }
+                    pos += 3; // skip -->
+                } else if pos + 8 < len && html[pos..pos+9].to_uppercase() == "<!DOCTYPE" {
+                    // DOCTYPE: skip until >
+                    while pos < len && chars[pos] != '>' {
+                        pos += 1;
+                    }
+                    if pos < len { pos += 1; }
+                } else {
+                    // Other markup (<?xml?>, <![CDATA[]]>, etc.)
+                    while pos < len && chars[pos] != '>' {
+                        pos += 1;
+                    }
+                    if pos < len { pos += 1; }
                 }
             } else {
-                // Opening tag: <tag attr="val"> or <tag/>
+                // Opening tag or self-closing
                 pos += 1; // skip '<'
+                
+                // Skip whitespace after <
+                while pos < len && chars[pos].is_whitespace() {
+                    pos += 1;
+                }
+                
+                // Read tag name
                 let start = pos;
-                while pos < len && chars[pos] != '>' && chars[pos] != '/' && !chars[pos].is_whitespace() {
+                while pos < len && chars[pos] != '>' && chars[pos] != '/' 
+                    && !chars[pos].is_whitespace() && chars[pos] != '<' 
+                {
                     pos += 1;
                 }
                 let tag_name: String = chars[start..pos].iter().collect();
                 let tag_name = tag_name.trim().to_lowercase();
 
                 if tag_name.is_empty() {
+                    // Malformed < or <<, skip
+                    while pos < len && chars[pos] != '>' {
+                        pos += 1;
+                    }
+                    if pos < len { pos += 1; }
                     continue;
                 }
 
                 let mut elem = Element::new(&tag_name);
 
+                // Check for raw text tags (script/style) - handle their content specially
+                let is_raw = is_raw_text_tag(&tag_name);
+
                 // Parse attributes
                 while pos < len && chars[pos] != '>' && chars[pos] != '/' {
+                    // Skip whitespace
                     while pos < len && chars[pos].is_whitespace() {
                         pos += 1;
                     }
@@ -124,12 +330,17 @@ pub fn parse_html(html: &str) -> Element {
                         break;
                     }
 
+                    // Attribute name
                     let k_start = pos;
-                    while pos < len && chars[pos] != '=' && chars[pos] != '>' && chars[pos] != '/' && !chars[pos].is_whitespace() {
+                    while pos < len && chars[pos] != '=' && chars[pos] != '>' 
+                        && chars[pos] != '/' && !chars[pos].is_whitespace() 
+                    {
                         pos += 1;
                     }
-                    let key: String = chars[k_start..pos].iter().collect();
+                    let mut key: String = chars[k_start..pos].iter().collect();
+                    key = key.to_lowercase();
 
+                    // Skip whitespace before =
                     while pos < len && chars[pos].is_whitespace() {
                         pos += 1;
                     }
@@ -137,10 +348,13 @@ pub fn parse_html(html: &str) -> Element {
                     let mut val = String::new();
                     if pos < len && chars[pos] == '=' {
                         pos += 1; // skip '='
+                        // Skip whitespace after =
                         while pos < len && chars[pos].is_whitespace() {
                             pos += 1;
                         }
+                        
                         if pos < len && (chars[pos] == '"' || chars[pos] == '\'') {
+                            // Quoted attribute value
                             let quote = chars[pos];
                             pos += 1;
                             let v_start = pos;
@@ -151,20 +365,28 @@ pub fn parse_html(html: &str) -> Element {
                             if pos < len && chars[pos] == quote {
                                 pos += 1;
                             }
-                        } else {
+                        } else if pos < len && chars[pos] != '>' && chars[pos] != '/' {
+                            // Unquoted attribute value
                             let v_start = pos;
                             while pos < len && !chars[pos].is_whitespace() && chars[pos] != '>' && chars[pos] != '/' {
                                 pos += 1;
                             }
                             val = chars[v_start..pos].iter().collect();
                         }
+                        // Decode HTML entities in attribute values
+                        val = decode_html_entities(&val);
                     }
+                    // Boolean attribute (no =value)
                     if !key.is_empty() {
                         elem.add_attr(&key, &val);
                     }
                 }
 
-                let is_self_closing = (pos < len && chars[pos] == '/') || is_void_tag(&tag_name);
+                let mut is_self_closing = false;
+                if pos < len && chars[pos] == '/' {
+                    is_self_closing = true;
+                    pos += 1;
+                }
                 while pos < len && chars[pos] != '>' {
                     pos += 1;
                 }
@@ -172,11 +394,60 @@ pub fn parse_html(html: &str) -> Element {
                     pos += 1;
                 }
 
-                if is_self_closing {
+                let is_void = is_void_tag(&tag_name);
+                elem.is_void = is_void || is_self_closing;
+
+                // Handle auto-closing of parent tags
+                if !elem.is_void && stack.len() > 1 && should_auto_close_parent(&stack.last().unwrap().tag, &tag_name) {
+                    let completed = stack.pop().unwrap();
+                    if let Some(parent) = stack.last_mut() {
+                        parent.add_child(completed);
+                    }
+                }
+
+                if is_void || is_self_closing {
+                    // Void/self-closing: add directly to parent
+                    if let Some(parent) = stack.last_mut() {
+                        parent.add_child(elem);
+                    }
+                } else if is_raw {
+                    // Raw text tags: read all content until closing tag
+                    // We need to find the closing tag even with nested content issues
+                    let close_tag = format!("</{}", tag_name);
+                    let close_tag_full = format!("</{}>", tag_name);
+                    
+                    // Find the actual closing tag position
+                    let html_slice = &html[pos.min(len)..];
+                    if let Some(end_pos) = html_slice.find(&close_tag_full) {
+                        // Extract raw text content
+                        let raw_text = &html_slice[..end_pos];
+                        elem.text = raw_text.to_string();
+                        
+                        // Advance past the content and closing tag
+                        pos += end_pos + close_tag_full.len();
+                    } else if let Some(end_pos) = html_slice.find(&close_tag) {
+                        // Partial match - try to find '>'
+                        let rest = &html_slice[end_pos..];
+                        if let Some(gt_pos) = rest.find('>') {
+                            let raw_text = &html_slice[..end_pos];
+                            elem.text = raw_text.to_string();
+                            pos += end_pos + gt_pos + 1;
+                        } else {
+                            // No closing tag found, take rest as content
+                            elem.text = html_slice.to_string();
+                            pos = len;
+                        }
+                    } else {
+                        // No closing tag, consume rest as raw text
+                        elem.text = html_slice.to_string();
+                        pos = len;
+                    }
+                    
                     if let Some(parent) = stack.last_mut() {
                         parent.add_child(elem);
                     }
                 } else {
+                    // Normal opening tag: push onto stack
                     stack.push(elem);
                 }
             }
@@ -186,7 +457,8 @@ pub fn parse_html(html: &str) -> Element {
             while pos < len && chars[pos] != '<' {
                 pos += 1;
             }
-            let text: String = chars[start..pos].iter().collect();
+            let mut text: String = chars[start..pos].iter().collect();
+            text = decode_html_entities(&text);
             let trimmed_text = text.trim();
             if !trimmed_text.is_empty() {
                 if let Some(current) = stack.last_mut() {
@@ -201,6 +473,7 @@ pub fn parse_html(html: &str) -> Element {
         }
     }
 
+    // Close all remaining open elements
     while stack.len() > 1 {
         let completed = stack.pop().unwrap();
         if let Some(parent) = stack.last_mut() {
@@ -208,8 +481,10 @@ pub fn parse_html(html: &str) -> Element {
         }
     }
 
-    let mut root = stack.pop().unwrap();
-    if root.children.len() == 1 {
+    let mut root = stack.pop().unwrap_or_else(|| Element::new("html"));
+    
+    // Clean up: if root only wraps a single child, return that child directly
+    if root.children.len() == 1 && root.text.is_empty() {
         root.children.remove(0)
     } else {
         root.tag = "html".to_string();
@@ -217,10 +492,7 @@ pub fn parse_html(html: &str) -> Element {
     }
 }
 
-fn is_void_tag(tag: &str) -> bool {
-    matches!(tag, "img" | "br" | "hr" | "input" | "meta" | "link")
-}
-
+/// Fallback parser for very simple HTML (no nesting)
 pub fn fallback_parser(html: &str) -> Element {
     let mut elem = Element::new("div");
     let mut in_tag = false;
@@ -248,5 +520,105 @@ mod tests {
         let dom = parse_html(html);
         assert!(dom.find_tag("h1").is_some());
         assert_eq!(dom.find_tag("h1").unwrap().text, "Hello");
+    }
+
+    #[test]
+    fn test_parse_nested_elements() {
+        let html = "<div><ul><li>Item 1</li><li>Item 2</li></ul></div>";
+        let dom = parse_html(html);
+        let lis = dom.find_all_tags("li");
+        assert_eq!(lis.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_with_attributes() {
+        let html = r#"<a href="https://example.com" class="link">Click</a>"#;
+        let dom = parse_html(html);
+        let links = dom.find_all_tags("a");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].get_attr("href"), Some(&"https://example.com".to_string()));
+        assert_eq!(links[0].get_attr("class"), Some(&"link".to_string()));
+    }
+
+    #[test]
+    fn test_void_elements() {
+        let html = "<div><img src='test.png'><br><hr></div>";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("img").is_some());
+        assert!(dom.find_tag("br").is_some());
+        assert!(dom.find_tag("hr").is_some());
+        assert!(dom.find_tag("img").unwrap().is_void);
+    }
+
+    #[test]
+    fn test_self_closing_tag() {
+        let html = "<div><img src='test.png' /></div>";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("img").is_some());
+    }
+
+    #[test]
+    fn test_html_entities() {
+        let html = "<p>A &amp; B &lt; C &gt; D</p>";
+        let dom = parse_html(html);
+        let p = dom.find_tag("p").unwrap();
+        assert_eq!(p.text, "A & B < C > D");
+    }
+
+    #[test]
+    fn test_missing_closing_tag() {
+        let html = "<div><p>Text without closing";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("p").is_some());
+        assert!(dom.find_tag("div").is_some());
+    }
+
+    #[test]
+    fn test_script_tag_raw_text() {
+        let html = "<script>var x = 1 < 2;</script><p>After</p>";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("script").is_some());
+        assert!(dom.find_tag("p").is_some());
+        let script = dom.find_tag("script").unwrap();
+        assert!(script.text.contains("var x"));
+    }
+
+    #[test]
+    fn test_comment_ignored() {
+        let html = "<div><!-- comment --><p>Text</p></div>";
+        let dom = parse_html(html);
+        let p = dom.find_tag("p");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().text, "Text");
+    }
+
+    #[test]
+    fn test_decode_numeric_entities() {
+        assert_eq!(decode_html_entities("&#65;"), "A");
+        assert_eq!(decode_html_entities("&#x41;"), "A");
+    }
+
+    #[test]
+    fn test_boolean_attribute() {
+        let html = "<input disabled required>";
+        let dom = parse_html(html);
+        let input = dom.find_tag("input").unwrap();
+        assert_eq!(input.get_attr("disabled"), Some(&"".to_string()));
+        assert_eq!(input.get_attr("required"), Some(&"".to_string()));
+    }
+    
+    #[test]
+    fn test_invalid_markup_recovery() {
+        let html = "<p>Hello << world</p>";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("p").is_some());
+    }
+
+    #[test]
+    fn test_text_content_recursive() {
+        let html = "<div><p>Hello <b>World</b></p></div>";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("p").is_some());
+        assert_eq!(dom.find_tag("b").unwrap().text, "World");
     }
 }

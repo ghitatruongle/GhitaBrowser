@@ -1,4 +1,4 @@
-// src/tab.rs - Tab management system (Phase 15-16)
+// src/tab.rs - Tab management system with history navigation (v0.0.2)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -93,6 +93,8 @@ pub struct TabManager {
     tabs: HashMap<usize, Tab>,
     active_tab_id: Option<usize>,
     next_id: usize,
+    /// Ordering of tab IDs for UI
+    tab_order: Vec<usize>,
 }
 
 impl TabManager {
@@ -101,6 +103,7 @@ impl TabManager {
             tabs: HashMap::new(),
             active_tab_id: None,
             next_id: 1,
+            tab_order: Vec::new(),
         }
     }
 
@@ -110,6 +113,7 @@ impl TabManager {
         
         let tab = Tab::new(id, url.to_string(), dom, title.to_string());
         self.tabs.insert(id, tab);
+        self.tab_order.push(id);
         
         self.set_active_tab(id);
         id
@@ -122,6 +126,11 @@ impl TabManager {
     pub fn get_tab_mut(&mut self, id: usize) -> Option<&mut Tab> {
         self.tabs.get_mut(&id)
     }
+    
+    /// Get a tab by its position in the tab bar (0-indexed)
+    pub fn get_tab_by_index(&self, index: usize) -> Option<&Tab> {
+        self.tab_order.get(index).and_then(|id| self.tabs.get(id))
+    }
 
     pub fn active_tab(&self) -> Option<&Tab> {
         self.active_tab_id.and_then(|id| self.tabs.get(&id))
@@ -130,30 +139,36 @@ impl TabManager {
     pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
         self.active_tab_id.and_then(|id| self.tabs.get_mut(&id))
     }
+    
+    /// Get the active tab ID
+    pub fn active_tab_id(&self) -> Option<usize> {
+        self.active_tab_id
+    }
 
     pub fn set_active_tab(&mut self, id: usize) {
         self.active_tab_id = Some(id);
     }
 
     pub fn remove_tab(&mut self, id: usize) -> Option<Tab> {
+        // Remove from order
+        self.tab_order.retain(|&tid| tid != id);
+        
+        // Handle active tab changes
         if self.active_tab_id == Some(id) {
-            if self.tabs.len() > 1 {
-                let remaining_ids: Vec<usize> = self.tabs.keys().copied().collect();
-                for &rid in &remaining_ids {
-                    if rid != id {
-                        self.set_active_tab(rid);
-                        break;
-                    }
-                }
-            } else {
+            if self.tab_order.is_empty() {
                 self.active_tab_id = None;
+            } else {
+                // Activate the last tab in the list
+                self.active_tab_id = Some(self.tab_order[self.tab_order.len() - 1]);
             }
         }
+        
         self.tabs.remove(&id)
     }
 
     pub fn close_all_tabs(&mut self) {
         self.tabs.clear();
+        self.tab_order.clear();
         self.active_tab_id = None;
         self.next_id = 1;
     }
@@ -172,6 +187,13 @@ impl TabManager {
 
     pub fn all_tabs(&self) -> std::collections::hash_map::Values<'_, usize, Tab> {
         self.tabs.values()
+    }
+    
+    /// Iterate tabs in UI order
+    pub fn iter_tabs(&self) -> Vec<&Tab> {
+        self.tab_order.iter()
+            .filter_map(|id| self.tabs.get(id))
+            .collect()
     }
 }
 
@@ -217,5 +239,27 @@ mod tests {
         assert_eq!(tab.url, "https://b.com");
         assert_eq!(tab.history_pos, 1);
         assert_eq!(tab.history[tab.history_pos], "https://b.com");
+    }
+    
+    #[test]
+    fn test_tab_manager_order() {
+        let mut tm = TabManager::new();
+        let id1 = tm.add_tab("https://a.com", Element::new("body"), "A");
+        let id2 = tm.add_tab("https://b.com", Element::new("div"), "B");
+        let id3 = tm.add_tab("https://c.com", Element::new("span"), "C");
+        
+        assert_eq!(tm.tab_count(), 3);
+        assert_eq!(tm.active_tab_id(), Some(id3));
+        
+        // Get by index
+        assert_eq!(tm.get_tab_by_index(0).unwrap().url, "https://a.com");
+        assert_eq!(tm.get_tab_by_index(1).unwrap().url, "https://b.com");
+        assert_eq!(tm.get_tab_by_index(2).unwrap().url, "https://c.com");
+        
+        // Remove middle tab
+        tm.remove_tab(id2);
+        assert_eq!(tm.tab_count(), 2);
+        assert_eq!(tm.get_tab_by_index(0).unwrap().url, "https://a.com");
+        assert_eq!(tm.get_tab_by_index(1).unwrap().url, "https://c.com");
     }
 }
