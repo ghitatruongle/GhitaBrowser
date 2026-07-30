@@ -1,4 +1,4 @@
-// src/storage.rs - Cookie and localStorage persistence with serde (v0.0.2)
+// src/storage.rs - Cookie and localStorage persistence with serde (v0.1.2)
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -373,7 +373,7 @@ impl StorageManager {
             .collect();
         
         let state = StorageState {
-            version: "0.0.2".to_string(),
+            version: "0.1.2".to_string(),
             cookies: self.cookies.cookies.clone(),
             local_storage: ls_map,
         };

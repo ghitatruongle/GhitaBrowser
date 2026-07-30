@@ -1,8 +1,8 @@
-// src/lib.rs - Public re-exports for ghitabrowser crate (v0.0.2)
+// src/lib.rs - Public re-exports for ghitabrowser crate (v0.1.2)
 #![allow(dead_code)]
 
 //! # GhitaBrowser
-//! A lightweight Rust browser v0.0.2 - built from scratch in safe Rust.
+//! A lightweight Rust browser v0.1.2 - built from scratch in safe Rust.
 
 pub mod parser;
 pub mod renderer;
@@ -106,8 +106,8 @@ impl Browser {
         let parse_time = parse_start.elapsed().as_millis() as u64;
         self.profiler.record("parse", parse_time);
         
-        // 3. Extract title
-        let title = extract_title(html_content);
+        // 3. Extract title from DOM
+        let title = extract_title_from_dom(&dom);
         
         // 4. Apply styles - merge global CSS with page <style> tags
         let style_start = std::time::Instant::now();
@@ -138,10 +138,16 @@ impl Browser {
         let layout_time = layout_start.elapsed().as_millis() as u64;
         self.profiler.record("layout", layout_time);
         
+        // Cache layout tree for re-rendering
+        if let Some(ref _root) = layout_tree {
+            if let Some(tab) = self.tabs.active_tab_mut() {
+                tab.layout = layout_tree.clone();
+            }
+        }
+        
         // 6. Render to text
         let render_start = std::time::Instant::now();
-        let rendered = if let Some(mut root) = layout_tree {
-            layout::perform_layout(&mut root, self.viewport_width as f64);
+        let rendered = if let Some(root) = layout_tree {
             let tr = text_renderer::TextRenderer::new(self.viewport_width, self.viewport_height);
             tr.render_to_text(&root)
         } else {
@@ -166,11 +172,20 @@ impl Browser {
             layout_nodes,
         });
         
-        // Update tab
+        // Update tab - save history entry then update
         if let Some(tab) = self.tabs.active_tab_mut() {
-            tab.set_url(url.to_string());
+            // Save current state to history before navigating
+            let current_entry = crate::tab::HistoryEntry {
+                url: tab.url.clone(),
+                title: tab.title.clone(),
+                dom: tab.dom.clone(),
+            };
+            tab.push_history(current_entry);
+            
+            // Update with new content
             tab.dom = dom;
             tab.title = title;
+            tab.url = url.to_string();
         } else {
             self.tabs.add_tab(url, dom, &title);
         }
@@ -179,17 +194,27 @@ impl Browser {
     }
     
     /// Load a URL with raw HTML content (for testing/offline)
-    pub fn load_html(&mut self, url: &str, html_content: &str) {
+    pub fn load_html(&mut self, url: &str, html_content: &str) -> Result<String, String> {
         let dom = parser::parse_html(html_content);
-        let title = extract_title(html_content);
+        let title = extract_title_from_dom(&dom);
         
         if let Some(tab) = self.tabs.active_tab_mut() {
-            tab.set_url(url.to_string());
+            // Save current state to history
+            let current_entry = crate::tab::HistoryEntry {
+                url: tab.url.clone(),
+                title: tab.title.clone(),
+                dom: tab.dom.clone(),
+            };
+            tab.push_history(current_entry);
+            
             tab.dom = dom;
             tab.title = title;
+            tab.url = url.to_string();
         } else {
             self.add_tab(url, dom, &title);
         }
+        
+        Ok(self.render_current())
     }
 
     /// Add a new tab with content
@@ -208,16 +233,20 @@ impl Browser {
     }
 
     /// Go back in the current tab's history
-    pub fn go_back(&mut self) {
+    pub fn go_back(&mut self) -> bool {
         if let Some(tab) = self.tabs.active_tab_mut() {
-            tab.go_back();
+            tab.go_back()
+        } else {
+            false
         }
     }
 
     /// Go forward in the current tab's history
-    pub fn go_forward(&mut self) {
+    pub fn go_forward(&mut self) -> bool {
         if let Some(tab) = self.tabs.active_tab_mut() {
-            tab.go_forward();
+            tab.go_forward()
+        } else {
+            false
         }
     }
 
@@ -250,13 +279,19 @@ impl Browser {
     /// Render the current tab's content to text (for headless testing)
     pub fn render_current(&self) -> String {
         if let Some(tab) = self.active_tab() {
-            let css_rules = &self.css_rules;
-            match layout::create_layout_tree(&tab.dom, css_rules, self.viewport_width) {
-                Some(root) => {
-                    let tr = text_renderer::TextRenderer::new(self.viewport_width, self.viewport_height);
-                    tr.render_to_text(&root)
-                },
-                None => String::from("[Error rendering content]"),
+            // Use cached layout if available, otherwise rebuild
+            if let Some(ref layout_root) = tab.layout {
+                let tr = text_renderer::TextRenderer::new(self.viewport_width, self.viewport_height);
+                tr.render_to_text(layout_root)
+            } else {
+                let css_rules = &self.css_rules;
+                match layout::create_layout_tree(&tab.dom, css_rules, self.viewport_width) {
+                    Some(root) => {
+                        let tr = text_renderer::TextRenderer::new(self.viewport_width, self.viewport_height);
+                        tr.render_to_text(&root)
+                    },
+                    None => String::from("[Error rendering content]"),
+                }
             }
         } else {
             String::from("[No active tab]")
@@ -265,33 +300,26 @@ impl Browser {
     
     /// Get status string for display
     pub fn status_string(&self) -> String {
-        let _stats = self.last_render_stats.as_ref();
         let cache_stats = self.cache.stats();
         
         format!(
-            "Viewport: {}x{} | {} | Cookies: {} | Memory: {} KB",
+            "Viewport: {}x{} | {} | Cookies: {} | Tabs: {}",
             self.viewport_width,
             self.viewport_height,
             cache_stats,
             self.storage.cookie_count(),
-            std::mem::size_of::<Self>() / 1024,
+            self.tabs.tab_count(),
         )
     }
 }
 
-/// Extract title from HTML
-fn extract_title(html: &str) -> String {
-    if let Some(start) = html.find("<title>") {
-        let after = &html[start + 7..];
-        if let Some(end) = after.find("</title>") {
-            return after[..end].to_string();
-        }
+/// Extract title from parsed DOM tree
+fn extract_title_from_dom(dom: &Element) -> String {
+    if let Some(title_elem) = dom.find_tag("title") {
+        return title_elem.text.trim().to_string();
     }
-    if let Some(start) = html.find("<TITLE>") {
-        let after = &html[start + 7..];
-        if let Some(end) = after.find("</TITLE>") {
-            return after[..end].to_string();
-        }
+    if let Some(h1_elem) = dom.find_tag("h1") {
+        return h1_elem.text.trim().to_string();
     }
     "Untitled Page".to_string()
 }

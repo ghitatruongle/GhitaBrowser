@@ -1,4 +1,4 @@
-// src/image_loader.rs - Image loading, caching, and decoding (v0.0.2)
+// src/image_loader.rs - Image loading, caching, and decoding (v0.1.2)
 #![allow(dead_code)]
 
 use std::collections::HashMap;

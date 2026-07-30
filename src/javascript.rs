@@ -1,4 +1,4 @@
-// src/javascript.rs - JavaScript Engine with variables, functions, control flow (v0.0.2)
+// src/javascript.rs - JavaScript Engine with variables, functions, control flow (v0.1.2)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -418,6 +418,7 @@ fn call_native_fn(name: &str, args: Vec<JsvValue>, console: &mut Vec<String>) ->
                 .collect::<Vec<_>>()
                 .join(" ");
             console.push(output.clone());
+            #[cfg(debug_assertions)]
             println!("[JS] {}", output);
             Ok(JsvValue::Undefined)
         }
@@ -427,6 +428,7 @@ fn call_native_fn(name: &str, args: Vec<JsvValue>, console: &mut Vec<String>) ->
                 .collect::<Vec<_>>()
                 .join(" ");
             console.push(format!("WARN: {}", output));
+            #[cfg(debug_assertions)]
             println!("[JS Warning] {}", output);
             Ok(JsvValue::Undefined)
         }
@@ -436,6 +438,7 @@ fn call_native_fn(name: &str, args: Vec<JsvValue>, console: &mut Vec<String>) ->
                 .collect::<Vec<_>>()
                 .join(" ");
             console.push(format!("ERROR: {}", output));
+            #[cfg(debug_assertions)]
             eprintln!("[JS Error] {}", output);
             Ok(JsvValue::Undefined)
         }

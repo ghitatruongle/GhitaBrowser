@@ -1,4 +1,4 @@
-// src/network.rs - Real HTTP Networking & Resource Caching (v0.0.2)
+// src/network.rs - Real HTTP Networking & Resource Caching (v0.1.2)
 // Uses ureq for HTTP/HTTPS fetching with TLS support, integrated with cookie jar
 
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ pub fn fetch_url(url_str: &str) -> Result<FetchResult, Box<dyn std::error::Error
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .redirects(5)
-        .user_agent("GhitaBrowser/0.0.2 (Rust)")
+        .user_agent("GhitaBrowser/0.1.2 (Rust)")
         .build();
     
     execute_fetch(&agent, url_str, None)
@@ -45,7 +45,7 @@ pub fn fetch_with_cookies(
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .redirects(5)
-        .user_agent("GhitaBrowser/0.0.2 (Rust)")
+        .user_agent("GhitaBrowser/0.1.2 (Rust)")
         .build();
     
     // Get matching cookies and build Cookie header
@@ -109,14 +109,10 @@ fn execute_fetch(
     
     // Collect all Set-Cookie headers (there can be multiple)
     let mut set_cookie_headers = Vec::new();
-    if let Some(all_cookies) = response.header("set-cookie") {
-        // ureq may return all Set-Cookie headers concatenated
-        // Split by common patterns for multiple cookies
-        for cookie_str in all_cookies.lines() {
-            let trimmed = cookie_str.trim();
-            if !trimmed.is_empty() {
-                set_cookie_headers.push(trimmed.to_string());
-            }
+    for cookie_val in response.all("set-cookie") {
+        let trimmed = cookie_val.trim();
+        if !trimmed.is_empty() {
+            set_cookie_headers.push(trimmed.to_string());
         }
     }
     
@@ -207,6 +203,7 @@ impl CacheEntry {
 pub struct ResourceCache {
     entries: HashMap<String, CacheEntry>,
     pub max_size: usize,
+    pub max_entries: usize,
     hits: u64,
     misses: u64,
 }
@@ -216,19 +213,46 @@ impl ResourceCache {
         Self {
             entries: HashMap::new(),
             max_size: 1024 * 1024 * 50, // 50MB default
+            max_entries: 100,
             hits: 0,
             misses: 0,
         }
     }
     
+    /// Calculate total bytes used by all cached entries
+    pub fn total_bytes(&self) -> usize {
+        self.entries.values()
+            .map(|e| e.result.body.len())
+            .sum()
+    }
+    
     pub fn insert(&mut self, url: &str, result: FetchResult, ttl_secs: u64) {
-        // Evict if at capacity (simple: remove oldest if over max_size)
-        if self.entries.len() >= 100 {
+        let entry_size = result.body.len();
+        
+        // Evict expired entries first
+        self.evict_expired();
+        
+        // Enforce max_entries limit - remove oldest if at capacity
+        while self.entries.len() >= self.max_entries {
             if let Some(oldest_key) = self.entries.iter()
                 .min_by_key(|(_, e)| e.cached_at)
                 .map(|(k, _)| k.clone())
             {
                 self.entries.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+        
+        // Enforce max_size byte limit - remove oldest entries until under limit
+        while self.total_bytes() + entry_size > self.max_size && !self.entries.is_empty() {
+            if let Some(oldest_key) = self.entries.iter()
+                .min_by_key(|(_, e)| e.cached_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest_key);
+            } else {
+                break;
             }
         }
         

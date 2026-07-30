@@ -1,9 +1,17 @@
-// src/tab.rs - Tab management system with history navigation (v0.0.2)
+// src/tab.rs - Tab management system with history navigation (v0.1.2)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use crate::parser::Element;
 use crate::layout::LayoutNode;
+
+/// A snapshot of page state for history navigation
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub url: String,
+    pub title: String,
+    pub dom: Element,
+}
 
 /// Represents a single browser tab
 #[derive(Debug)]
@@ -16,20 +24,21 @@ pub struct Tab {
     /// Cached layout tree for rendering
     pub layout: Option<LayoutNode>,
     /// History stack for back/forward navigation
-    history: Vec<String>,
+    history: Vec<HistoryEntry>,
     /// Current history position (0-indexed)
     history_pos: usize,
 }
 
 impl Tab {
     pub fn new(id: usize, url: String, dom: Element, title: String) -> Self {
+        let entry = HistoryEntry { url: url.clone(), title: title.clone(), dom: dom.clone() };
         Tab {
             id,
             url: url.clone(),
             title,
             dom,
             layout: None,
-            history: vec![url],
+            history: vec![entry],
             history_pos: 0,
         }
     }
@@ -43,7 +52,14 @@ impl Tab {
             self.history.truncate(self.history_pos + 1);
         }
         self.url = url.clone();
-        self.history.push(url);
+        self.layout = None;
+    }
+
+    pub fn push_history(&mut self, entry: HistoryEntry) {
+        if self.history_pos + 1 < self.history.len() {
+            self.history.truncate(self.history_pos + 1);
+        }
+        self.history.push(entry);
         self.history_pos = self.history.len() - 1;
         self.layout = None;
     }
@@ -51,7 +67,10 @@ impl Tab {
     pub fn go_back(&mut self) -> bool {
         if self.history_pos > 0 {
             self.history_pos -= 1;
-            self.url = self.history[self.history_pos].clone();
+            let entry = &self.history[self.history_pos];
+            self.url = entry.url.clone();
+            self.title = entry.title.clone();
+            self.dom = entry.dom.clone();
             self.layout = None;
             true
         } else {
@@ -62,7 +81,10 @@ impl Tab {
     pub fn go_forward(&mut self) -> bool {
         if self.history_pos + 1 < self.history.len() {
             self.history_pos += 1;
-            self.url = self.history[self.history_pos].clone();
+            let entry = &self.history[self.history_pos];
+            self.url = entry.url.clone();
+            self.title = entry.title.clone();
+            self.dom = entry.dom.clone();
             self.layout = None;
             true
         } else {
@@ -76,15 +98,6 @@ impl Tab {
 
     pub fn can_go_forward(&self) -> bool {
         self.history_pos + 1 < self.history.len()
-    }
-
-    pub fn add_history_item(&mut self, url: &str) {
-        if self.history_pos + 1 < self.history.len() {
-            self.history.truncate(self.history_pos + 1);
-        }
-        self.history.push(url.to_string());
-        self.history_pos = self.history.len() - 1;
-        self.layout = None;
     }
 }
 
@@ -146,7 +159,9 @@ impl TabManager {
     }
 
     pub fn set_active_tab(&mut self, id: usize) {
-        self.active_tab_id = Some(id);
+        if self.tabs.contains_key(&id) {
+            self.active_tab_id = Some(id);
+        }
     }
 
     pub fn remove_tab(&mut self, id: usize) -> Option<Tab> {
@@ -158,7 +173,8 @@ impl TabManager {
             if self.tab_order.is_empty() {
                 self.active_tab_id = None;
             } else {
-                // Activate the last tab in the list
+                // Find the position of the removed tab in the old order
+                // Activate the tab to the right, or the last tab if removing the rightmost
                 self.active_tab_id = Some(self.tab_order[self.tab_order.len() - 1]);
             }
         }

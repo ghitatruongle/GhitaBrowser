@@ -1,4 +1,4 @@
-// src/text_renderer.rs - ASCII text rendering of layout tree (v0.0.2)
+// src/text_renderer.rs - ASCII text rendering of layout tree (v0.1.2)
 #![allow(dead_code)]
 
 use super::layout::{DisplayType, LayoutNode};
@@ -15,7 +15,7 @@ impl TextRenderer {
 
     pub fn render_to_text(&self, layout: &LayoutNode) -> String {
         let mut output = String::new();
-        output.push_str(&format!("╔═ GhitaBrowser v0.0.2 ═{}╗\n", "═".repeat(40)));
+        output.push_str(&format!("╔═ GhitaBrowser v0.1.2 ═{}╗\n", "═".repeat(40)));
         self.render_node(layout, 0, &mut output);
         output.push_str(&format!("╚{}╝\n", "═".repeat(54)));
         output

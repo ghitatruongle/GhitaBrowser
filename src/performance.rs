@@ -18,9 +18,12 @@ impl Profiler {
     }
 
     pub fn report(&self) {
-        println!("=== Performance Report ===");
-        for (name, total) in &self.timings {
-            println!("{}: {} ms", name, total);
+        #[cfg(debug_assertions)]
+        {
+            println!("=== Performance Report ===");
+            for (name, total) in &self.timings {
+                println!("{}: {} ms", name, total);
+            }
         }
     }
 }

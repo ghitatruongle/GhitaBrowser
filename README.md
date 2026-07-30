@@ -6,9 +6,24 @@ A lightweight Rust browser optimized faster than Chrome, built from scratch with
 
 ## Overview
 
-GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.0.1).
+GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.1.2).
 
-### v0.0.1 New Features
+### v0.1.2 New Features
+
+- ✅ **Console fix** — No more terminal popup when launching the app (`windows_subsystem = "windows"`)
+- ✅ **Dark/Light theme toggle** — Switch between dark and light themes with the 🎨 button in the status bar
+- ✅ **Custom brand colors** — Navy + orange brand identity replacing default theme colors
+- ✅ **Redesigned tab bar** — Tab pills with orange active indicator, smooth styling
+- ✅ **Enhanced toolbar** — Home button, URL clear button, loading spinner, HTTPS padlock indicator
+- ✅ **Keyboard shortcuts** — `Ctrl+L` focus URL, `Ctrl+T` new tab, `Ctrl+W` close tab, `F5` reload
+- ✅ **DevTools side panel** — JS Console, Storage inspector, Cache stats in a slide-out panel
+- ✅ **Loading indicator** — Visual loading spinner and load time tracking
+- ✅ **Error page styling** — Formatted error pages with suggestions
+- ✅ **Status bar improvements** — Load time, tab count, theme toggle, devtools toggle
+- ✅ **Debug diagnostics** — All diagnostic output gated behind `#[cfg(debug_assertions)]` for clean release
+- ✅ **Version bump** — Updated across all modules (Cargo.toml, headers, User-Agent strings, HTML templates)
+
+### v0.0.1 Features (Retained)
 
 - ✅ **Real HTTP/HTTPS networking** via `ureq` (was stub)
 - ✅ **HTML5 parser** with error recovery, script/style raw text, HTML entities, comments
@@ -24,17 +39,28 @@ GhitaBrowser is a complete web browser implementation written entirely in safe R
 
 | Module | Description | Status |
 |--------|-------------|--------|
-| **Network** | Real HTTP/HTTPS via ureq, ResourceCache with TTL | ✅ v0.0.1 |
-| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.0.1 |
-| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.0.1 |
-| **Layout** | Box model, text wrapping, block/inline, auto-height | ✅ v0.0.1 |
-| **Renderer** | ASCII text rendering of layout tree | ✅ v0.0.1 |
-| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.0.1 |
-| **Storage** | CookieStore + LocalStorage with serde persistence | ✅ v0.0.1 |
-| **UI (Iced)** | Tab bar, navigation, URL bar, status bar, dev tools | ✅ v0.0.1 |
-| **Image Loader** | Image cache with memory management | ✅ v0.0.1 |
-| **Performance** | Profiler with per-phase timing | ✅ v0.0.1 |
-| **Window** | winit-based native window with icon | ✅ v0.0.0 |
+| **Network** | Real HTTP/HTTPS via ureq, ResourceCache with TTL | ✅ v0.1.2 |
+| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.1.2 |
+| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.1.2 |
+| **Layout** | Box model, text wrapping, block/inline, auto-height | ✅ v0.1.2 |
+| **Renderer** | ASCII text rendering of layout tree | ✅ v0.1.2 |
+| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.1.2 |
+| **Storage** | CookieStore + LocalStorage with serde persistence | ✅ v0.1.2 |
+| **UI (Iced)** | Tab bar, navigation, URL bar, status bar, dev tools, theme toggle, keyboard shortcuts | ✅ v0.1.2 |
+| **Image Loader** | Image cache with memory management | ✅ v0.1.2 |
+| **Performance** | Profiler with per-phase timing | ✅ v0.1.2 |
+| **Window** | winit-based native window with icon | ✅ v0.1.2 |
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl + L` | Focus URL bar |
+| `Ctrl + T` | Open new tab |
+| `Ctrl + W` | Close current tab |
+| `Ctrl + R` / `F5` | Reload current page |
+| `Alt + ←` | Go back |
+| `Alt + →` | Go forward |
 
 ## Architecture
 
@@ -48,8 +74,8 @@ The project follows a phased development plan:
 | 7-8 | Layout engine with text wrapping | ✅ v0.0.1 (Box model) |
 | 9-10 | Text rendering | ✅ v0.0.1 |
 | 11-12 | Image loading pipeline | ✅ v0.0.1 |
-| 13 | Window manager (winit) | ✅ v0.0.0 |
-| 14 | UI framework (Iced) | ✅ v0.0.1 (Full integration) |
+| 13 | Window manager (winit) | ✅ v0.0.1 |
+| 14 | UI framework (Iced) | ✅ v0.1.2 (Theme, toolbar, devtools, shortcuts) |
 | 15-16 | Tab management system | ✅ v0.0.1 |
 | 17-18 | Storage (cookies, localStorage) | ✅ v0.0.1 (Persistent) |
 | 19-20 | JavaScript engine | ✅ v0.0.1 (Variables, functions) |
