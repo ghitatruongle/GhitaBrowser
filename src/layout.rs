@@ -1,4 +1,4 @@
-// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.1.2)
+// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.1.5)
 #![allow(dead_code)]
 
 use crate::parser::Element;

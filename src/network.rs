@@ -1,4 +1,4 @@
-// src/network.rs - Real HTTP Networking & Resource Caching (v0.1.2)
+// src/network.rs - Real HTTP Networking & Resource Caching (v0.1.5)
 // Uses ureq for HTTP/HTTPS fetching with TLS support, integrated with cookie jar
 
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ pub fn fetch_url(url_str: &str) -> Result<FetchResult, Box<dyn std::error::Error
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .redirects(5)
-        .user_agent("GhitaBrowser/0.1.2 (Rust)")
+        .user_agent("GhitaBrowser/0.1.5 (Rust)")
         .build();
     
     execute_fetch(&agent, url_str, None)
@@ -45,7 +45,7 @@ pub fn fetch_with_cookies(
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .redirects(5)
-        .user_agent("GhitaBrowser/0.1.2 (Rust)")
+        .user_agent("GhitaBrowser/0.1.5 (Rust)")
         .build();
     
     // Get matching cookies and build Cookie header
@@ -152,12 +152,16 @@ pub fn fetch_with_cache(
     if let Some(cached) = cache.get(url) {
         if !cached.is_expired() {
             info!("Cache HIT for: {}", url);
-            return Ok(cached.result.clone());
+            let result = cached.result.clone();
+            cache.record_hit();
+            return Ok(result);
         } else {
             info!("Cache STALE for: {}", url);
         }
     }
-    
+
+    cache.record_miss();
+
     // Fetch fresh (with or without cookies)
     let result = if let Some(cs) = cookie_store {
         fetch_with_cookies(url, cs)?

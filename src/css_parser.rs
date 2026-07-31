@@ -1,4 +1,4 @@
-// src/css_parser.rs - Advanced CSS Parser and Style Computation (v0.1.2)
+// src/css_parser.rs - Advanced CSS Parser and Style Computation (v0.1.5)
 #![allow(dead_code)]
 
 // use std::collections::HashMap;

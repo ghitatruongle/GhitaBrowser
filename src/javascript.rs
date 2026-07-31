@@ -1,4 +1,4 @@
-// src/javascript.rs - JavaScript Engine with variables, functions, control flow (v0.1.2)
+// src/javascript.rs - JavaScript Engine with variables, functions, control flow (v0.1.5)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -350,6 +350,21 @@ fn eval_expr(expr: &JsvExpr, env: &mut JsvEnvironment, console: &mut Vec<String>
 
 /// Apply a binary operator
 fn apply_binary_op(l_val: JsvValue, r_val: JsvValue, op: OpKind) -> Result<JsvValue, String> {
+    // Short-circuit evaluation for logical operators
+    match op {
+        OpKind::And => {
+            // JS semantics: returns first falsy value, or last value if all truthy
+            if !l_val.is_truthy() { return Ok(l_val); }
+            return Ok(r_val);
+        }
+        OpKind::Or => {
+            // JS semantics: returns first truthy value, or last value if all falsy
+            if l_val.is_truthy() { return Ok(l_val); }
+            return Ok(r_val);
+        }
+        _ => {}
+    }
+
     match (l_val, r_val) {
         (JsvValue::Number(ln), JsvValue::Number(rn)) => match op {
             OpKind::Add => Ok(JsvValue::Number(ln + rn)),
@@ -653,21 +668,24 @@ fn parse_assignment(tokens: &[String], pos: usize) -> Result<(JsvExpr, usize), S
 
 fn parse_or(tokens: &[String], pos: usize) -> Result<(JsvExpr, usize), String> {
     let (left, mut i) = parse_and(tokens, pos)?;
+    let mut result = left;
     while i < tokens.len() && tokens[i] == "||" {
-        let (_right, new_i) = parse_and(tokens, i + 1)?;
+        let (right, new_i) = parse_and(tokens, i + 1)?;
+        result = JsvExpr::BinaryOp(Box::new(result), OpKind::Or, Box::new(right));
         i = new_i;
-        // Simplified: treat as left operand only for now
     }
-    Ok((left, i))
+    Ok((result, i))
 }
 
 fn parse_and(tokens: &[String], pos: usize) -> Result<(JsvExpr, usize), String> {
     let (left, mut i) = parse_equality(tokens, pos)?;
+    let mut result = left;
     while i < tokens.len() && tokens[i] == "&&" {
-        let (_right, new_i) = parse_equality(tokens, i + 1)?;
+        let (right, new_i) = parse_equality(tokens, i + 1)?;
+        result = JsvExpr::BinaryOp(Box::new(result), OpKind::And, Box::new(right));
         i = new_i;
     }
-    Ok((left, i))
+    Ok((result, i))
 }
 
 fn parse_equality(tokens: &[String], pos: usize) -> Result<(JsvExpr, usize), String> {

@@ -1,7 +1,8 @@
-// src/image_loader.rs - Image loading, caching, and decoding (v0.1.2)
+// src/image_loader.rs - Image loading, caching, and decoding (v0.1.5)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
 use log::warn;
 
@@ -146,22 +147,31 @@ impl ImageCache {
     
     /// Fetch image bytes from URL and decode
     fn fetch_and_decode(&self, url: &str) -> Result<ImageData, Box<dyn std::error::Error>> {
-        // For now, try to use the image crate with files
-        // In production, would fetch via HTTP
-        let path = if url.starts_with("http://") || url.starts_with("https://") {
-            // Remote image - would need real fetching
-            return Err("Remote image loading not yet implemented".into());
+        let bytes = if url.starts_with("http://") || url.starts_with("https://") {
+            // Fetch remote image via HTTP/HTTPS
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(10))
+                .timeout_read(std::time::Duration::from_secs(30))
+                .redirects(5)
+                .user_agent("GhitaBrowser/0.1.5 (Rust)")
+                .build();
+            let response = agent.get(url).call()?;
+
+            let mut bytes = Vec::new();
+            response.into_reader().read_to_end(&mut bytes)?;
+            bytes
         } else {
-            url.to_string()
+            // Local file
+            std::fs::read(url)?
         };
-        
-        let img = image::open(&path)?;
+
+        let img = image::load_from_memory(&bytes)?;
         let rgba = img.to_rgba8();
         let (width, height) = rgba.dimensions();
         let pixels = rgba.into_raw();
-        
+
         let format = ImageFormat::from_extension(url);
-        
+
         Ok(ImageData {
             url: url.to_string(),
             width,

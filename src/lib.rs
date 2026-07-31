@@ -1,8 +1,8 @@
-// src/lib.rs - Public re-exports for ghitabrowser crate (v0.1.2)
+// src/lib.rs - Public re-exports for ghitabrowser crate (v0.1.5)
 #![allow(dead_code)]
 
 //! # GhitaBrowser
-//! A lightweight Rust browser v0.1.2 - built from scratch in safe Rust.
+//! A lightweight Rust browser v0.1.5 - built from scratch in safe Rust.
 
 pub mod parser;
 pub mod renderer;
@@ -179,9 +179,10 @@ impl Browser {
                 url: tab.url.clone(),
                 title: tab.title.clone(),
                 dom: tab.dom.clone(),
+                layout: tab.layout.clone(),
             };
             tab.push_history(current_entry);
-            
+
             // Update with new content
             tab.dom = dom;
             tab.title = title;
@@ -189,21 +190,22 @@ impl Browser {
         } else {
             self.tabs.add_tab(url, dom, &title);
         }
-        
+
         Ok(rendered)
     }
-    
+
     /// Load a URL with raw HTML content (for testing/offline)
     pub fn load_html(&mut self, url: &str, html_content: &str) -> Result<String, String> {
         let dom = parser::parse_html(html_content);
         let title = extract_title_from_dom(&dom);
-        
+
         if let Some(tab) = self.tabs.active_tab_mut() {
             // Save current state to history
             let current_entry = crate::tab::HistoryEntry {
                 url: tab.url.clone(),
                 title: tab.title.clone(),
                 dom: tab.dom.clone(),
+                layout: tab.layout.clone(),
             };
             tab.push_history(current_entry);
             
@@ -344,7 +346,7 @@ mod tests {
     fn test_browser_load_html() {
         let mut browser = Browser::new();
         let html = "<html><body><h1>Hello</h1></body></html>";
-        browser.load_html("https://example.com", html);
+        let _ = browser.load_html("https://example.com", html);
         
         assert_eq!(browser.tab_count(), 1);
         assert!(browser.active_tab().is_some());
@@ -354,7 +356,7 @@ mod tests {
     #[test]
     fn test_browser_render() {
         let mut browser = Browser::new();
-        browser.load_html("https://example.com", "<html><body><h1>Welcome</h1></body></html>");
+        let _ = browser.load_html("https://example.com", "<html><body><h1>Welcome</h1></body></html>");
         let rendered = browser.render_current();
         assert!(!rendered.is_empty());
         assert!(rendered.contains("Welcome"));
@@ -364,7 +366,7 @@ mod tests {
     fn test_browser_with_css() {
         let mut browser = Browser::new();
         browser.set_css("h1 { color: red; font-size: 24px; }");
-        browser.load_html("https://example.com", "<html><body><h1>Styled</h1></body></html>");
+        let _ = browser.load_html("https://example.com", "<html><body><h1>Styled</h1></body></html>");
         let rendered = browser.render_current();
         assert!(rendered.contains("Styled"));
     }
@@ -372,7 +374,7 @@ mod tests {
     #[test]
     fn test_browser_tab_switching() {
         let mut browser = Browser::new();
-        browser.load_html("https://a.com", "<html><body><h1>Page A</h1></body></html>");
+        let _ = browser.load_html("https://a.com", "<html><body><h1>Page A</h1></body></html>");
         browser.add_tab("https://b.com", parser::parse_html("<html><body><h1>Page B</h1></body></html>"), "Page B");
         
         assert_eq!(browser.tab_count(), 2);
@@ -383,7 +385,7 @@ mod tests {
     
     #[test]
     fn test_extract_title() {
-        let html = "<html><head><title>My Page</title></head><body></body></html>";
-        assert_eq!(extract_title(html), "My Page");
+        let dom = parser::parse_html("<html><head><title>My Page</title></head><body></body></html>");
+        assert_eq!(extract_title_from_dom(&dom), "My Page");
     }
 }

@@ -1,4 +1,4 @@
-// src/ui.rs - Modern GUI Browser with real engine integration (v0.1.2)
+// src/ui.rs - Modern GUI Browser with real engine integration (v0.1.5)
 #![allow(dead_code)]
 
 use iced::widget::{button, column, container, horizontal_space, row, scrollable, text, text_input, vertical_space};
@@ -70,6 +70,7 @@ pub enum Message {
     
     // View toggles
     ToggleDevTools,
+    CloseDevTools,
     ToggleStorage,
     ToggleCache,
     ToggleJsConsole,
@@ -82,7 +83,7 @@ pub enum Message {
     FocusUrl,
     
     // Internal
-    PageLoaded(String),
+    PageLoaded { html: String, url: String, fetch_time: u64 },
     LoadError(String),
 }
 
@@ -97,7 +98,7 @@ impl Application for GhitaBrowserApp {
         
         // Load a default page
         let welcome_html = String::from(
-            "<html>\n            <head><title>GhitaBrowser v0.1.2</title></head>\n            <body>\n                <h1>🚀 GhitaBrowser v0.1.2</h1>\n                <p>Welcome to the next-generation Rust browser!</p>\n                <p>Built from scratch in safe Rust with:</p>\n                <ul>\n                    <li>Real HTTP/HTTPS networking via <strong>ureq</strong></li>\n                    <li>Custom HTML5 parser with error recovery</li>\n                    <li>Advanced CSS selector engine with specificity</li>\n                    <li>Layout engine with text wrapping</li>\n                    <li>JavaScript evaluator with variables & functions</li>\n                    <li>Persistent cookie & localStorage storage</li>\n                    <li>Iced GUI with multi-tab support</li>\n                </ul>\n                <p>Enter a URL above and click Go to start browsing!</p>\n            </body>\n            </html>"
+            "<html>\n            <head><title>GhitaBrowser v0.1.5</title></head>\n            <body>\n                <h1>🚀 GhitaBrowser v0.1.5</h1>\n                <p>Welcome to the next-generation Rust browser!</p>\n                <p>Built from scratch in safe Rust with:</p>\n                <ul>\n                    <li>Real HTTP/HTTPS networking via <strong>ureq</strong></li>\n                    <li>Custom HTML5 parser with error recovery</li>\n                    <li>Advanced CSS selector engine with specificity</li>\n                    <li>Layout engine with text wrapping</li>\n                    <li>JavaScript evaluator with variables & functions</li>\n                    <li>Persistent cookie & localStorage storage</li>\n                    <li>Iced GUI with multi-tab support</li>\n                </ul>\n                <p>Enter a URL above and click Go to start browsing!</p>\n            </body>\n            </html>"
         );
         
         let _ = browser.load_html("https://ghitabrowser.local", &welcome_html);
@@ -133,8 +134,8 @@ impl Application for GhitaBrowserApp {
 
     fn title(&self) -> String {
         self.browser.active_tab()
-            .map(|t| format!("GhitaBrowser v0.1.2 - {}", t.title))
-            .unwrap_or_else(|| "GhitaBrowser v0.1.2".to_string())
+            .map(|t| format!("GhitaBrowser v0.1.5 - {}", t.title))
+            .unwrap_or_else(|| "GhitaBrowser v0.1.5".to_string())
     }
 
     fn theme(&self) -> Theme {
@@ -158,8 +159,8 @@ impl Application for GhitaBrowserApp {
                 if url.is_empty() {
                     return Command::none();
                 }
-                
-                // Handle special URLs
+
+                // Handle special URLs synchronously
                 if url == "about:blank" {
                     let blank_html = String::from(
                         "<html><head><title>New Tab</title></head>\
@@ -173,51 +174,39 @@ impl Application for GhitaBrowserApp {
                     self.is_loading = false;
                     return Command::none();
                 }
-                
-                // Add http:// if missing
+
+                // Add https:// if missing
                 let url = if !url.starts_with("http://") && !url.starts_with("https://") {
                     format!("https://{}", url)
                 } else {
                     url.clone()
                 };
-                
+
                 self.is_loading = true;
-                self.status_msg = format!("Loading {}...", url);
+                self.status_msg = format!("Fetching {}...", url);
                 self.url_input = url.clone();
                 self.load_start_time = Some(Instant::now());
-                
-                let start = Instant::now();
-                
-                match self.browser.load_url(&url) {
-                    Ok(rendered) => {
-                        let elapsed = start.elapsed().as_millis() as u64;
-                        self.last_load_time = Some(elapsed);
-                        self.rendered_content = rendered;
-                        self.is_loading = false;
-                        self.load_start_time = None;
-                        
-                        if let Some(stats) = &self.browser.last_render_stats {
-                            self.render_stats_text = format!(
-                                "Parse: {}ms | Style: {}ms | Layout: {}ms | Render: {}ms | Total: {}ms | {} DOM nodes",
-                                stats.parse_time_ms, stats.style_time_ms,
-                                stats.layout_time_ms, stats.render_time_ms,
-                                stats.total_time_ms, stats.dom_nodes
-                            );
+                self.render_stats_text = String::new();
+
+                // Launch async network fetch — UI stays responsive
+                let fetch_url = url.clone();
+                return Command::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            crate::network::fetch_url(&fetch_url)
+                                .map(|result| (result.body, result.url, result.fetch_time_ms))
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
+                    },
+                    |result| match result {
+                        Ok((html, url, fetch_time)) => {
+                            Message::PageLoaded { html, url, fetch_time }
                         }
-                        
-                        let title = self.browser.active_tab()
-                            .map(|t| t.title.clone())
-                            .unwrap_or_else(|| url.clone());
-                        self.page_heading = format!("{}", title);
-                        self.status_msg = format!("{} | {}ms", self.browser.status_string(), elapsed);
-                    }
-                    Err(e) => {
-                        self.is_loading = false;
-                        self.load_start_time = None;
-                        self.status_msg = format!("Error: {}", e);
-                        self.rendered_content = format_error_page(&e, &url);
-                    }
-                }
+                        Err(e) => Message::LoadError(e),
+                    },
+                )
             }
             Message::GoBack => {
                 self.browser.go_back();
@@ -247,35 +236,40 @@ impl Application for GhitaBrowserApp {
                     }
                     self.url_input = url.clone();
                     self.is_loading = true;
+                    self.status_msg = format!("Reloading {}...", url);
                     self.load_start_time = Some(Instant::now());
-                    
-                    let start = Instant::now();
-                    match self.browser.load_url(&url) {
-                        Ok(rendered) => {
-                            self.last_load_time = Some(start.elapsed().as_millis() as u64);
-                            self.rendered_content = rendered;
-                            self.is_loading = false;
-                            self.load_start_time = None;
-                            self.status_msg = format!("Reloaded | {}ms", self.last_load_time.unwrap_or(0));
-                        }
-                        Err(e) => {
-                            self.is_loading = false;
-                            self.load_start_time = None;
-                            self.status_msg = format!("Reload error: {}", e);
-                            self.rendered_content = format_error_page(&e, &url);
-                        }
-                    }
+                    self.render_stats_text = String::new();
+
+                    let fetch_url = url.clone();
+                    return Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                crate::network::fetch_url(&fetch_url)
+                                    .map(|result| (result.body, result.url, result.fetch_time_ms))
+                                    .map_err(|e| e.to_string())
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
+                        },
+                        |result| match result {
+                            Ok((html, url, fetch_time)) => {
+                                Message::PageLoaded { html, url, fetch_time }
+                            }
+                            Err(e) => Message::LoadError(e),
+                        },
+                    );
                 }
+                return Command::none();
             }
             Message::Home => {
                 let html = String::from(
-                    "<html><head><title>GhitaBrowser v0.1.2</title></head>\
-                     <body><h1>🚀 GhitaBrowser v0.1.2</h1>\
+                    "<html><head><title>GhitaBrowser v0.1.5</title></head>\
+                     <body><h1>🚀 GhitaBrowser v0.1.5</h1>\
                      <p>Welcome! Enter a URL above to start browsing.</p></body></html>"
                 );
                 let _ = self.browser.load_html("https://ghitabrowser.local", &html);
                 self.url_input = "https://ghitabrowser.local".to_string();
-                self.page_heading = "GhitaBrowser v0.1.2".to_string();
+                self.page_heading = "GhitaBrowser v0.1.5".to_string();
                 self.rendered_content = self.browser.render_current();
                 self.status_msg = "Home".to_string();
                 self.is_loading = false;
@@ -311,15 +305,19 @@ impl Application for GhitaBrowserApp {
                 if let Some(tab) = self.browser.tabs.get_tab_by_index(index) {
                     let id = tab.id;
                     self.browser.tabs.remove_tab(id);
-                    
+
+                    // If no tabs left, create a blank one
+                    if self.browser.tab_count() == 0 {
+                        let blank_html = "<html><head><title>New Tab</title></head>\
+                             <body><h1>New Tab</h1><p>Enter a URL and press Go.</p></body></html>";
+                        let dom = parse_html(blank_html);
+                        self.browser.add_tab("about:blank", dom, "New Tab");
+                    }
+
                     if let Some(active) = self.browser.active_tab() {
                         self.url_input = active.url.clone();
                         self.page_heading = format!("{}", active.title);
                         self.rendered_content = self.browser.render_current();
-                    } else {
-                        self.rendered_content = "No open tabs".to_string();
-                        self.page_heading = "GhitaBrowser".to_string();
-                        self.url_input = String::new();
                     }
                     self.status_msg = format!("Tab closed ({} remaining)", self.browser.tab_count());
                 }
@@ -328,15 +326,19 @@ impl Application for GhitaBrowserApp {
                 if let Some(active) = self.browser.active_tab() {
                     let id = active.id;
                     self.browser.tabs.remove_tab(id);
-                    
+
+                    // If no tabs left, create a blank one
+                    if self.browser.tab_count() == 0 {
+                        let blank_html = "<html><head><title>New Tab</title></head>\
+                             <body><h1>New Tab</h1><p>Enter a URL and press Go.</p></body></html>";
+                        let dom = parse_html(blank_html);
+                        self.browser.add_tab("about:blank", dom, "New Tab");
+                    }
+
                     if let Some(active) = self.browser.active_tab() {
                         self.url_input = active.url.clone();
                         self.page_heading = format!("{}", active.title);
                         self.rendered_content = self.browser.render_current();
-                    } else {
-                        self.rendered_content = "No open tabs".to_string();
-                        self.page_heading = "GhitaBrowser".to_string();
-                        self.url_input = String::new();
                     }
                     self.status_msg = format!("Tab closed ({} remaining)", self.browser.tab_count());
                 }
@@ -361,6 +363,15 @@ impl Application for GhitaBrowserApp {
                     self.js_input_text = String::new();
                     self.status_msg = "DevTools opened".to_string();
                 } else {
+                    self.show_storage = false;
+                    self.show_cache = false;
+                    self.show_js_console = false;
+                    self.status_msg = "DevTools closed".to_string();
+                }
+            }
+            Message::CloseDevTools => {
+                if self.show_devtools {
+                    self.show_devtools = false;
                     self.show_storage = false;
                     self.show_cache = false;
                     self.show_js_console = false;
@@ -420,15 +431,122 @@ impl Application for GhitaBrowserApp {
             Message::FocusUrl => {
                 self.status_msg = "URL bar ready — start typing".to_string();
             }
-            Message::PageLoaded(content) => {
-                self.rendered_content = content;
+            Message::PageLoaded { html, url, fetch_time } => {
+                self.is_loading = true;
+                self.status_msg = format!("Parsing {}...", url);
+
+                let start = Instant::now();
+
+                // 1. Parse HTML
+                let parse_start = Instant::now();
+                let dom = parse_html(&html);
+                let parse_time = parse_start.elapsed().as_millis() as u64;
+
+                // 2. Extract title
+                let title = {
+                    if let Some(title_elem) = dom.find_tag("title") {
+                        title_elem.text.trim().to_string()
+                    } else if let Some(h1_elem) = dom.find_tag("h1") {
+                        h1_elem.text.trim().to_string()
+                    } else {
+                        url.clone()
+                    }
+                };
+
+                // 3. Extract and parse <style> tags
+                let style_start = Instant::now();
+                let mut page_css_rules: Vec<crate::css_parser::CssRule> = Vec::new();
+                let style_elements = dom.find_all_tags("style");
+                for style_elem in &style_elements {
+                    let css_text = style_elem.text.trim();
+                    if !css_text.is_empty() {
+                        let mut rules = crate::css_parser::parse_css(css_text);
+                        page_css_rules.append(&mut rules);
+                    }
+                }
+                let all_rules: Vec<crate::css_parser::CssRule> = self.browser.css_rules.iter()
+                    .cloned()
+                    .chain(page_css_rules)
+                    .collect();
+                let style_time = style_start.elapsed().as_millis() as u64;
+
+                // 4. Create layout
+                let layout_start = Instant::now();
+                let layout_tree = crate::layout::create_layout_tree(&dom, &all_rules, self.browser.viewport_width());
+                let layout_time = layout_start.elapsed().as_millis() as u64;
+
+                // Cache layout tree
+                if let Some(ref _root) = layout_tree {
+                    if let Some(tab) = self.browser.active_tab_mut() {
+                        tab.layout = layout_tree.clone();
+                    }
+                }
+
+                // 5. Render to text
+                let render_start = Instant::now();
+                let rendered = if let Some(ref root) = layout_tree {
+                    let tr = crate::text_renderer::TextRenderer::new(
+                        self.browser.viewport_width(),
+                        self.browser.viewport_height(),
+                    );
+                    tr.render_to_text(root)
+                } else {
+                    String::from("[Empty page]")
+                };
+                let render_time = render_start.elapsed().as_millis() as u64;
+
+                // 6. Count DOM nodes
+                fn count_elements(el: &crate::parser::Element) -> usize {
+                    1 + el.children.iter().map(count_elements).sum::<usize>()
+                }
+                let dom_nodes = count_elements(&dom);
+
+                let total_time = start.elapsed().as_millis() as u64;
+
+                self.browser.last_render_stats = Some(crate::RenderStats {
+                    parse_time_ms: parse_time,
+                    style_time_ms: style_time,
+                    layout_time_ms: layout_time,
+                    render_time_ms: render_time,
+                    total_time_ms: total_time,
+                    dom_nodes,
+                    layout_nodes: 0,
+                });
+
+                // 7. Update tab state
+                if let Some(tab) = self.browser.active_tab_mut() {
+                    let current_entry = crate::tab::HistoryEntry {
+                        url: tab.url.clone(),
+                        title: tab.title.clone(),
+                        dom: tab.dom.clone(),
+                        layout: tab.layout.clone(),
+                    };
+                    tab.push_history(current_entry);
+                    tab.dom = dom;
+                    tab.title = title.clone();
+                    tab.url = url.clone();
+                } else {
+                    self.browser.add_tab(&url, dom, &title);
+                }
+
+                // 8. Update UI state
+                self.rendered_content = rendered;
+                self.last_load_time = Some(fetch_time + total_time as u64);
                 self.is_loading = false;
                 self.load_start_time = None;
+                self.page_heading = title;
+                self.render_stats_text = format!(
+                    "Fetch: {}ms | Parse: {}ms | Style: {}ms | Layout: {}ms | Render: {}ms | Total: {}ms | {} DOM nodes",
+                    fetch_time, parse_time, style_time, layout_time, render_time,
+                    total_time, dom_nodes
+                );
+                self.status_msg = format!("Loaded {} | {}ms", url, fetch_time + total_time as u64);
             }
             Message::LoadError(err) => {
                 self.status_msg = format!("Error: {}", err);
                 self.is_loading = false;
                 self.load_start_time = None;
+                self.rendered_content = format_error_page(&err, &self.url_input);
             }
         }
         Command::none()
@@ -480,6 +598,9 @@ fn handle_keyboard(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifier
                     Key::Character(c) if c == "r" || c == "R" => {
                         Some(Message::Reload)
                     }
+                    Key::Character(c) if c == "d" || c == "D" => {
+                        Some(Message::ToggleDevTools)
+                    }
                     _ => None,
                 }
             } else if modifiers.alt() {
@@ -493,7 +614,12 @@ fn handle_keyboard(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifier
                     _ => None,
                 }
             } else {
-                None
+                match key {
+                    Key::Named(iced::keyboard::key::Named::Escape) => {
+                        Some(Message::CloseDevTools)
+                    }
+                    _ => None,
+                }
             }
         }
     }
@@ -657,9 +783,22 @@ impl GhitaBrowserApp {
         // Loading indicator
         if self.is_loading {
             items.push(
-                text("Loading... Please wait").size(14).style(iced::theme::Text::from(BRAND_ORANGE)).into()
+                container(
+                    row![
+                        text("⟳").size(16).style(iced::theme::Text::from(BRAND_ORANGE)),
+                        text(&self.status_msg).size(13).style(iced::theme::Text::from(BRAND_ORANGE)),
+                    ].spacing(8).align_items(iced::Alignment::Center)
+                )
+                .padding(8)
+                .style(|_: &Theme| container::Appearance {
+                    background: Some(iced::Background::Color(BRAND_NAVY_LIGHT)),
+                    text_color: Some(BRAND_ORANGE),
+                    border: iced::Border { color: BRAND_ORANGE, width: 1.0, radius: 6.0.into() },
+                    shadow: Shadow::default(),
+                })
+                .into()
             );
-            items.push(vertical_space().height(4).into());
+            items.push(vertical_space().height(6).into());
         }
         
         // Page content
@@ -906,46 +1045,6 @@ impl GhitaBrowserApp {
         .into()
     }
     
-    fn build_viewport_inner(&self) -> Element<'_, Message> {
-        let mut items: Vec<Element<'_, Message>> = vec![];
-        
-        if !self.page_heading.is_empty() {
-            items.push(
-                text(&self.page_heading).size(20).style(iced::theme::Text::from(BRAND_TEXT)).into()
-            );
-            items.push(vertical_space().height(6).into());
-        }
-        
-        if self.is_loading {
-            items.push(
-                text("Loading...").size(14).style(iced::theme::Text::from(BRAND_ORANGE)).into()
-            );
-            items.push(vertical_space().height(4).into());
-        }
-        
-        items.push(
-            text(&self.rendered_content).size(13)
-                .style(iced::theme::Text::from(if self.is_dark_theme { 
-                    Color::from_rgb(0.85, 0.85, 0.90) 
-                } else { 
-                    Color::from_rgb(0.20, 0.20, 0.25) 
-                }))
-                .into()
-        );
-        
-        if !self.render_stats_text.is_empty() {
-            items.push(vertical_space().height(8).into());
-            items.push(
-                text(&self.render_stats_text).size(11).style(iced::theme::Text::from(BRAND_TEXT_DIM)).into()
-            );
-        }
-        
-        scrollable(column(items).spacing(4))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-    
     fn build_status_bar(&self) -> Element<'_, Message> {
         let load_time_str = self.last_load_time
             .map(|t| format!("{}ms", t))
@@ -960,7 +1059,7 @@ impl GhitaBrowserApp {
             button(text("⚙").size(11).style(iced::theme::Text::from(BRAND_TEXT_DIM)))
                 .on_press(Message::ToggleDevTools)
                 .style(iced::theme::Button::Text),
-            text(format!("v0.1.2 | {} tabs", self.browser.tab_count())).size(11).style(iced::theme::Text::from(BRAND_TEXT_DIM)),
+            text(format!("v0.1.5 | {} tabs", self.browser.tab_count())).size(11).style(iced::theme::Text::from(BRAND_TEXT_DIM)),
         ]
         .spacing(6)
         .padding(4)
@@ -1002,6 +1101,6 @@ pub fn run_gui() -> Result<(), iced::Error> {
     let mut settings = Settings::default();
     settings.window.size = iced::Size::new(1280.0, 900.0);
     settings.window.min_size = Some(iced::Size::new(800.0, 600.0));
-    info!("Starting GhitaBrowser v0.1.2 GUI");
+    info!("Starting GhitaBrowser v0.1.5 GUI");
     GhitaBrowserApp::run(settings)
 }

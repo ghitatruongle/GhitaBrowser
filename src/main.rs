@@ -1,4 +1,4 @@
-// GhitaBrowser v0.1.2 - Main entry point
+// GhitaBrowser v0.1.5 - Main entry point
 #![windows_subsystem = "windows"]
 
 #[cfg(debug_assertions)]
@@ -26,7 +26,7 @@ fn print_banner() {
     #[cfg(debug_assertions)]
     {
         println!("╔══════════════════════════════════════════╗");
-        println!("║   🦀 GhitaBrowser v0.1.2                ║");
+        println!("║   🦀 GhitaBrowser v0.1.5                ║");
         println!("║   Next-Gen Rust Browser Engine           ║");
         println!("╚══════════════════════════════════════════╝");
     }
@@ -64,7 +64,7 @@ fn main() {
         let test_html = r#"<html>
             <head><title>GhitaBrowser Test</title></head>
             <body>
-                <h1 class="main-title">Welcome to GhitaBrowser v0.1.2!</h1>
+                <h1 class="main-title">Welcome to GhitaBrowser v0.1.5!</h1>
                 <p>This is a <strong>Rust</strong> browser built from scratch.</p>
                 <img src="logo.png" alt="Logo">
                 <!-- This is a comment -->
@@ -121,7 +121,7 @@ fn main() {
     {
         println!("\n📐 Layout Engine: Box model with text wrapping");
         let test_html = r#"<html><head><title>GhitaBrowser Test</title></head><body>
-            <h1 class="main-title">Welcome to GhitaBrowser v0.1.2!</h1>
+            <h1 class="main-title">Welcome to GhitaBrowser v0.1.5!</h1>
             <p>This is a <strong>Rust</strong> browser built from scratch.</p>
             <ul><li>Item A &amp; B</li><li>Item C</li></ul>
         </body></html>"#;
@@ -231,13 +231,16 @@ fn main() {
     {
         println!("\n═══════════════════════════════════════════");
         println!("✅ All subsystems initialized successfully!");
-        println!("🌐 Launching GhitaBrowser v0.1.2 GUI...");
+        println!("🌐 Launching GhitaBrowser v0.1.5 GUI...");
         println!("═══════════════════════════════════════════\n");
     }
 
     // Launch GUI
-    if let Err(_e) = ghitabrowser::ui::run_gui() {
+    match ghitabrowser::ui::run_gui() {
+        Ok(()) => {}
         #[cfg(debug_assertions)]
-        eprintln!("GUI launch error: {}", e);
+        Err(e) => eprintln!("GUI launch error: {}", e),
+        #[cfg(not(debug_assertions))]
+        Err(_) => {}
     }
 }

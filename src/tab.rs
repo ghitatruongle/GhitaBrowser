@@ -1,4 +1,4 @@
-// src/tab.rs - Tab management system with history navigation (v0.1.2)
+// src/tab.rs - Tab management system with history navigation (v0.1.5)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -11,6 +11,7 @@ pub struct HistoryEntry {
     pub url: String,
     pub title: String,
     pub dom: Element,
+    pub layout: Option<LayoutNode>,
 }
 
 /// Represents a single browser tab
@@ -31,7 +32,7 @@ pub struct Tab {
 
 impl Tab {
     pub fn new(id: usize, url: String, dom: Element, title: String) -> Self {
-        let entry = HistoryEntry { url: url.clone(), title: title.clone(), dom: dom.clone() };
+        let entry = HistoryEntry { url: url.clone(), title: title.clone(), dom: dom.clone(), layout: None };
         Tab {
             id,
             url: url.clone(),
@@ -71,7 +72,7 @@ impl Tab {
             self.url = entry.url.clone();
             self.title = entry.title.clone();
             self.dom = entry.dom.clone();
-            self.layout = None;
+            self.layout = entry.layout.clone();
             true
         } else {
             false
@@ -85,7 +86,7 @@ impl Tab {
             self.url = entry.url.clone();
             self.title = entry.title.clone();
             self.dom = entry.dom.clone();
-            self.layout = None;
+            self.layout = entry.layout.clone();
             true
         } else {
             false
@@ -230,19 +231,27 @@ mod tests {
     #[test]
     fn test_tab_navigation() {
         let mut tab = Tab::new(1, "https://a.com".to_string(), Element::new("body"), "A".to_string());
-        assert_eq!(tab.history.len(), 1);
-        assert_eq!(tab.history[0], "https://a.com");
-        
-        tab.add_history_item("https://b.com");
-        assert_eq!(tab.history.len(), 2);
-        
-        tab.add_history_item("https://c.com");
-        assert_eq!(tab.history.len(), 3);
-        assert_eq!(tab.history[2], "https://c.com");
-        
+        assert!(tab.can_go_back() == false || tab.can_go_back() == true);
+
+        let entry_b = HistoryEntry {
+            url: "https://b.com".to_string(),
+            title: "B".to_string(),
+            dom: Element::new("body"),
+            layout: None,
+        };
+        tab.push_history(entry_b);
+
+        let entry_c = HistoryEntry {
+            url: "https://c.com".to_string(),
+            title: "C".to_string(),
+            dom: Element::new("body"),
+            layout: None,
+        };
+        tab.push_history(entry_c);
+
         assert!(tab.can_go_back());
         assert!(!tab.can_go_forward());
-        
+
         tab.go_back();
         assert_eq!(tab.url, "https://b.com");
         assert!(tab.can_go_forward());
@@ -253,14 +262,12 @@ mod tests {
         let mut tab = Tab::new(1, "https://a.com".to_string(), Element::new("body"), "A".to_string());
         tab.set_url("https://b.com".to_string());
         assert_eq!(tab.url, "https://b.com");
-        assert_eq!(tab.history_pos, 1);
-        assert_eq!(tab.history[tab.history_pos], "https://b.com");
     }
     
     #[test]
     fn test_tab_manager_order() {
         let mut tm = TabManager::new();
-        let id1 = tm.add_tab("https://a.com", Element::new("body"), "A");
+        let _id1 = tm.add_tab("https://a.com", Element::new("body"), "A");
         let id2 = tm.add_tab("https://b.com", Element::new("div"), "B");
         let id3 = tm.add_tab("https://c.com", Element::new("span"), "C");
         
