@@ -1,8 +1,35 @@
-/target
-**/*.rs.bk
+# Build output
+target/
+
+# Cargo
 Cargo.lock
+
+# Backup files
+*.rs.bk
+*.bk
+
+# Editor swap files
 *.swp
 *.swo
+
+# OS artifacts
 .DS_Store
 Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+
+# ZCode
 .zcode/
+
+# Build artifacts
+GhitaBrowser.exe
+*.pdb
