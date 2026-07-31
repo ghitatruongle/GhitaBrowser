@@ -1,4 +1,4 @@
-// src/network.rs - Real HTTP Networking & Resource Caching (v0.1.5)
+// src/network.rs - Real HTTP Networking & Resource Caching (v0.5.0)
 // Uses ureq for HTTP/HTTPS fetching with TLS support, integrated with cookie jar
 
 use std::collections::HashMap;
@@ -24,7 +24,7 @@ pub fn fetch_url(url_str: &str) -> Result<FetchResult, Box<dyn std::error::Error
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .redirects(5)
-        .user_agent("GhitaBrowser/0.1.5 (Rust)")
+        .user_agent("GhitaBrowser/0.5.0 (Rust)")
         .build();
     
     execute_fetch(&agent, url_str, None)
@@ -45,7 +45,7 @@ pub fn fetch_with_cookies(
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
         .redirects(5)
-        .user_agent("GhitaBrowser/0.1.5 (Rust)")
+        .user_agent("GhitaBrowser/0.5.0 (Rust)")
         .build();
     
     // Get matching cookies and build Cookie header
@@ -139,6 +139,62 @@ fn execute_fetch(
         fetch_time_ms,
         set_cookie_headers,
     })
+}
+
+/// Download raw bytes from a URL (used by the downloads manager)
+/// Returns (bytes, suggested_file_name, content_type)
+pub fn download_url(url_str: &str) -> Result<(Vec<u8>, String, String), Box<dyn std::error::Error>> {
+    let parsed = url::Url::parse(url_str)?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("Unsupported URL scheme: {}", scheme).into());
+    }
+    
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(60))
+        .redirects(5)
+        .user_agent("GhitaBrowser/0.5.0 (Rust)")
+        .build();
+    
+    let response = agent.get(url_str).call()?;
+    let content_type = response
+        .header("content-type")
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    
+    // Suggested name: Content-Disposition filename, else last URL path segment
+    let mut file_name = response
+        .header("content-disposition")
+        .and_then(|cd| cd.split("filename=").nth(1))
+        .and_then(|s| s.split(';').next())
+        .map(|s| s.trim().trim_matches('"').trim().to_string())
+        .unwrap_or_default();
+    if file_name.is_empty() {
+        file_name = parsed.path_segments()
+            .and_then(|segs| segs.filter(|s| !s.is_empty()).next_back())
+            .unwrap_or("")
+            .to_string();
+    }
+    if file_name.is_empty() {
+        file_name = format!("{}.html", parsed.host_str().unwrap_or("download"));
+    }
+    
+    // Read body bytes (limit 100MB). Read one extra byte so an over-limit
+    // response is reported as an error instead of being silently truncated.
+    use std::io::Read;
+    const MAX_DOWNLOAD: u64 = 100 * 1024 * 1024;
+    let mut bytes: Vec<u8> = Vec::new();
+    response.into_reader()
+        .take(MAX_DOWNLOAD + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DOWNLOAD {
+        return Err("File exceeds the 100MB download limit".into());
+    }
+    
+    info!("Downloaded {} ({} bytes) as {}", url_str, bytes.len(), file_name);
+    
+    Ok((bytes, file_name, content_type))
 }
 
 /// Fetch with caching support - returns cached result if fresh

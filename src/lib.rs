@@ -1,8 +1,8 @@
-// src/lib.rs - Public re-exports for ghitabrowser crate (v0.1.5)
+// src/lib.rs - Public re-exports for ghitabrowser crate (v0.5.0)
 #![allow(dead_code)]
 
 //! # GhitaBrowser
-//! A lightweight Rust browser v0.1.5 - built from scratch in safe Rust.
+//! A Chrome-style Rust browser v0.5.0 - built from scratch in safe Rust.
 
 pub mod parser;
 pub mod renderer;
@@ -16,6 +16,7 @@ pub mod image_loader;
 pub mod tab;
 pub mod javascript;
 pub mod performance;
+pub mod paint;
 
 /// Re-export parser module types for convenience
 pub use parser::{Element, parse_html};
@@ -26,7 +27,7 @@ pub use network::{fetch_url, fetch_with_cache, FetchResult, ResourceCache, Cache
 /// Re-export tab system
 pub use tab::{Tab, TabManager};
 /// Re-export storage system
-pub use storage::{StorageManager, Cookie, LocalStorage, CookieStore};
+pub use storage::{StorageManager, Cookie, LocalStorage, CookieStore, Bookmark, HistoryRecord, DownloadRecord, BrowserSettings};
 /// Re-export CSS parser
 pub use css_parser::{parse_css, CssRule, ComputedStyle};
 /// Re-export layout system
@@ -35,6 +36,8 @@ pub use layout::{LayoutNode, create_layout_tree, perform_layout};
 pub use javascript::JsvEngine;
 /// Re-export performance profiler
 pub use performance::Profiler;
+/// Re-export the pixel painter
+pub use paint::{DisplayList, DisplayItem, LinkRegion, Rgba, build_display_list};
 
 /// Performance statistics for monitoring
 #[derive(Debug, Clone)]

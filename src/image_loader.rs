@@ -1,4 +1,4 @@
-// src/image_loader.rs - Image loading, caching, and decoding (v0.1.5)
+// src/image_loader.rs - Image loading, caching, and decoding (v0.5.0)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -153,7 +153,7 @@ impl ImageCache {
                 .timeout_connect(std::time::Duration::from_secs(10))
                 .timeout_read(std::time::Duration::from_secs(30))
                 .redirects(5)
-                .user_agent("GhitaBrowser/0.1.5 (Rust)")
+                .user_agent("GhitaBrowser/0.5.0 (Rust)")
                 .build();
             let response = agent.get(url).call()?;
 

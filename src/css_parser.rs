@@ -1,4 +1,4 @@
-// src/css_parser.rs - Advanced CSS Parser and Style Computation (v0.1.5)
+// src/css_parser.rs - Advanced CSS Parser and Style Computation (v0.5.0)
 #![allow(dead_code)]
 
 // use std::collections::HashMap;
@@ -511,6 +511,18 @@ pub fn compute_computed_style(
     // Default display based on tag
     style.display = Some(default_display_for_tag(element_tag).to_string());
 
+    // User-agent stylesheet: default font-size/weight per tag (like Chrome's built-in styles).
+    // Applied after inheritance but before author rules, so page CSS can still override it.
+    if let Some(ua_size) = ua_font_size_px(element_tag) {
+        style.font_size = Some(CssUnit::Pixels(ua_size));
+    }
+    if matches!(element_tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "b" | "strong" | "th") {
+        style.font_weight = Some(700);
+    }
+    if matches!(element_tag, "i" | "em" | "cite" | "var" | "address") {
+        style.font_style = Some("italic".to_string());
+    }
+
     // Apply matching rules in specificity order
     let mut matching_rules: Vec<&CssRule> = Vec::new();
     for rule in rules {
@@ -532,6 +544,20 @@ pub fn compute_computed_style(
     }
 
     style
+}
+
+/// User-agent stylesheet default font size (px) for a tag, or None to inherit
+fn ua_font_size_px(tag: &str) -> Option<f64> {
+    match tag {
+        "h1" => Some(32.0),
+        "h2" => Some(24.0),
+        "h3" => Some(18.72),
+        "h4" => Some(16.0),
+        "h5" => Some(13.28),
+        "h6" => Some(10.72),
+        "small" | "sub" | "sup" => Some(13.28),
+        _ => None,
+    }
 }
 
 fn default_display_for_tag(tag: &str) -> &'static str {

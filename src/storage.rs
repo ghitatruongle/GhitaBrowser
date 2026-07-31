@@ -1,4 +1,4 @@
-// src/storage.rs - Cookie and localStorage persistence with serde (v0.1.5)
+// src/storage.rs - Cookies, localStorage, bookmarks, history, downloads & settings (v0.5.0)
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -282,18 +282,97 @@ impl LocalStorage {
     }
 }
 
+/// A saved bookmark (Chrome-style star)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub url: String,
+    pub title: String,
+    pub added_at: i64,
+}
+
+fn default_visit_count() -> u32 { 1 }
+
+/// A single entry in the global browsing history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryRecord {
+    pub url: String,
+    pub title: String,
+    pub visited_at: i64,
+    #[serde(default = "default_visit_count")]
+    pub visit_count: u32,
+}
+
+/// A completed (or failed) download
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRecord {
+    pub url: String,
+    pub file_name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub completed_at: i64,
+    pub success: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// User-facing browser settings (Chrome-style preferences)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserSettings {
+    /// "dark" or "light"
+    pub theme: String,
+    /// "google", "bing" or "duckduckgo"
+    pub search_engine: String,
+    /// Page opened by the Home button and new windows
+    pub homepage: String,
+    /// Whether the bookmarks bar is visible
+    pub show_bookmarks_bar: bool,
+    /// Default page zoom in percent (100 = normal)
+    pub default_zoom: u16,
+    /// Real pixel graphics renderer (true) or legacy text mode (false)
+    #[serde(default = "default_true")]
+    pub pixel_rendering: bool,
+}
+
+impl Default for BrowserSettings {
+    fn default() -> Self {
+        Self {
+            theme: "dark".to_string(),
+            search_engine: "google".to_string(),
+            homepage: "ghita://newtab".to_string(),
+            show_bookmarks_bar: true,
+            default_zoom: 100,
+            pixel_rendering: true,
+        }
+    }
+}
+
 /// Combined storage state for serialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StorageState {
     version: String,
     cookies: HashMap<String, HashSet<Cookie>>,
     local_storage: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
+    bookmarks: Vec<Bookmark>,
+    #[serde(default)]
+    history: Vec<HistoryRecord>,
+    #[serde(default)]
+    downloads: Vec<DownloadRecord>,
+    #[serde(default)]
+    settings: BrowserSettings,
 }
 
-/// Combined storage manager (cookies + localStorage) with persistence
+/// Combined storage manager (cookies + localStorage + bookmarks + history + downloads + settings)
 pub struct StorageManager {
     cookies: CookieStore,
     local_storage: HashMap<String, LocalStorage>, // Origin -> LocalStorage
+    bookmarks: Vec<Bookmark>,
+    /// Global browsing history, newest first
+    history: Vec<HistoryRecord>,
+    /// Download records, newest first
+    downloads: Vec<DownloadRecord>,
+    /// User settings (theme, search engine, homepage...)
+    pub settings: BrowserSettings,
     storage_dir: Option<PathBuf>,
 }
 
@@ -312,6 +391,10 @@ impl StorageManager {
         let mut mgr = Self {
             cookies: CookieStore::new(),
             local_storage: HashMap::new(),
+            bookmarks: Vec::new(),
+            history: Vec::new(),
+            downloads: Vec::new(),
+            settings: BrowserSettings::default(),
             storage_dir,
         };
         
@@ -373,9 +456,13 @@ impl StorageManager {
             .collect();
         
         let state = StorageState {
-            version: "0.1.5".to_string(),
+            version: "0.5.0".to_string(),
             cookies: self.cookies.cookies.clone(),
             local_storage: ls_map,
+            bookmarks: self.bookmarks.clone(),
+            history: self.history.clone(),
+            downloads: self.downloads.clone(),
+            settings: self.settings.clone(),
         };
         
         match serde_json::to_string_pretty(&state) {
@@ -416,6 +503,12 @@ impl StorageManager {
                             self.local_storage.insert(origin, ls);
                         }
                         
+                        // Restore bookmarks, history, downloads and settings
+                        self.bookmarks = state.bookmarks;
+                        self.history = state.history;
+                        self.downloads = state.downloads;
+                        self.settings = state.settings;
+                        
                         info!("Storage loaded from {:?}", path);
                     }
                     Err(e) => {
@@ -453,6 +546,99 @@ impl StorageManager {
     /// Get all origins that have localStorage
     pub fn local_storage_origins(&self) -> Vec<String> {
         self.local_storage.keys().cloned().collect()
+    }
+    
+    // ===== Bookmarks =====
+    
+    /// All bookmarks, in insertion order
+    pub fn bookmarks(&self) -> &[Bookmark] {
+        &self.bookmarks
+    }
+    
+    /// Whether a URL is bookmarked
+    pub fn is_bookmarked(&self, url: &str) -> bool {
+        self.bookmarks.iter().any(|b| b.url == url)
+    }
+    
+    /// Toggle a bookmark; returns true if the URL is now bookmarked
+    pub fn toggle_bookmark(&mut self, url: &str, title: &str) -> bool {
+        if self.is_bookmarked(url) {
+            self.bookmarks.retain(|b| b.url != url);
+            false
+        } else {
+            self.bookmarks.push(Bookmark {
+                url: url.to_string(),
+                title: if title.trim().is_empty() { url.to_string() } else { title.to_string() },
+                added_at: chrono::Utc::now().timestamp(),
+            });
+            true
+        }
+    }
+    
+    /// Remove a bookmark by URL
+    pub fn remove_bookmark(&mut self, url: &str) {
+        self.bookmarks.retain(|b| b.url != url);
+    }
+    
+    // ===== Browsing history =====
+    
+    /// Global history, newest first
+    pub fn history(&self) -> &[HistoryRecord] {
+        &self.history
+    }
+    
+    /// Record a visit; merges duplicates and keeps newest first (capped at 2000 entries)
+    pub fn add_history(&mut self, url: &str, title: &str) {
+        let now = chrono::Utc::now().timestamp();
+        let prev_count = if let Some(pos) = self.history.iter().position(|h| h.url == url) {
+            let old = self.history.remove(pos);
+            old.visit_count
+        } else {
+            0
+        };
+        self.history.insert(0, HistoryRecord {
+            url: url.to_string(),
+            title: if title.trim().is_empty() { url.to_string() } else { title.to_string() },
+            visited_at: now,
+            visit_count: prev_count + 1,
+        });
+        self.history.truncate(2000);
+    }
+    
+    /// Remove a single history entry by URL
+    pub fn remove_history_entry(&mut self, url: &str) {
+        self.history.retain(|h| h.url != url);
+    }
+    
+    /// Clear all browsing history
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+    
+    /// Most visited sites (for the New Tab page tiles)
+    pub fn top_sites(&self, n: usize) -> Vec<HistoryRecord> {
+        let mut sorted: Vec<HistoryRecord> = self.history.clone();
+        sorted.sort_by(|a, b| b.visit_count.cmp(&a.visit_count).then(b.visited_at.cmp(&a.visited_at)));
+        sorted.truncate(n);
+        sorted
+    }
+    
+    // ===== Downloads =====
+    
+    /// Download records, newest first
+    pub fn downloads(&self) -> &[DownloadRecord] {
+        &self.downloads
+    }
+    
+    /// Add a download record (newest first, capped at 200)
+    pub fn add_download(&mut self, record: DownloadRecord) {
+        self.downloads.insert(0, record);
+        self.downloads.truncate(200);
+    }
+    
+    /// Clear the downloads list (does not delete files)
+    pub fn clear_downloads(&mut self) {
+        self.downloads.clear();
     }
 }
 

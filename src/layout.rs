@@ -1,4 +1,4 @@
-// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.1.5)
+// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.5.0)
 #![allow(dead_code)]
 
 use crate::parser::Element;
@@ -114,6 +114,29 @@ pub fn get_font_size(style: &ComputedStyle, parent_font_size: f64) -> f64 {
         .unwrap_or(parent_font_size)
 }
 
+/// UA-stylesheet default font size per tag (like Chrome's built-in styles)
+pub fn default_font_size_for_tag(tag: &str, parent_font_size: f64) -> f64 {
+    match tag {
+        "h1" => 32.0,
+        "h2" => 24.0,
+        "h3" => 18.72,
+        "h4" => 16.0,
+        "h5" => 13.28,
+        "h6" => 10.72,
+        "small" | "sub" | "sup" => 13.28,
+        "code" | "pre" | "kbd" | "samp" => 13.0,
+        _ => parent_font_size,
+    }
+}
+
+/// Effective font size: CSS value if present, otherwise UA default for the tag
+pub fn effective_font_size(style: &ComputedStyle, tag: &str, parent_font_size: f64) -> f64 {
+    style.font_size
+        .as_ref()
+        .map(|fs| fs.to_pixels(parent_font_size, 16.0))
+        .unwrap_or_else(|| default_font_size_for_tag(tag, parent_font_size))
+}
+
 /// Wrap text to fit within a given width
 pub fn wrap_text(text: &str, max_width: f64, font_size: f64) -> Vec<String> {
     if max_width <= 0.0 || text.is_empty() {
@@ -181,7 +204,7 @@ fn build_layout_node(
     );
     
     let display_type = parse_display_style(&computed_style, &element.tag);
-    let font_size = get_font_size(&computed_style, parent_font_size);
+    let font_size = effective_font_size(&computed_style, &element.tag, parent_font_size);
 
     if display_type == DisplayType::None {
         return None;
@@ -271,7 +294,7 @@ fn layout_node_recursive(
     parent_width: f64,
     parent_font_size: f64,
 ) -> f64 {
-    let font_size = get_font_size(&node.computed_style, parent_font_size);
+    let font_size = effective_font_size(&node.computed_style, &node.element.tag, parent_font_size);
     
     // Set position
     node.rect.x = current_x + node.rect.margin_left;
@@ -305,27 +328,61 @@ fn layout_node_recursive(
     };
     let text_height = text_lines.len() as f64 * (font_size * 1.4); // line height
 
-    // Layout children
-    let mut child_y = content_y;
-    let mut total_child_height = 0.0;
+    // If this node has BOTH direct text and element children, reserve room for the
+    // text so children are laid out below it instead of overlapping (visible now
+    // that pages are painted with real pixels).
+    let own_text_height = if node.children.is_empty() { 0.0 } else { text_height };
+
+    // Inline formatting context: inline / inline-block children flow horizontally
+    // and wrap to a new line when they no longer fit; block / list-item children
+    // always break onto their own full-width line (like Chrome).
+    let start_y = content_y + own_text_height;
+    let mut line_x = content_x;
+    let mut line_y = start_y;
+    let mut line_height: f64 = 0.0;
+    let default_line = font_size * 1.4;
 
     for child in &mut node.children {
-        let child_height = layout_node_recursive(
-            child,
-            content_x,
-            child_y,
-            inner_width,
-            font_size,
+        let is_inline = matches!(
+            child.rect.display,
+            DisplayType::Inline | DisplayType::InlineBlock
         );
-        child_y += child_height;
-        total_child_height += child_height;
+
+        if is_inline {
+            // Width is known from the build step (text width + padding); use it to
+            // decide whether the inline box still fits on the current line.
+            let child_outer = child.rect.width
+                + child.rect.margin_left + child.rect.margin_right;
+            if line_x > content_x && line_x + child_outer > content_x + inner_width {
+                // Wrap to the next line
+                line_y += if line_height > 0.0 { line_height } else { default_line };
+                line_x = content_x;
+                line_height = 0.0;
+            }
+            let child_height = layout_node_recursive(child, line_x, line_y, inner_width, font_size);
+            line_x += child.rect.outer_width();
+            line_height = line_height.max(child_height);
+        } else {
+            // Block-level child: finish the current inline line first
+            if line_x > content_x {
+                line_y += if line_height > 0.0 { line_height } else { default_line };
+                line_x = content_x;
+                line_height = 0.0;
+            }
+            let child_height = layout_node_recursive(child, content_x, line_y, inner_width, font_size);
+            line_y += child_height;
+        }
+    }
+    // Include the height of the last (unfinished) inline line
+    if line_x > content_x {
+        line_y += if line_height > 0.0 { line_height } else { default_line };
     }
 
     // Compute final height
-    let content_height = if total_child_height > 0.0 {
-        total_child_height
-    } else {
+    let content_height = if node.children.is_empty() {
         text_height
+    } else {
+        (line_y - content_y).max(own_text_height)
     };
 
     node.rect.height = (content_height
@@ -407,5 +464,33 @@ mod tests {
         let (root, _) = build_layout_node(&dom, None, &rules, 800.0, 16.0).unwrap();
         assert_eq!(root.children.len(), 1); // script should be filtered out
         assert_eq!(root.children[0].element.tag, "p");
+    }
+
+    #[test]
+    fn test_inline_children_share_a_line() {
+        // Two inline links in a block should sit on the same line, side by side
+        let html = "<div><a href='#'>Home</a><a href='#'>About</a></div>";
+        let dom = crate::parser::parse_html(html);
+        let rules: Vec<css_parser::CssRule> = vec![];
+        let mut layout = create_layout_tree(&dom, &rules, 800).unwrap();
+        perform_layout(&mut layout, 800.0);
+        let links: Vec<&LayoutNode> = layout.children.iter()
+            .filter(|c| c.element.tag == "a").collect();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].rect.y, links[1].rect.y, "inline links must share a line");
+        assert!(links[1].rect.x > links[0].rect.x, "second link must be to the right");
+    }
+
+    #[test]
+    fn test_block_children_stack_vertically() {
+        let html = "<div><p>One</p><p>Two</p></div>";
+        let dom = crate::parser::parse_html(html);
+        let rules: Vec<css_parser::CssRule> = vec![];
+        let mut layout = create_layout_tree(&dom, &rules, 800).unwrap();
+        perform_layout(&mut layout, 800.0);
+        let ps: Vec<&LayoutNode> = layout.children.iter()
+            .filter(|c| c.element.tag == "p").collect();
+        assert_eq!(ps.len(), 2);
+        assert!(ps[1].rect.y > ps[0].rect.y, "block children must stack vertically");
     }
 }

@@ -1,4 +1,4 @@
-// src/tab.rs - Tab management system with history navigation (v0.1.5)
+// src/tab.rs - Tab management system with history navigation (v0.3.0)
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -24,6 +24,10 @@ pub struct Tab {
     pub dom: Element,
     /// Cached layout tree for rendering
     pub layout: Option<LayoutNode>,
+    /// Incognito tabs never record global browsing history
+    pub incognito: bool,
+    /// True when the current page is an error page (excluded from session history)
+    pub is_error: bool,
     /// History stack for back/forward navigation
     history: Vec<HistoryEntry>,
     /// Current history position (0-indexed)
@@ -39,6 +43,8 @@ impl Tab {
             title,
             dom,
             layout: None,
+            incognito: false,
+            is_error: false,
             history: vec![entry],
             history_pos: 0,
         }
@@ -73,6 +79,7 @@ impl Tab {
             self.title = entry.title.clone();
             self.dom = entry.dom.clone();
             self.layout = entry.layout.clone();
+            self.is_error = false; // history only holds successfully loaded pages
             true
         } else {
             false
@@ -87,6 +94,7 @@ impl Tab {
             self.title = entry.title.clone();
             self.dom = entry.dom.clone();
             self.layout = entry.layout.clone();
+            self.is_error = false; // history only holds successfully loaded pages
             true
         } else {
             false
@@ -109,6 +117,8 @@ pub struct TabManager {
     next_id: usize,
     /// Ordering of tab IDs for UI
     tab_order: Vec<usize>,
+    /// Recently closed tabs (url, title) for "Reopen closed tab" (Ctrl+Shift+T)
+    closed_tabs: Vec<(String, String)>,
 }
 
 impl TabManager {
@@ -118,6 +128,7 @@ impl TabManager {
             active_tab_id: None,
             next_id: 1,
             tab_order: Vec::new(),
+            closed_tabs: Vec::new(),
         }
     }
 
@@ -164,8 +175,38 @@ impl TabManager {
             self.active_tab_id = Some(id);
         }
     }
+    
+    /// Activate a tab by its position in the tab bar
+    pub fn set_active_by_index(&mut self, index: usize) {
+        if let Some(&id) = self.tab_order.get(index) {
+            self.active_tab_id = Some(id);
+        }
+    }
+    
+    /// Cycle to the next tab (Ctrl+Tab)
+    pub fn activate_next(&mut self) {
+        if self.tab_order.is_empty() { return; }
+        let pos = self.active_tab_id
+            .and_then(|id| self.tab_order.iter().position(|&tid| tid == id))
+            .unwrap_or(0);
+        let next = (pos + 1) % self.tab_order.len();
+        self.active_tab_id = Some(self.tab_order[next]);
+    }
+    
+    /// Cycle to the previous tab (Ctrl+Shift+Tab)
+    pub fn activate_prev(&mut self) {
+        if self.tab_order.is_empty() { return; }
+        let pos = self.active_tab_id
+            .and_then(|id| self.tab_order.iter().position(|&tid| tid == id))
+            .unwrap_or(0);
+        let prev = (pos + self.tab_order.len() - 1) % self.tab_order.len();
+        self.active_tab_id = Some(self.tab_order[prev]);
+    }
 
     pub fn remove_tab(&mut self, id: usize) -> Option<Tab> {
+        // Remember the position for Chrome-style right-neighbor activation
+        let old_pos = self.tab_order.iter().position(|&tid| tid == id);
+        
         // Remove from order
         self.tab_order.retain(|&tid| tid != id);
         
@@ -174,13 +215,36 @@ impl TabManager {
             if self.tab_order.is_empty() {
                 self.active_tab_id = None;
             } else {
-                // Find the position of the removed tab in the old order
-                // Activate the tab to the right, or the last tab if removing the rightmost
-                self.active_tab_id = Some(self.tab_order[self.tab_order.len() - 1]);
+                // Chrome behavior: activate the tab to the right,
+                // or the new last tab if the rightmost tab was closed
+                let idx = old_pos.unwrap_or(0).min(self.tab_order.len() - 1);
+                self.active_tab_id = Some(self.tab_order[idx]);
             }
         }
         
-        self.tabs.remove(&id)
+        let removed = self.tabs.remove(&id);
+        
+        // Remember closed tab for Ctrl+Shift+T (skip internal & incognito pages)
+        if let Some(ref tab) = removed {
+            if !tab.incognito && (tab.url.starts_with("http://") || tab.url.starts_with("https://")) {
+                self.closed_tabs.push((tab.url.clone(), tab.title.clone()));
+                if self.closed_tabs.len() > 25 {
+                    self.closed_tabs.remove(0);
+                }
+            }
+        }
+        
+        removed
+    }
+    
+    /// Pop the most recently closed tab (url, title), if any
+    pub fn pop_closed_tab(&mut self) -> Option<(String, String)> {
+        self.closed_tabs.pop()
+    }
+    
+    /// Whether there is a closed tab available to reopen
+    pub fn has_closed_tabs(&self) -> bool {
+        !self.closed_tabs.is_empty()
     }
 
     pub fn close_all_tabs(&mut self) {
