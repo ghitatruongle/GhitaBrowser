@@ -1,8 +1,10 @@
-// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.5.0)
+// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.6.0)
 #![allow(dead_code)]
 
+use crate::css_parser::{
+    compute_computed_style, parse_class_attr, ComputedStyle, CssRule, CssUnit,
+};
 use crate::parser::Element;
-use crate::css_parser::{CssRule, ComputedStyle, compute_computed_style, parse_class_attr};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayType {
@@ -36,17 +38,23 @@ pub struct RectModel {
 
 impl RectModel {
     pub fn content_width(&self) -> f64 {
-        (self.width - self.padding_left - self.padding_right - self.border_left - self.border_right).max(0.0)
+        (self.width - self.padding_left - self.padding_right - self.border_left - self.border_right)
+            .max(0.0)
     }
 
     pub fn content_height(&self) -> f64 {
-        (self.height - self.padding_top - self.padding_bottom - self.border_top - self.border_bottom).max(0.0)
+        (self.height
+            - self.padding_top
+            - self.padding_bottom
+            - self.border_top
+            - self.border_bottom)
+            .max(0.0)
     }
-    
+
     pub fn outer_width(&self) -> f64 {
         self.width + self.margin_left + self.margin_right
     }
-    
+
     pub fn outer_height(&self) -> f64 {
         self.height + self.margin_top + self.margin_bottom
     }
@@ -92,7 +100,9 @@ pub fn parse_display_style(style: &ComputedStyle, tag: &str) -> DisplayType {
 
 fn default_display_for_tag(tag: &str) -> DisplayType {
     match tag {
-        "span" | "a" | "i" | "b" | "em" | "strong" | "img" | "code" | "label" => DisplayType::Inline,
+        "span" | "a" | "i" | "b" | "em" | "strong" | "img" | "code" | "label" => {
+            DisplayType::Inline
+        }
         "head" | "script" | "style" | "meta" | "link" | "noscript" => DisplayType::None,
         "li" => DisplayType::ListItem,
         _ => DisplayType::Block,
@@ -108,7 +118,8 @@ pub fn estimate_text_width(text: &str, font_size: f64) -> f64 {
 
 /// Get font size from computed style
 pub fn get_font_size(style: &ComputedStyle, parent_font_size: f64) -> f64 {
-    style.font_size
+    style
+        .font_size
         .as_ref()
         .map(|fs| fs.to_pixels(parent_font_size, 16.0))
         .unwrap_or(parent_font_size)
@@ -131,7 +142,8 @@ pub fn default_font_size_for_tag(tag: &str, parent_font_size: f64) -> f64 {
 
 /// Effective font size: CSS value if present, otherwise UA default for the tag
 pub fn effective_font_size(style: &ComputedStyle, tag: &str, parent_font_size: f64) -> f64 {
-    style.font_size
+    style
+        .font_size
         .as_ref()
         .map(|fs| fs.to_pixels(parent_font_size, 16.0))
         .unwrap_or_else(|| default_font_size_for_tag(tag, parent_font_size))
@@ -142,18 +154,19 @@ pub fn wrap_text(text: &str, max_width: f64, font_size: f64) -> Vec<String> {
     if max_width <= 0.0 || text.is_empty() {
         return vec![text.to_string()];
     }
-    
+
     let char_width = font_size * 0.6;
     let max_chars = (max_width / char_width).max(1.0) as usize;
-    
+
     let mut lines = Vec::new();
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut current_line = String::new();
-    
+
     for word in words {
+        let word_chars = word.chars().count();
         if current_line.is_empty() {
             current_line = word.to_string();
-        } else if current_line.len() + 1 + word.len() <= max_chars {
+        } else if current_line.chars().count() + 1 + word_chars <= max_chars {
             current_line.push(' ');
             current_line.push_str(word);
         } else {
@@ -161,16 +174,24 @@ pub fn wrap_text(text: &str, max_width: f64, font_size: f64) -> Vec<String> {
             current_line = word.to_string();
         }
     }
-    
+
     if !current_line.is_empty() {
         lines.push(current_line);
     }
-    
+
     if lines.is_empty() {
         lines.push(text.to_string());
     }
-    
+
     lines
+}
+
+/// Whether a computed style sets a real (non-auto) width.
+fn has_explicit_width(style: &ComputedStyle) -> bool {
+    matches!(
+        style.width,
+        Some(CssUnit::Pixels(_) | CssUnit::Percent(_) | CssUnit::Em(_) | CssUnit::Rem(_))
+    )
 }
 
 /// Build a complete layout tree from DOM + CSS rules
@@ -194,15 +215,16 @@ fn build_layout_node(
 ) -> Option<(LayoutNode, ComputedStyle)> {
     let classes = parse_class_attr(element.get_attr("class").map(|s| s.as_str()));
     let elem_id = element.get_attr("id").map(|s| s.as_str());
-    
+
     let computed_style = compute_computed_style(
         &element.tag,
         &classes,
         elem_id,
         css_rules,
         parent_style,
+        &element.attrs,
     );
-    
+
     let display_type = parse_display_style(&computed_style, &element.tag);
     let font_size = effective_font_size(&computed_style, &element.tag, parent_font_size);
 
@@ -211,35 +233,61 @@ fn build_layout_node(
     }
 
     // Compute box model values
-    let margin_top = computed_style.margin_top.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
-    let margin_right = computed_style.margin_right.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
-    let margin_bottom = computed_style.margin_bottom.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
-    let margin_left = computed_style.margin_left.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
-    let padding_top = computed_style.padding_top.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
-    let padding_right = computed_style.padding_right.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
-    let padding_bottom = computed_style.padding_bottom.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
-    let padding_left = computed_style.padding_left.as_ref()
-        .map(|m| m.to_pixels(viewport_width, 16.0)).unwrap_or(0.0);
+    let margin_top = computed_style
+        .margin_top
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
+    let margin_right = computed_style
+        .margin_right
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
+    let margin_bottom = computed_style
+        .margin_bottom
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
+    let margin_left = computed_style
+        .margin_left
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
+    let padding_top = computed_style
+        .padding_top
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
+    let padding_right = computed_style
+        .padding_right
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
+    let padding_bottom = computed_style
+        .padding_bottom
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
+    let padding_left = computed_style
+        .padding_left
+        .as_ref()
+        .map(|m| m.to_pixels(viewport_width, 16.0))
+        .unwrap_or(0.0);
 
     let default_width = match display_type {
-        DisplayType::Block | DisplayType::ListItem => {
-            viewport_width - margin_left - margin_right
-        }
+        DisplayType::Block | DisplayType::ListItem => viewport_width - margin_left - margin_right,
         DisplayType::Inline | DisplayType::InlineBlock => {
-            estimate_text_width(&element.text, font_size) + padding_left + padding_right
+            // Include descendant text: <a>Home <b>Page</b></a> must size by the
+            // full "Home Page", not just the direct text "Home".
+            estimate_text_width(&element.text_content(), font_size) + padding_left + padding_right
         }
         DisplayType::None => 0.0,
     };
 
     // Resolve width from CSS
-    let width = computed_style.width.as_ref()
+    let width = computed_style
+        .width
+        .as_ref()
         .map(|w| w.to_pixels(viewport_width, 16.0))
         .unwrap_or(default_width);
 
@@ -295,7 +343,7 @@ fn layout_node_recursive(
     parent_font_size: f64,
 ) -> f64 {
     let font_size = effective_font_size(&node.computed_style, &node.element.tag, parent_font_size);
-    
+
     // Set position
     node.rect.x = current_x + node.rect.margin_left;
     node.rect.y = current_y + node.rect.margin_top;
@@ -303,13 +351,19 @@ fn layout_node_recursive(
     // Block/inline width calculation
     match node.rect.display {
         DisplayType::Block | DisplayType::ListItem => {
-            node.rect.width = (parent_width - node.rect.margin_left - node.rect.margin_right)
-                .max(0.0);
+            // Only auto-size when no explicit CSS width is set (including
+            // `width: auto`); an explicit width (e.g. 300px) must survive the
+            // layout pass instead of being recomputed to the full parent.
+            if !has_explicit_width(&node.computed_style) {
+                node.rect.width =
+                    (parent_width - node.rect.margin_left - node.rect.margin_right).max(0.0);
+            }
         }
         DisplayType::Inline | DisplayType::InlineBlock => {
             if node.rect.width == 0.0 {
-                node.rect.width = estimate_text_width(&node.element.text, font_size)
-                    + node.rect.padding_left + node.rect.padding_right;
+                node.rect.width = estimate_text_width(&node.element.text_content(), font_size)
+                    + node.rect.padding_left
+                    + node.rect.padding_right;
             }
         }
         DisplayType::None => {}
@@ -331,7 +385,11 @@ fn layout_node_recursive(
     // If this node has BOTH direct text and element children, reserve room for the
     // text so children are laid out below it instead of overlapping (visible now
     // that pages are painted with real pixels).
-    let own_text_height = if node.children.is_empty() { 0.0 } else { text_height };
+    let own_text_height = if node.children.is_empty() {
+        0.0
+    } else {
+        text_height
+    };
 
     // Inline formatting context: inline / inline-block children flow horizontally
     // and wrap to a new line when they no longer fit; block / list-item children
@@ -351,11 +409,14 @@ fn layout_node_recursive(
         if is_inline {
             // Width is known from the build step (text width + padding); use it to
             // decide whether the inline box still fits on the current line.
-            let child_outer = child.rect.width
-                + child.rect.margin_left + child.rect.margin_right;
+            let child_outer = child.rect.width + child.rect.margin_left + child.rect.margin_right;
             if line_x > content_x && line_x + child_outer > content_x + inner_width {
                 // Wrap to the next line
-                line_y += if line_height > 0.0 { line_height } else { default_line };
+                line_y += if line_height > 0.0 {
+                    line_height
+                } else {
+                    default_line
+                };
                 line_x = content_x;
                 line_height = 0.0;
             }
@@ -365,17 +426,26 @@ fn layout_node_recursive(
         } else {
             // Block-level child: finish the current inline line first
             if line_x > content_x {
-                line_y += if line_height > 0.0 { line_height } else { default_line };
+                line_y += if line_height > 0.0 {
+                    line_height
+                } else {
+                    default_line
+                };
                 line_x = content_x;
                 line_height = 0.0;
             }
-            let child_height = layout_node_recursive(child, content_x, line_y, inner_width, font_size);
+            let child_height =
+                layout_node_recursive(child, content_x, line_y, inner_width, font_size);
             line_y += child_height;
         }
     }
     // Include the height of the last (unfinished) inline line
     if line_x > content_x {
-        line_y += if line_height > 0.0 { line_height } else { default_line };
+        line_y += if line_height > 0.0 {
+            line_height
+        } else {
+            default_line
+        };
     }
 
     // Compute final height
@@ -386,8 +456,10 @@ fn layout_node_recursive(
     };
 
     node.rect.height = (content_height
-        + node.rect.padding_top + node.rect.padding_bottom
-        + node.rect.border_top + node.rect.border_bottom)
+        + node.rect.padding_top
+        + node.rect.padding_bottom
+        + node.rect.border_top
+        + node.rect.border_bottom)
         .max(font_size * 1.4); // Minimum height for one line
 
     node.rect.height
@@ -400,8 +472,10 @@ mod tests {
 
     #[test]
     fn test_parse_display_block() {
-        let mut style = ComputedStyle::default();
-        style.display = Some("block".to_string());
+        let style = ComputedStyle {
+            display: Some("block".to_string()),
+            ..Default::default()
+        };
         assert_eq!(parse_display_style(&style, "div"), DisplayType::Block);
     }
 
@@ -432,7 +506,7 @@ mod tests {
         let dom = crate::parser::parse_html(html);
         let css = "body { font-family: Arial; }";
         let rules = css_parser::parse_css(css);
-        
+
         if let Some(mut layout) = create_layout_tree(&dom, &rules, 800) {
             perform_layout(&mut layout, 800.0);
             assert!(layout.rect.width > 0.0);
@@ -446,7 +520,7 @@ mod tests {
         let dom = crate::parser::parse_html(html);
         let css = ".content { margin: 10px; padding: 5px; } p { color: red; }";
         let rules = css_parser::parse_css(css);
-        
+
         if let Some(mut layout) = create_layout_tree(&dom, &rules, 1024) {
             perform_layout(&mut layout, 1024.0);
             let p_node = &layout.children[0];
@@ -460,7 +534,7 @@ mod tests {
         let html = "<div><script>var x=1;</script><p>Visible</p></div>";
         let dom = crate::parser::parse_html(html);
         let rules = vec![];
-        
+
         let (root, _) = build_layout_node(&dom, None, &rules, 800.0, 16.0).unwrap();
         assert_eq!(root.children.len(), 1); // script should be filtered out
         assert_eq!(root.children[0].element.tag, "p");
@@ -474,11 +548,20 @@ mod tests {
         let rules: Vec<css_parser::CssRule> = vec![];
         let mut layout = create_layout_tree(&dom, &rules, 800).unwrap();
         perform_layout(&mut layout, 800.0);
-        let links: Vec<&LayoutNode> = layout.children.iter()
-            .filter(|c| c.element.tag == "a").collect();
+        let links: Vec<&LayoutNode> = layout
+            .children
+            .iter()
+            .filter(|c| c.element.tag == "a")
+            .collect();
         assert_eq!(links.len(), 2);
-        assert_eq!(links[0].rect.y, links[1].rect.y, "inline links must share a line");
-        assert!(links[1].rect.x > links[0].rect.x, "second link must be to the right");
+        assert_eq!(
+            links[0].rect.y, links[1].rect.y,
+            "inline links must share a line"
+        );
+        assert!(
+            links[1].rect.x > links[0].rect.x,
+            "second link must be to the right"
+        );
     }
 
     #[test]
@@ -488,9 +571,65 @@ mod tests {
         let rules: Vec<css_parser::CssRule> = vec![];
         let mut layout = create_layout_tree(&dom, &rules, 800).unwrap();
         perform_layout(&mut layout, 800.0);
-        let ps: Vec<&LayoutNode> = layout.children.iter()
-            .filter(|c| c.element.tag == "p").collect();
+        let ps: Vec<&LayoutNode> = layout
+            .children
+            .iter()
+            .filter(|c| c.element.tag == "p")
+            .collect();
         assert_eq!(ps.len(), 2);
-        assert!(ps[1].rect.y > ps[0].rect.y, "block children must stack vertically");
+        assert!(
+            ps[1].rect.y > ps[0].rect.y,
+            "block children must stack vertically"
+        );
+    }
+
+    #[test]
+    fn test_explicit_block_width_survives_layout() {
+        // width: 300px must not be overwritten by the layout pass
+        let html = "<div class='box'><p>x</p></div>";
+        let dom = crate::parser::parse_html(html);
+        let css = ".box { width: 300px; }";
+        let rules = css_parser::parse_css(css);
+        let mut layout = create_layout_tree(&dom, &rules, 800).unwrap();
+        perform_layout(&mut layout, 800.0);
+        // The DOM root is the div itself (parse_html unwraps the single child)
+        assert_eq!(layout.element.tag, "div");
+        assert!((layout.rect.width - 300.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_auto_margin_is_zero() {
+        // margin: 0 auto must not expand the margin to the parent width
+        let html = "<div class='box'><p>x</p></div>";
+        let dom = crate::parser::parse_html(html);
+        let css = ".box { margin: 0 auto; }";
+        let rules = css_parser::parse_css(css);
+        let mut layout = create_layout_tree(&dom, &rules, 800).unwrap();
+        perform_layout(&mut layout, 800.0);
+        assert_eq!(layout.rect.margin_left, 0.0);
+        assert_eq!(layout.rect.margin_right, 0.0);
+    }
+
+    #[test]
+    fn test_wrap_text_counts_chars_not_bytes() {
+        // 19 chars but 21 UTF-8 bytes; byte-counting wrapped mid-word, the
+        // char-based fix keeps it on one line (max_chars = 20 here)
+        let text = "xin chào thế giới!";
+        let lines = wrap_text(text, 192.0, 16.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], text);
+    }
+
+    #[test]
+    fn test_inline_width_includes_descendant_text() {
+        // <a>Home <b>Page</b></a> should be sized by "Home Page", not "Home"
+        let html = "<div><a href='#'>Home <b>Page</b></a></div>";
+        let dom = crate::parser::parse_html(html);
+        let rules: Vec<css_parser::CssRule> = vec![];
+        let mut layout = create_layout_tree(&dom, &rules, 800).unwrap();
+        perform_layout(&mut layout, 800.0);
+        let link = &layout.children[0];
+        let with_child_width = link.rect.width;
+        assert!(with_child_width > estimate_text_width("Home", 16.0));
     }
 }

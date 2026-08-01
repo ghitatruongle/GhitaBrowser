@@ -1,16 +1,24 @@
 // src/performance.rs - Performance Optimization & Profiling (Phase 21-22)
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use super::layout::LayoutNode;
+use std::collections::HashMap;
 
 pub struct Profiler {
     timings: HashMap<String, u64>,
 }
 
+impl Default for Profiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Profiler {
     pub fn new() -> Self {
-        Self { timings: HashMap::new() }
+        Self {
+            timings: HashMap::new(),
+        }
     }
 
     pub fn record(&mut self, name: &str, duration_ms: u64) {

@@ -1,10 +1,10 @@
-// src/paint.rs - Pixel painting: layout tree -> display list (v0.5.0)
+// src/paint.rs - Pixel painting: layout tree -> display list (v0.6.0)
 // Turns the layout tree into a flat list of paint commands (rects, borders,
 // text runs, link regions) that the GUI draws onto a real graphics canvas.
 // This module is UI-framework agnostic: colors are plain RGBA floats.
 #![allow(dead_code)]
 
-use crate::layout::{DisplayType, LayoutNode, effective_font_size, wrap_text};
+use crate::layout::{effective_font_size, wrap_text, DisplayType, LayoutNode};
 
 /// Plain RGBA color (0.0 - 1.0), independent from any GUI framework
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,7 +20,7 @@ impl Rgba {
         Self { r, g, b, a: 1.0 }
     }
 
-    pub const BLACK: Rgba = Rgba::rgb(0.067, 0.067, 0.067);   // #111111 default text
+    pub const BLACK: Rgba = Rgba::rgb(0.067, 0.067, 0.067); // #111111 default text
     pub const WHITE: Rgba = Rgba::rgb(1.0, 1.0, 1.0);
     /// Standard link blue (#1A0DAB like Google results)
     pub const LINK_BLUE: Rgba = Rgba::rgb(0.102, 0.051, 0.671);
@@ -30,9 +30,22 @@ impl Rgba {
 #[derive(Debug, Clone)]
 pub enum DisplayItem {
     /// Filled rectangle (backgrounds)
-    Rect { x: f32, y: f32, w: f32, h: f32, color: Rgba },
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: Rgba,
+    },
     /// Rectangle outline (borders), drawn as 4 thin filled rects by the GUI
-    Border { x: f32, y: f32, w: f32, h: f32, width: f32, color: Rgba },
+    Border {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        width: f32,
+        color: Rgba,
+    },
     /// One line of text
     TextRun {
         x: f32,
@@ -74,9 +87,11 @@ impl DisplayList {
 
     /// Find the topmost link under a document-space point
     pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
-        self.links.iter().rev().find(|l| {
-            x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h
-        }).map(|l| l.href.as_str())
+        self.links
+            .iter()
+            .rev()
+            .find(|l| x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h)
+            .map(|l| l.href.as_str())
     }
 }
 
@@ -127,12 +142,22 @@ pub fn build_display_list(root: &LayoutNode) -> DisplayList {
 
 /// Look for a background color on the root/html/body elements
 fn page_background(root: &LayoutNode) -> Option<Rgba> {
-    if let Some(bg) = root.computed_style.background_color.as_deref().and_then(parse_css_color) {
+    if let Some(bg) = root
+        .computed_style
+        .background_color
+        .as_deref()
+        .and_then(parse_css_color)
+    {
         return Some(bg);
     }
     for child in &root.children {
         if child.element.tag == "body" || child.element.tag == "html" {
-            if let Some(bg) = child.computed_style.background_color.as_deref().and_then(parse_css_color) {
+            if let Some(bg) = child
+                .computed_style
+                .background_color
+                .as_deref()
+                .and_then(parse_css_color)
+            {
                 return Some(bg);
             }
             if child.element.tag == "html" {
@@ -156,15 +181,27 @@ fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
     // Resolve inherited text properties (UA defaults + CSS)
     let is_link = parent.link || (tag == "a" && node.element.get_attr("href").is_some());
     let bold = parent.bold
-        || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th")
-        || node.computed_style.font_weight.map(|w| w >= 600).unwrap_or(false);
+        || matches!(
+            tag,
+            "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"
+        )
+        || node
+            .computed_style
+            .font_weight
+            .map(|w| w >= 600)
+            .unwrap_or(false);
     let italic = parent.italic
         || matches!(tag, "i" | "em" | "cite" | "var")
         || node.computed_style.font_style.as_deref() == Some("italic");
     let monospace = parent.monospace || matches!(tag, "code" | "pre" | "kbd" | "samp" | "tt");
 
     // Text color: explicit CSS wins; otherwise inherit, with a blue default for the first <a>
-    let color = if let Some(c) = node.computed_style.color.as_deref().and_then(parse_css_color) {
+    let color = if let Some(c) = node
+        .computed_style
+        .color
+        .as_deref()
+        .and_then(parse_css_color)
+    {
         c
     } else if is_link && !parent.link {
         Rgba::LINK_BLUE
@@ -179,23 +216,50 @@ fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
 
     // Background (skip the page-level fill already painted)
     if tag != "html" && tag != "body" {
-        if let Some(bg) = node.computed_style.background_color.as_deref().and_then(parse_css_color) {
-            list.items.push(DisplayItem::Rect { x, y, w, h, color: bg });
+        if let Some(bg) = node
+            .computed_style
+            .background_color
+            .as_deref()
+            .and_then(parse_css_color)
+        {
+            list.items.push(DisplayItem::Rect {
+                x,
+                y,
+                w,
+                h,
+                color: bg,
+            });
         }
     }
 
     // Border (if styled)
-    let border_style_ok = node.computed_style.border_style.as_deref()
+    let border_style_ok = node
+        .computed_style
+        .border_style
+        .as_deref()
         .map(|s| s != "none" && s != "hidden")
         .unwrap_or(false);
-    let border_width = node.computed_style.border_width.as_ref()
+    let border_width = node
+        .computed_style
+        .border_width
+        .as_ref()
         .map(|bw| bw.to_pixels(node.rect.width, 16.0) as f32)
         .unwrap_or(if border_style_ok { 1.0 } else { 0.0 });
     if border_width > 0.0 && (border_style_ok || node.computed_style.border_color.is_some()) {
-        let border_color = node.computed_style.border_color.as_deref()
+        let border_color = node
+            .computed_style
+            .border_color
+            .as_deref()
             .and_then(parse_css_color)
             .unwrap_or(color);
-        list.items.push(DisplayItem::Border { x, y, w, h, width: border_width, color: border_color });
+        list.items.push(DisplayItem::Border {
+            x,
+            y,
+            w,
+            h,
+            width: border_width,
+            color: border_color,
+        });
     }
 
     // Horizontal rule renders as a thin divider
@@ -221,7 +285,13 @@ fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
         let display_text = if node.rect.display == DisplayType::ListItem {
             format!("•  {}", text)
         } else if tag == "img" {
-            format!("🖼 [{}]", node.element.get_attr("alt").map(|s| s.as_str()).unwrap_or("image"))
+            format!(
+                "🖼 [{}]",
+                node.element
+                    .get_attr("alt")
+                    .map(|s| s.as_str())
+                    .unwrap_or("image")
+            )
         } else {
             text.to_string()
         };
@@ -287,7 +357,11 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
                 let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?;
                 let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?;
                 let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?;
-                Some(Rgba::rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0))
+                Some(Rgba::rgb(
+                    r as f32 / 255.0,
+                    g as f32 / 255.0,
+                    b as f32 / 255.0,
+                ))
             }
             6 | 8 => {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -298,7 +372,12 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
                 } else {
                     1.0
                 };
-                Some(Rgba { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a })
+                Some(Rgba {
+                    r: r as f32 / 255.0,
+                    g: g as f32 / 255.0,
+                    b: b as f32 / 255.0,
+                    a,
+                })
             }
             _ => None,
         };
@@ -312,8 +391,17 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
             let r = parts[0].parse::<f32>().ok()? / 255.0;
             let g = parts[1].parse::<f32>().ok()? / 255.0;
             let b = parts[2].parse::<f32>().ok()? / 255.0;
-            let a = if parts.len() >= 4 { parts[3].parse::<f32>().unwrap_or(1.0) } else { 1.0 };
-            return Some(Rgba { r, g, b, a: a.clamp(0.0, 1.0) });
+            let a = if parts.len() >= 4 {
+                parts[3].parse::<f32>().unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            return Some(Rgba {
+                r,
+                g,
+                b,
+                a: a.clamp(0.0, 1.0),
+            });
         }
         return None;
     }
@@ -368,10 +456,21 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
         "whitesmoke" => (245, 245, 245),
         "ghostwhite" => (248, 248, 255),
         "snow" => (255, 250, 250),
-        "transparent" => return Some(Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+        "transparent" => {
+            return Some(Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            })
+        }
         _ => return None,
     };
-    Some(Rgba::rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0))
+    Some(Rgba::rgb(
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+    ))
 }
 
 #[cfg(test)]
@@ -434,9 +533,11 @@ mod tests {
     #[test]
     fn test_display_list_has_text() {
         let list = build("<html><body><h1>Hello Pixels</h1></body></html>", "");
-        let has_text = list.items.iter().any(|i| matches!(
-            i, DisplayItem::TextRun { content, .. } if content.contains("Hello Pixels")
-        ));
+        let has_text = list.items.iter().any(|i| {
+            matches!(
+                i, DisplayItem::TextRun { content, .. } if content.contains("Hello Pixels")
+            )
+        });
         assert!(has_text);
         assert!(list.width > 0.0 && list.height > 0.0);
     }
@@ -444,14 +545,27 @@ mod tests {
     #[test]
     fn test_heading_is_bold_and_larger() {
         let list = build("<html><body><h1>Big</h1><p>Small</p></body></html>", "");
-        let h1 = list.items.iter().find_map(|i| match i {
-            DisplayItem::TextRun { content, size, bold, .. } if content == "Big" => Some((*size, *bold)),
-            _ => None,
-        }).expect("h1 text run");
-        let p = list.items.iter().find_map(|i| match i {
-            DisplayItem::TextRun { content, size, .. } if content == "Small" => Some(*size),
-            _ => None,
-        }).expect("p text run");
+        let h1 = list
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::TextRun {
+                    content,
+                    size,
+                    bold,
+                    ..
+                } if content == "Big" => Some((*size, *bold)),
+                _ => None,
+            })
+            .expect("h1 text run");
+        let p = list
+            .items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::TextRun { content, size, .. } if content == "Small" => Some(*size),
+                _ => None,
+            })
+            .expect("p text run");
         assert!(h1.1, "h1 must be bold");
         assert!(h1.0 > p, "h1 ({}) must be larger than p ({})", h1.0, p);
     }
@@ -473,7 +587,10 @@ mod tests {
 
         // Hit-testing inside the region works
         let l = &list.links[0];
-        assert_eq!(list.link_at(l.x + 1.0, l.y + 1.0), Some("https://example.com"));
+        assert_eq!(
+            list.link_at(l.x + 1.0, l.y + 1.0),
+            Some("https://example.com")
+        );
         assert_eq!(list.link_at(-100.0, -100.0), None);
     }
 
@@ -484,15 +601,19 @@ mod tests {
              <body><p>Colored</p></body></html>",
             "",
         );
-        let red_text = list.items.iter().any(|i| matches!(
-            i, DisplayItem::TextRun { content, color, .. }
-                if content == "Colored" && (color.r - 1.0).abs() < 0.01 && color.g < 0.01
-        ));
+        let red_text = list.items.iter().any(|i| {
+            matches!(
+                i, DisplayItem::TextRun { content, color, .. }
+                    if content == "Colored" && (color.r - 1.0).abs() < 0.01 && color.g < 0.01
+            )
+        });
         assert!(red_text, "paragraph text should be red");
 
-        let bg = list.items.iter().any(|i| matches!(
-            i, DisplayItem::Rect { color, .. } if (color.r - 0.933).abs() < 0.01
-        ));
+        let bg = list.items.iter().any(|i| {
+            matches!(
+                i, DisplayItem::Rect { color, .. } if (color.r - 0.933).abs() < 0.01
+            )
+        });
         assert!(bg, "paragraph background should be painted");
     }
 
@@ -508,9 +629,11 @@ mod tests {
     #[test]
     fn test_list_item_bullet() {
         let list = build("<html><body><ul><li>Item one</li></ul></body></html>", "");
-        let bullet = list.items.iter().any(|i| matches!(
-            i, DisplayItem::TextRun { content, .. } if content.starts_with("•")
-        ));
+        let bullet = list.items.iter().any(|i| {
+            matches!(
+                i, DisplayItem::TextRun { content, .. } if content.starts_with("•")
+            )
+        });
         assert!(bullet);
     }
 }

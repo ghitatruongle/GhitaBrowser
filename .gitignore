@@ -33,3 +33,4 @@ Thumbs.db
 # Build artifacts
 GhitaBrowser.exe
 *.pdb
+__pycache__/

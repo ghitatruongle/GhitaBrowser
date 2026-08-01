@@ -1,15 +1,22 @@
-// src/ui.rs - Chrome-style GUI built with Iced, powered by the Rust engine (v0.5.0)
+// src/ui.rs - Chrome-style GUI built with Iced, powered by the Rust engine (v0.6.0)
 #![allow(dead_code)]
 
-use iced::widget::{button, canvas, column, container, horizontal_space, row, scrollable, text, text_input, vertical_space};
-use iced::{Application, Command, Element, Length, Settings, Theme, Color, keyboard, mouse, Shadow};
+use iced::widget::{
+    button, canvas, column, container, horizontal_space, row, scrollable, text, text_input,
+    vertical_space,
+};
+use iced::{
+    keyboard, mouse, Application, Color, Command, Element, Length, Settings, Shadow, Theme,
+};
 use log::info;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::Browser;
 use crate::paint::{DisplayItem, DisplayList};
 use crate::parser::parse_html;
+use crate::search::{search_web, SearchResult};
+use crate::Browser;
 
 // ===== Chrome color palettes (dark + light), sampled from Google Chrome =====
 
@@ -49,47 +56,49 @@ struct Pal {
 
 /// Chrome dark theme (#202124 / #35363A / #8AB4F8)
 const DARK_PAL: Pal = Pal {
-    tab_strip: Color::from_rgb(0.125, 0.129, 0.141),      // #202124
-    tab_hover: Color::from_rgb(0.173, 0.180, 0.196),      // #2C2E32
-    toolbar: Color::from_rgb(0.208, 0.212, 0.227),        // #35363A
-    omnibox: Color::from_rgb(0.125, 0.129, 0.141),        // #202124
-    omnibox_focus: Color::from_rgb(0.188, 0.192, 0.204),  // #303134
-    menu_bg: Color::from_rgb(0.161, 0.165, 0.176),        // #292A2D
-    menu_hover: Color::from_rgb(0.235, 0.243, 0.263),     // #3C3E43
-    content_bg: Color::from_rgb(0.125, 0.129, 0.141),     // #202124
-    text: Color::from_rgb(0.910, 0.918, 0.929),           // #E8EAED
-    text_dim: Color::from_rgb(0.604, 0.627, 0.651),       // #9AA0A6
-    accent: Color::from_rgb(0.541, 0.706, 0.973),         // #8AB4F8
+    tab_strip: Color::from_rgb(0.125, 0.129, 0.141), // #202124
+    tab_hover: Color::from_rgb(0.173, 0.180, 0.196), // #2C2E32
+    toolbar: Color::from_rgb(0.208, 0.212, 0.227),   // #35363A
+    omnibox: Color::from_rgb(0.125, 0.129, 0.141),   // #202124
+    omnibox_focus: Color::from_rgb(0.188, 0.192, 0.204), // #303134
+    menu_bg: Color::from_rgb(0.161, 0.165, 0.176),   // #292A2D
+    menu_hover: Color::from_rgb(0.235, 0.243, 0.263), // #3C3E43
+    content_bg: Color::from_rgb(0.125, 0.129, 0.141), // #202124
+    text: Color::from_rgb(0.910, 0.918, 0.929),      // #E8EAED
+    text_dim: Color::from_rgb(0.604, 0.627, 0.651),  // #9AA0A6
+    accent: Color::from_rgb(0.541, 0.706, 0.973),    // #8AB4F8
     on_accent: Color::from_rgb(0.125, 0.129, 0.141),
-    danger: Color::from_rgb(0.949, 0.545, 0.510),         // #F28B82
-    divider: Color::from_rgb(0.235, 0.251, 0.263),        // #3C4043
-    secure: Color::from_rgb(0.506, 0.788, 0.584),         // #81C995
+    danger: Color::from_rgb(0.949, 0.545, 0.510), // #F28B82
+    divider: Color::from_rgb(0.235, 0.251, 0.263), // #3C4043
+    secure: Color::from_rgb(0.506, 0.788, 0.584), // #81C995
 };
 
 /// Chrome light theme (#DEE1E6 / #FFFFFF / #1A73E8)
 const LIGHT_PAL: Pal = Pal {
-    tab_strip: Color::from_rgb(0.871, 0.882, 0.902),      // #DEE1E6
-    tab_hover: Color::from_rgb(0.816, 0.827, 0.847),      // #D0D3D8
-    toolbar: Color::from_rgb(1.0, 1.0, 1.0),              // #FFFFFF
-    omnibox: Color::from_rgb(0.945, 0.953, 0.957),        // #F1F3F4
-    omnibox_focus: Color::from_rgb(1.0, 1.0, 1.0),        // #FFFFFF
-    menu_bg: Color::from_rgb(1.0, 1.0, 1.0),              // #FFFFFF
-    menu_hover: Color::from_rgb(0.945, 0.953, 0.957),     // #F1F3F4
-    content_bg: Color::from_rgb(1.0, 1.0, 1.0),           // #FFFFFF
-    text: Color::from_rgb(0.125, 0.129, 0.141),           // #202124
-    text_dim: Color::from_rgb(0.373, 0.388, 0.408),       // #5F6368
-    accent: Color::from_rgb(0.102, 0.451, 0.910),         // #1A73E8
+    tab_strip: Color::from_rgb(0.871, 0.882, 0.902), // #DEE1E6
+    tab_hover: Color::from_rgb(0.816, 0.827, 0.847), // #D0D3D8
+    toolbar: Color::from_rgb(1.0, 1.0, 1.0),         // #FFFFFF
+    omnibox: Color::from_rgb(0.945, 0.953, 0.957),   // #F1F3F4
+    omnibox_focus: Color::from_rgb(1.0, 1.0, 1.0),   // #FFFFFF
+    menu_bg: Color::from_rgb(1.0, 1.0, 1.0),         // #FFFFFF
+    menu_hover: Color::from_rgb(0.945, 0.953, 0.957), // #F1F3F4
+    content_bg: Color::from_rgb(1.0, 1.0, 1.0),      // #FFFFFF
+    text: Color::from_rgb(0.125, 0.129, 0.141),      // #202124
+    text_dim: Color::from_rgb(0.373, 0.388, 0.408),  // #5F6368
+    accent: Color::from_rgb(0.102, 0.451, 0.910),    // #1A73E8
     on_accent: Color::from_rgb(1.0, 1.0, 1.0),
-    danger: Color::from_rgb(0.851, 0.188, 0.145),         // #D93025
-    divider: Color::from_rgb(0.855, 0.863, 0.878),        // #DADCE0
-    secure: Color::from_rgb(0.094, 0.502, 0.220),         // #188038
+    danger: Color::from_rgb(0.851, 0.188, 0.145), // #D93025
+    divider: Color::from_rgb(0.855, 0.863, 0.878), // #DADCE0
+    secure: Color::from_rgb(0.094, 0.502, 0.220), // #188038
 };
 
-// Google logo colors for the New Tab page wordmark
-const G_BLUE: Color = Color::from_rgb(0.259, 0.522, 0.957);
-const G_RED: Color = Color::from_rgb(0.918, 0.263, 0.208);
-const G_YELLOW: Color = Color::from_rgb(0.984, 0.737, 0.016);
-const G_GREEN: Color = Color::from_rgb(0.204, 0.659, 0.325);
+// Ghita "Fire" brand palette for the New Tab page wordmark —
+// a warm orange→red gradient, distinct from Google's rainbow
+const GH_ORANGE: Color = Color::from_rgb(1.0, 0.549, 0.259); // #FF8C42
+const GH_AMBER: Color = Color::from_rgb(0.969, 0.702, 0.169); // #F7B32B
+const GH_RED: Color = Color::from_rgb(0.949, 0.314, 0.133); // #F25022
+const GH_CRIMSON: Color = Color::from_rgb(0.839, 0.271, 0.271); // #D64545
+const GH_EMBER: Color = Color::from_rgb(0.651, 0.227, 0.169); // #A63A2B
 
 // ===== Custom widget styles =====
 
@@ -128,7 +137,12 @@ impl button::StyleSheet for ChromeButtonStyle {
 
 /// Helper to build a Chrome-style button theme
 fn chrome_btn(bg: Color, hover: Color, txt: Color, radius: [f32; 4]) -> iced::theme::Button {
-    iced::theme::Button::Custom(Box::new(ChromeButtonStyle { bg, hover, txt, radius }))
+    iced::theme::Button::Custom(Box::new(ChromeButtonStyle {
+        bg,
+        hover,
+        txt,
+        radius,
+    }))
 }
 
 /// Rounded-pill omnibox / search field style
@@ -189,7 +203,10 @@ impl text_input::StyleSheet for OmniboxStyle {
     }
 
     fn selection_color(&self, _style: &Theme) -> Color {
-        Color { a: 0.35, ..self.accent }
+        Color {
+            a: 0.35,
+            ..self.accent
+        }
     }
 }
 
@@ -211,14 +228,25 @@ const FIND_ID: &str = "find-box";
 const NTP_SEARCH_ID: &str = "ntp-search";
 
 // Chrome zoom steps (Ctrl +/-)
-const ZOOM_STEPS: [u16; 17] = [25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500];
+const ZOOM_STEPS: [u16; 17] = [
+    25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500,
+];
 
 fn zoom_step_in(current: u16) -> u16 {
-    ZOOM_STEPS.iter().copied().find(|&z| z > current).unwrap_or(500)
+    ZOOM_STEPS
+        .iter()
+        .copied()
+        .find(|&z| z > current)
+        .unwrap_or(500)
 }
 
 fn zoom_step_out(current: u16) -> u16 {
-    ZOOM_STEPS.iter().rev().copied().find(|&z| z < current).unwrap_or(25)
+    ZOOM_STEPS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&z| z < current)
+        .unwrap_or(25)
 }
 
 /// Which DevTools pane is visible
@@ -227,6 +255,15 @@ pub enum DevPane {
     Console,
     Storage,
     Cache,
+}
+
+/// Per-tab state for the in-app web search results page (ghita://search)
+#[derive(Debug, Clone, Default)]
+struct TabSearchState {
+    query: String,
+    results: Vec<SearchResult>,
+    loading: bool,
+    error: Option<String>,
 }
 
 /// Main application state - connected to the real Browser engine
@@ -252,6 +289,15 @@ pub struct GhitaBrowserApp {
     zoom_percent: u16,
     history_query: String,
     homepage_input: String,
+
+    // Web search state (per-tab, ghita://search results page)
+    search_state: HashMap<usize, TabSearchState>,
+
+    // Async load coordination: every fetch/search bumps `load_seq`; the
+    // response carries the sequence that started it, and is discarded if a
+    // newer load was started for the same tab in the meantime.
+    load_seq: u64,
+    pending_loads: HashMap<usize, u64>,
 
     // Pixel renderer state
     display_list: Arc<DisplayList>,
@@ -282,6 +328,20 @@ pub enum Message {
     // New Tab page search box
     NtpSearchChanged(String),
     NtpSearchSubmit,
+
+    // Web search (ghita://search results page)
+    SearchResultsLoaded {
+        results: Vec<SearchResult>,
+        query: String,
+        tab_id: usize,
+        seq: u64,
+    },
+    SearchError {
+        err: String,
+        query: String,
+        tab_id: usize,
+        seq: u64,
+    },
 
     // Tabs
     SelectTab(usize),
@@ -340,8 +400,17 @@ pub enum Message {
     EscapePressed,
 
     // Internal
-    PageLoaded { html: String, url: String, fetch_time: u64, tab_id: usize },
-    LoadError { err: String, url: String, tab_id: usize },
+    PageLoaded {
+        result: crate::network::FetchResult,
+        tab_id: usize,
+        seq: u64,
+    },
+    LoadError {
+        err: String,
+        url: String,
+        tab_id: usize,
+        seq: u64,
+    },
 }
 
 impl Application for GhitaBrowserApp {
@@ -357,7 +426,11 @@ impl Application for GhitaBrowserApp {
         let settings = browser.storage.settings.clone();
         let is_dark_theme = settings.theme != "light";
         let show_bookmarks_bar = settings.show_bookmarks_bar;
-        let zoom_percent = if settings.default_zoom == 0 { 100 } else { settings.default_zoom };
+        let zoom_percent = if settings.default_zoom == 0 {
+            100
+        } else {
+            settings.default_zoom
+        };
         let homepage_input = settings.homepage.clone();
 
         let mut app = Self {
@@ -377,6 +450,9 @@ impl Application for GhitaBrowserApp {
             zoom_percent,
             history_query: String::new(),
             homepage_input,
+            search_state: HashMap::new(),
+            load_seq: 0,
+            pending_loads: HashMap::new(),
             display_list: Arc::new(DisplayList::default()),
             canvas_cache: canvas::Cache::new(),
             show_devtools: false,
@@ -389,11 +465,13 @@ impl Application for GhitaBrowserApp {
         // Chrome starts on the New Tab page
         app.open_internal("ghita://newtab", true);
 
-        (app, Command::none())
+        // Start with keyboard focus in the omnibox so typing works immediately
+        (app, Command::perform(async {}, |_| Message::FocusUrl))
     }
 
     fn title(&self) -> String {
-        self.browser.active_tab()
+        self.browser
+            .active_tab()
             .map(|t| format!("{} - GhitaBrowser", t.title))
             .unwrap_or_else(|| "GhitaBrowser".to_string())
     }
@@ -425,15 +503,20 @@ impl Application for GhitaBrowserApp {
             }
             Message::GoBack => {
                 self.browser.go_back();
+                self.invalidate_active_tab_loads();
                 self.after_tab_change("Navigated back");
             }
             Message::GoForward => {
                 self.browser.go_forward();
+                self.invalidate_active_tab_loads();
                 self.after_tab_change("Navigated forward");
             }
             Message::Reload => {
                 if let Some(tab) = self.browser.active_tab() {
                     let url = tab.url.clone();
+                    if url.starts_with("ghita://search") {
+                        return self.start_search(&url);
+                    }
                     if url.starts_with("http://") || url.starts_with("https://") {
                         return self.start_fetch(url);
                     }
@@ -463,6 +546,50 @@ impl Application for GhitaBrowserApp {
                 let target = self.resolve_omnibox(&raw);
                 return self.navigate(target);
             }
+            Message::SearchResultsLoaded {
+                results,
+                query,
+                tab_id,
+                seq,
+            } => {
+                // Discard results from a search superseded by a newer load
+                if self.pending_loads.get(&tab_id) != Some(&seq) {
+                    return Command::none();
+                }
+                let st = self.search_state.entry(tab_id).or_default();
+                st.results = results;
+                st.query = query;
+                st.loading = false;
+                st.error = None;
+                let result_count = st.results.len();
+                self.is_loading = false;
+                self.status_msg = format!("{} results", result_count);
+                if self.browser.tabs.active_tab_id() == Some(tab_id) {
+                    self.show_suggestions = false;
+                    self.sync_from_active_tab();
+                }
+            }
+            Message::SearchError {
+                err,
+                query,
+                tab_id,
+                seq,
+            } => {
+                // Discard errors from a search superseded by a newer load
+                if self.pending_loads.get(&tab_id) != Some(&seq) {
+                    return Command::none();
+                }
+                let st = self.search_state.entry(tab_id).or_default();
+                st.error = Some(err.clone());
+                st.query = query;
+                st.loading = false;
+                self.is_loading = false;
+                self.status_msg = format!("Search failed: {}", err);
+                if self.browser.tabs.active_tab_id() == Some(tab_id) {
+                    self.show_suggestions = false;
+                    self.sync_from_active_tab();
+                }
+            }
             Message::SelectTab(index) => {
                 self.browser.tabs.set_active_by_index(index);
                 self.after_tab_change("");
@@ -482,6 +609,8 @@ impl Application for GhitaBrowserApp {
                 if let Some(tab) = self.browser.tabs.get_tab_by_index(index) {
                     let id = tab.id;
                     self.browser.tabs.remove_tab(id);
+                    self.search_state.remove(&id);
+                    self.pending_loads.remove(&id);
                     self.ensure_tab();
                     self.after_tab_change("Tab closed");
                 }
@@ -490,6 +619,8 @@ impl Application for GhitaBrowserApp {
                 if let Some(tab) = self.browser.active_tab() {
                     let id = tab.id;
                     self.browser.tabs.remove_tab(id);
+                    self.search_state.remove(&id);
+                    self.pending_loads.remove(&id);
                     self.ensure_tab();
                     self.after_tab_change("Tab closed");
                 }
@@ -527,7 +658,9 @@ impl Application for GhitaBrowserApp {
                 self.open_internal(&page, true);
             }
             Message::ToggleBookmark => {
-                let target = self.browser.active_tab()
+                let target = self
+                    .browser
+                    .active_tab()
                     .map(|t| (t.url.clone(), t.title.clone()));
                 if let Some((url, title)) = target {
                     if url.starts_with("http://") || url.starts_with("https://") {
@@ -589,7 +722,11 @@ impl Application for GhitaBrowserApp {
             }
             Message::SavePageAs => {
                 self.show_menu = false;
-                let url = self.browser.active_tab().map(|t| t.url.clone()).unwrap_or_default();
+                let url = self
+                    .browser
+                    .active_tab()
+                    .map(|t| t.url.clone())
+                    .unwrap_or_default();
                 if !url.starts_with("http://") && !url.starts_with("https://") {
                     self.status_msg = "Only web pages can be downloaded".to_string();
                     return Command::none();
@@ -598,8 +735,8 @@ impl Application for GhitaBrowserApp {
                 return Command::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            let (bytes, name, _ct) = crate::network::download_url(&url)
-                                .map_err(|e| e.to_string())?;
+                            let (bytes, name, _ct) =
+                                crate::network::download_url(&url).map_err(|e| e.to_string())?;
                             // Sanitize: keep only the final path component so a malicious
                             // Content-Disposition can't traverse dirs or write an absolute path.
                             let name = std::path::Path::new(&name)
@@ -616,18 +753,25 @@ impl Application for GhitaBrowserApp {
                             let mut counter = 1;
                             while path.exists() {
                                 let stem = std::path::Path::new(&name)
-                                    .file_stem().and_then(|s| s.to_str()).unwrap_or("download");
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("download");
                                 let ext = std::path::Path::new(&name)
-                                    .extension().and_then(|s| s.to_str())
-                                    .map(|e| format!(".{}", e)).unwrap_or_default();
+                                    .extension()
+                                    .and_then(|s| s.to_str())
+                                    .map(|e| format!(".{}", e))
+                                    .unwrap_or_default();
                                 path = dir.join(format!("{} ({}){}", stem, counter, ext));
                                 counter += 1;
                             }
                             std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
                             Ok(crate::storage::DownloadRecord {
                                 url,
-                                file_name: path.file_name()
-                                    .and_then(|s| s.to_str()).unwrap_or(&name).to_string(),
+                                file_name: path
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(&name)
+                                    .to_string(),
                                 path: path.to_string_lossy().to_string(),
                                 size_bytes: bytes.len() as u64,
                                 completed_at: chrono::Utc::now().timestamp(),
@@ -640,33 +784,39 @@ impl Application for GhitaBrowserApp {
                     Message::DownloadFinished,
                 );
             }
-            Message::DownloadFinished(result) => {
-                match result {
-                    Ok(rec) => {
-                        self.status_msg = format!(
-                            "Downloaded {} ({})", rec.file_name, fmt_bytes(rec.size_bytes)
-                        );
-                        self.browser.storage.add_download(rec);
-                    }
-                    Err(e) => {
-                        self.status_msg = format!("Download failed: {}", e);
-                    }
+            Message::DownloadFinished(result) => match result {
+                Ok(rec) => {
+                    self.status_msg = format!(
+                        "Downloaded {} ({})",
+                        rec.file_name,
+                        fmt_bytes(rec.size_bytes)
+                    );
+                    self.browser.storage.add_download(rec);
                 }
-            }
+                Err(e) => {
+                    self.status_msg = format!("Download failed: {}", e);
+                }
+            },
             Message::ClearDownloads => {
                 self.browser.storage.clear_downloads();
                 self.status_msg = "Downloads list cleared".to_string();
             }
             Message::SetThemeDark(dark) => {
                 self.is_dark_theme = dark;
-                self.browser.storage.settings.theme =
-                    if dark { "dark".to_string() } else { "light".to_string() };
+                self.browser.storage.settings.theme = if dark {
+                    "dark".to_string()
+                } else {
+                    "light".to_string()
+                };
             }
             Message::ToggleTheme => {
                 let dark = !self.is_dark_theme;
                 self.is_dark_theme = dark;
-                self.browser.storage.settings.theme =
-                    if dark { "dark".to_string() } else { "light".to_string() };
+                self.browser.storage.settings.theme = if dark {
+                    "dark".to_string()
+                } else {
+                    "light".to_string()
+                };
             }
             Message::SetSearchEngine(engine) => {
                 self.browser.storage.settings.search_engine = engine;
@@ -717,15 +867,17 @@ impl Application for GhitaBrowserApp {
                     match self.browser.js_engine.execute_script(&code) {
                         Ok(val) => {
                             let output = val.to_display_string();
-                            self.browser.js_engine.console_output.push(
-                                format!("> {} = {}", code, output)
-                            );
+                            self.browser
+                                .js_engine
+                                .console_output
+                                .push(format!("> {} = {}", code, output));
                             self.status_msg = format!("JS: {} = {}", code, output);
                         }
                         Err(e) => {
-                            self.browser.js_engine.console_output.push(
-                                format!("> {}  // Error: {}", code, e)
-                            );
+                            self.browser
+                                .js_engine
+                                .console_output
+                                .push(format!("> {}  // Error: {}", code, e));
                             self.status_msg = format!("JS Error: {}", e);
                         }
                     }
@@ -745,7 +897,42 @@ impl Application for GhitaBrowserApp {
                     self.show_devtools = false;
                 }
             }
-            Message::PageLoaded { html, url, fetch_time, tab_id } => {
+            Message::PageLoaded {
+                result,
+                tab_id,
+                seq,
+            } => {
+                // Discard responses for loads superseded by a newer navigation
+                // or search in the same tab (e.g. user typed a new URL while
+                // the old one was still in flight).
+                if self.pending_loads.get(&tab_id) != Some(&seq) {
+                    return Command::none();
+                }
+                let url = result.url.clone();
+                let html = result.body.clone();
+                let fetch_time = result.fetch_time_ms;
+
+                // Warm the resource cache so repeated visits reuse this response
+                self.browser.cache.insert(
+                    &url,
+                    result.clone(),
+                    crate::network::cache_ttl_secs(&result.headers),
+                );
+
+                // Persist Set-Cookie headers from the response into the jar,
+                // so subsequent requests to the same host send the cookies
+                if let Ok(parsed) = url::Url::parse(&url) {
+                    if let Some(host) = parsed.host_str() {
+                        for header in &result.set_cookie_headers {
+                            let cookie =
+                                crate::storage::Cookie::from_set_cookie_header(header, host);
+                            if !cookie.name.is_empty() {
+                                self.browser.storage.cookies_mut().add_cookie(cookie);
+                            }
+                        }
+                    }
+                }
+
                 self.is_loading = true;
                 self.status_msg = format!("Parsing {}...", url);
 
@@ -778,7 +965,10 @@ impl Application for GhitaBrowserApp {
                         page_css_rules.append(&mut rules);
                     }
                 }
-                let all_rules: Vec<crate::css_parser::CssRule> = self.browser.css_rules.iter()
+                let all_rules: Vec<crate::css_parser::CssRule> = self
+                    .browser
+                    .css_rules
+                    .iter()
                     .cloned()
                     .chain(page_css_rules)
                     .collect();
@@ -786,7 +976,11 @@ impl Application for GhitaBrowserApp {
 
                 // 4. Create layout
                 let layout_start = Instant::now();
-                let layout_tree = crate::layout::create_layout_tree(&dom, &all_rules, self.browser.viewport_width());
+                let layout_tree = crate::layout::create_layout_tree(
+                    &dom,
+                    &all_rules,
+                    self.browser.viewport_width(),
+                );
                 let layout_time = layout_start.elapsed().as_millis() as u64;
 
                 // 5. Render to text
@@ -821,19 +1015,25 @@ impl Application for GhitaBrowserApp {
                 });
 
                 // 7. Update the originating tab (may differ from the active tab now)
-                let incognito = self.browser.tabs.get_tab(tab_id).map(|t| t.incognito).unwrap_or(false);
+                let incognito = self
+                    .browser
+                    .tabs
+                    .get_tab(tab_id)
+                    .map(|t| t.incognito)
+                    .unwrap_or(false);
                 let target_is_active = self.browser.tabs.active_tab_id() == Some(tab_id);
                 if let Some(tab) = self.browser.tabs.get_tab_mut(tab_id) {
-                    // Leaving an error page replaces it in history instead of pushing it
-                    if !tab.is_error {
-                        let current_entry = crate::tab::HistoryEntry {
-                            url: tab.url.clone(),
-                            title: tab.title.clone(),
-                            dom: tab.dom.clone(),
-                            layout: tab.layout.clone(),
-                        };
-                        tab.push_history(current_entry);
-                    }
+                    // Record the freshly loaded page in session history.
+                    // push_history dedups consecutive same-URL loads (reloads
+                    // and duplicate notifications), and error pages never
+                    // enter history (see Tab::go_back's is_error handling).
+                    let loaded_entry = crate::tab::HistoryEntry {
+                        url: url.clone(),
+                        title: title.clone(),
+                        dom: dom.clone(),
+                        layout: layout_tree.clone(),
+                    };
+                    tab.push_history(loaded_entry);
                     tab.is_error = false;
                     tab.dom = dom;
                     tab.title = title.clone();
@@ -864,16 +1064,27 @@ impl Application for GhitaBrowserApp {
                 if target_is_active {
                     self.rendered_content = rendered;
                     self.display_list = Arc::new(
-                        layout_tree.as_ref()
+                        layout_tree
+                            .as_ref()
                             .map(crate::paint::build_display_list)
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
                     );
                     self.canvas_cache.clear();
                     self.show_suggestions = false;
                     self.url_input = url.clone();
                 }
             }
-            Message::LoadError { err, url, tab_id } => {
+            Message::LoadError {
+                err,
+                url,
+                tab_id,
+                seq,
+            } => {
+                // Discard errors for loads superseded by a newer navigation
+                // or search in the same tab.
+                if self.pending_loads.get(&tab_id) != Some(&seq) {
+                    return Command::none();
+                }
                 self.is_loading = false;
                 self.status_msg = format!("Error loading {}: {}", url, err);
 
@@ -890,17 +1101,9 @@ impl Application for GhitaBrowserApp {
                 let dom = parse_html(&error_html);
                 let target_is_active = self.browser.tabs.active_tab_id() == Some(tab_id);
                 if let Some(tab) = self.browser.tabs.get_tab_mut(tab_id) {
-                    // Push the page we're leaving only if it was a real page, so
-                    // consecutive failures don't stack error entries in history.
-                    if !tab.is_error {
-                        let current_entry = crate::tab::HistoryEntry {
-                            url: tab.url.clone(),
-                            title: tab.title.clone(),
-                            dom: tab.dom.clone(),
-                            layout: tab.layout.clone(),
-                        };
-                        tab.push_history(current_entry);
-                    }
+                    // Error pages are never recorded in history; the tab keeps
+                    // its current history position so Back returns to the last
+                    // good page (see Tab::go_back's is_error handling).
                     tab.dom = dom;
                     tab.title = "This site can't be reached".to_string();
                     tab.url = url;
@@ -919,10 +1122,7 @@ impl Application for GhitaBrowserApp {
     fn view(&self) -> Element<'_, Message> {
         let pal = self.palette();
 
-        let mut layers = column![
-            self.build_tab_strip(pal),
-            self.build_toolbar(pal),
-        ];
+        let mut layers = column![self.build_tab_strip(pal), self.build_toolbar(pal),];
 
         // Thin Chrome-style loading strip under the toolbar
         if self.is_loading {
@@ -933,7 +1133,7 @@ impl Application for GhitaBrowserApp {
                         ..Default::default()
                     })
                     .width(Length::Fill)
-                    .height(Length::Fixed(3.0))
+                    .height(Length::Fixed(3.0)),
             );
         }
 
@@ -964,17 +1164,18 @@ impl Application for GhitaBrowserApp {
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        keyboard::on_key_press(|key, modifiers| {
-            handle_keyboard(key, modifiers)
-        })
+        keyboard::on_key_press(handle_keyboard)
     }
 }
 
 // ===== Keyboard Shortcuts (Chrome bindings) =====
 
-fn handle_keyboard(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Option<Message> {
-    use iced::keyboard::Key;
+fn handle_keyboard(
+    key: iced::keyboard::Key,
+    modifiers: iced::keyboard::Modifiers,
+) -> Option<Message> {
     use iced::keyboard::key::Named;
+    use iced::keyboard::Key;
 
     // Function keys first
     if let Key::Named(named) = &key {
@@ -1017,9 +1218,11 @@ fn handle_keyboard(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifier
             Key::Character(c) if c == "=" || c == "+" => Some(Message::ZoomIn),
             Key::Character(c) if c == "-" => Some(Message::ZoomOut),
             Key::Character(c) if c == "0" => Some(Message::ZoomReset),
-            Key::Character(c) if ("1"..="8").contains(&c.as_str()) => {
-                c.as_str().parse::<usize>().ok().map(|n| Message::SelectTabNumber(n - 1))
-            }
+            Key::Character(c) if ("1"..="8").contains(&c.as_str()) => c
+                .as_str()
+                .parse::<usize>()
+                .ok()
+                .map(|n| Message::SelectTabNumber(n - 1)),
             Key::Character(c) if c == "9" => Some(Message::SelectTabNumber(usize::MAX)),
             Key::Named(Named::Tab) => Some(Message::NextTab),
             _ => None,
@@ -1045,7 +1248,11 @@ fn handle_keyboard(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifier
 
 impl GhitaBrowserApp {
     fn palette(&self) -> &'static Pal {
-        if self.is_dark_theme { &DARK_PAL } else { &LIGHT_PAL }
+        if self.is_dark_theme {
+            &DARK_PAL
+        } else {
+            &LIGHT_PAL
+        }
     }
 
     /// Chrome omnibox behavior: URL, internal page, or search query
@@ -1057,12 +1264,17 @@ impl GhitaBrowserApp {
         if input.starts_with("http://") || input.starts_with("https://") {
             return input.to_string();
         }
-        let looks_like_url = !input.contains(' ')
-            && (input.contains('.') || input.starts_with("localhost"));
+        let looks_like_url =
+            !input.contains(' ') && (input.contains('.') || input.starts_with("localhost"));
         if looks_like_url {
-            format!("https://{}", input)
+            // localhost runs plain HTTP by default, everything else is HTTPS
+            if input == "localhost" || input.starts_with("localhost:") {
+                format!("http://{}", input)
+            } else {
+                format!("https://{}", input)
+            }
         } else {
-            self.search_url(input)
+            search_page_url(input)
         }
     }
 
@@ -1089,11 +1301,26 @@ impl GhitaBrowserApp {
     fn navigate(&mut self, target: String) -> Command<Message> {
         self.show_menu = false;
         self.show_suggestions = false;
+        if target.starts_with("ghita://search") {
+            self.open_internal(&target, false);
+            return self.start_search(&target);
+        }
         if target.starts_with("ghita://") || target.starts_with("about:") {
             self.open_internal(&target, false);
             Command::none()
         } else {
             self.start_fetch(target)
+        }
+    }
+
+    /// Invalidate any fetch/search still in flight for the active tab so its
+    /// late response can't overwrite a page the user explicitly navigated to
+    /// (back/forward, internal pages, ...).
+    fn invalidate_active_tab_loads(&mut self) {
+        if let Some(tab_id) = self.browser.tabs.active_tab_id() {
+            self.load_seq = self.load_seq.wrapping_add(1);
+            let seq = self.load_seq;
+            self.pending_loads.insert(tab_id, seq);
         }
     }
 
@@ -1106,50 +1333,120 @@ impl GhitaBrowserApp {
         self.show_suggestions = false;
 
         // Bind the load to the tab that started it, so switching tabs mid-load
-        // never applies content or history to the wrong tab.
+        // never applies content or history to the wrong tab. The sequence
+        // number lets stale responses (from a superseded navigation) be dropped.
         let tab_id = self.browser.tabs.active_tab_id().unwrap_or(0);
+        self.load_seq = self.load_seq.wrapping_add(1);
+        let seq = self.load_seq;
+        self.pending_loads.insert(tab_id, seq);
         let fetch_url = url.clone();
         let err_url = url;
+        // Cookie-aware fetch: inject the stored cookie jar, and hand the raw
+        // result back so the handler can persist Set-Cookie headers and warm
+        // the resource cache (mirrors Browser::load_url).
+        let cookie_store = self.browser.storage.cookies().clone();
         Command::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    crate::network::fetch_url(&fetch_url)
-                        .map(|result| (result.body, result.url, result.fetch_time_ms))
+                    let mut store = cookie_store;
+                    crate::network::fetch_with_cookies(&fetch_url, &mut store)
                         .map_err(|e| e.to_string())
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
             },
             move |result| match result {
-                Ok((html, url, fetch_time)) => Message::PageLoaded { html, url, fetch_time, tab_id },
-                Err(e) => Message::LoadError { err: e, url: err_url, tab_id },
+                Ok(result) => Message::PageLoaded {
+                    result,
+                    tab_id,
+                    seq,
+                },
+                Err(e) => Message::LoadError {
+                    err: e,
+                    url: err_url,
+                    tab_id,
+                    seq,
+                },
+            },
+        )
+    }
+
+    /// Kick off an async web search for a ghita://search page — UI stays responsive
+    fn start_search(&mut self, page_url: &str) -> Command<Message> {
+        let query = search_query_from_url(page_url).unwrap_or_default();
+        let tab_id = self.browser.tabs.active_tab_id().unwrap_or(0);
+        let query_clone = query.clone();
+
+        // Invalidate any in-flight load/search for this tab; stale results
+        // (an earlier query in the same tab) will be dropped by the seq check.
+        self.load_seq = self.load_seq.wrapping_add(1);
+        let seq = self.load_seq;
+        self.pending_loads.insert(tab_id, seq);
+
+        let st = self.search_state.entry(tab_id).or_default();
+        st.query = query.clone();
+        st.results.clear();
+        st.loading = true;
+        st.error = None;
+
+        self.is_loading = true;
+        self.status_msg = format!("Searching for \"{}\"...", query);
+
+        Command::perform(
+            async move {
+                tokio::task::spawn_blocking(move || search_web(&query))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
+            },
+            move |result| match result {
+                Ok(results) => Message::SearchResultsLoaded {
+                    results,
+                    query: query_clone.clone(),
+                    tab_id,
+                    seq,
+                },
+                Err(err) => Message::SearchError {
+                    err,
+                    query: query_clone,
+                    tab_id,
+                    seq,
+                },
             },
         )
     }
 
     /// Open a ghita:// internal page in the current tab or a new tab
     fn open_internal(&mut self, url: &str, new_tab: bool) {
-        let url = if url == "about:blank" { "ghita://newtab" } else { url };
+        let url = if url == "about:blank" {
+            "ghita://newtab"
+        } else {
+            url
+        };
         let (title, html) = internal_page_meta(url);
         let dom = parse_html(&html);
 
         if new_tab || self.browser.active_tab().is_none() {
             self.browser.add_tab(url, dom, &title);
         } else if let Some(tab) = self.browser.active_tab_mut() {
-            // Navigating away from an error page replaces it (no history push)
-            if !tab.is_error {
-                let current_entry = crate::tab::HistoryEntry {
-                    url: tab.url.clone(),
-                    title: tab.title.clone(),
-                    dom: tab.dom.clone(),
-                    layout: tab.layout.clone(),
-                };
-                tab.push_history(current_entry);
-            }
+            // Internal pages are part of session history; push_history dedups
+            // re-opening the same page (e.g. clicking Settings repeatedly).
+            let entry = crate::tab::HistoryEntry {
+                url: url.to_string(),
+                title: title.clone(),
+                dom: dom.clone(),
+                layout: None,
+            };
+            tab.push_history(entry);
             tab.is_error = false;
             tab.dom = dom;
             tab.title = title.clone();
             tab.url = url.to_string();
+        }
+
+        // An internal navigation supersedes any fetch still in flight for this
+        // tab, so its response can no longer overwrite this page.
+        if !new_tab {
+            self.invalidate_active_tab_loads();
         }
 
         self.is_loading = false;
@@ -1167,8 +1464,16 @@ impl GhitaBrowserApp {
 
     /// Refresh omnibox + content after the active tab changed
     fn sync_from_active_tab(&mut self) {
-        let url = self.browser.active_tab().map(|t| t.url.clone()).unwrap_or_default();
-        self.url_input = if is_blank_page(&url) { String::new() } else { url };
+        let url = self
+            .browser
+            .active_tab()
+            .map(|t| t.url.clone())
+            .unwrap_or_default();
+        self.url_input = if is_blank_page(&url) {
+            String::new()
+        } else {
+            url
+        };
         self.rendered_content = self.browser.render_current();
         self.rebuild_display_list();
         self.show_suggestions = false;
@@ -1183,9 +1488,13 @@ impl GhitaBrowserApp {
                 crate::paint::build_display_list(root)
             } else {
                 // No cached layout (e.g. restored history entry): re-layout from the DOM
-                crate::layout::create_layout_tree(&tab.dom, &self.browser.css_rules, self.browser.viewport_width())
-                    .map(|root| crate::paint::build_display_list(&root))
-                    .unwrap_or_default()
+                crate::layout::create_layout_tree(
+                    &tab.dom,
+                    &self.browser.css_rules,
+                    self.browser.viewport_width(),
+                )
+                .map(|root| crate::paint::build_display_list(&root))
+                .unwrap_or_default()
             }
         } else {
             DisplayList::default()
@@ -1221,6 +1530,20 @@ fn internal_page_meta(url: &str) -> (String, String) {
         "ghita://downloads" => "Downloads",
         "ghita://settings" => "Settings",
         "ghita://about" => "About GhitaBrowser",
+        _ if url.starts_with("ghita://search") => {
+            let q = search_query_from_url(url).unwrap_or_else(|| "web".to_string());
+            // Escape the user-supplied query before it is embedded in the
+            // generated HTML, so quotes/angle brackets can't break the page
+            // (or smuggle markup into it).
+            let safe_q = html_escape(&q);
+            return (
+                format!("Search: {}", q),
+                format!(
+                    "<html><head><title>Search: {}</title></head><body><h1>Search: {}</h1></body></html>",
+                    safe_q, safe_q
+                ),
+            );
+        }
         _ => "New Tab",
     };
     let html = format!(
@@ -1230,6 +1553,30 @@ fn internal_page_meta(url: &str) -> (String, String) {
     (title.to_string(), html)
 }
 
+/// Escape text for safe insertion into generated HTML (F8)
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Build the in-app search results URL for a query (ghita://search?q=...)
+fn search_page_url(query: &str) -> String {
+    let encoded: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    format!("ghita://search?q={}", encoded)
+}
+
+/// Extract the query from a ghita://search?q=... URL
+fn search_query_from_url(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find(|(k, _)| k == "q")
+        .map(|(_, v)| v.into_owned())
+}
+
 // ===== UI builders =====
 
 impl GhitaBrowserApp {
@@ -1237,7 +1584,10 @@ impl GhitaBrowserApp {
     fn build_tab_strip(&self, pal: &'static Pal) -> Element<'_, Message> {
         let mut strip = row![].spacing(1).padding([6, 8, 0, 8]);
 
-        let tab_info: Vec<(usize, String, String, bool)> = self.browser.tabs.iter_tabs()
+        let tab_info: Vec<(usize, String, String, bool)> = self
+            .browser
+            .tabs
+            .iter_tabs()
             .into_iter()
             .map(|t| (t.id, t.title.clone(), t.url.clone(), t.incognito))
             .collect();
@@ -1251,7 +1601,11 @@ impl GhitaBrowserApp {
             } else {
                 (pal.tab_strip, pal.text_dim)
             };
-            let hover = if is_active { pal.toolbar } else { pal.tab_hover };
+            let hover = if is_active {
+                pal.toolbar
+            } else {
+                pal.tab_hover
+            };
 
             // Favicon-ish glyph: incognito / internal / regular page
             let icon = if *incognito {
@@ -1286,7 +1640,12 @@ impl GhitaBrowserApp {
         let new_tab_btn = button(text("+").size(16))
             .on_press(Message::NewTab)
             .padding([2, 10])
-            .style(chrome_btn(pal.tab_strip, pal.tab_hover, pal.text_dim, [8.0, 8.0, 8.0, 8.0]));
+            .style(chrome_btn(
+                pal.tab_strip,
+                pal.tab_hover,
+                pal.text_dim,
+                [8.0, 8.0, 8.0, 8.0],
+            ));
         strip = strip.push(new_tab_btn);
 
         container(strip)
@@ -1300,18 +1659,42 @@ impl GhitaBrowserApp {
 
     /// Chrome toolbar: nav buttons + omnibox (padlock & star inside) + downloads + menu
     fn build_toolbar(&self, pal: &'static Pal) -> Element<'_, Message> {
-        let can_go_back = self.browser.active_tab().map(|t| t.can_go_back()).unwrap_or(false);
-        let can_go_forward = self.browser.active_tab().map(|t| t.can_go_forward()).unwrap_or(false);
+        let can_go_back = self
+            .browser
+            .active_tab()
+            .map(|t| t.can_go_back())
+            .unwrap_or(false);
+        let can_go_forward = self
+            .browser
+            .active_tab()
+            .map(|t| t.can_go_forward())
+            .unwrap_or(false);
 
         let back_btn = button(text("←").size(16))
-            .on_press_maybe(if can_go_back { Some(Message::GoBack) } else { None })
+            .on_press_maybe(if can_go_back {
+                Some(Message::GoBack)
+            } else {
+                None
+            })
             .padding([4, 9])
-            .style(if can_go_back { chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4]) } else { chrome_btn(pal.toolbar, pal.toolbar, pal.divider, [16.0; 4]) });
+            .style(if can_go_back {
+                chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4])
+            } else {
+                chrome_btn(pal.toolbar, pal.toolbar, pal.divider, [16.0; 4])
+            });
 
         let fwd_btn = button(text("→").size(16))
-            .on_press_maybe(if can_go_forward { Some(Message::GoForward) } else { None })
+            .on_press_maybe(if can_go_forward {
+                Some(Message::GoForward)
+            } else {
+                None
+            })
             .padding([4, 9])
-            .style(if can_go_forward { chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4]) } else { chrome_btn(pal.toolbar, pal.toolbar, pal.divider, [16.0; 4]) });
+            .style(if can_go_forward {
+                chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4])
+            } else {
+                chrome_btn(pal.toolbar, pal.toolbar, pal.divider, [16.0; 4])
+            });
 
         let reload_btn = button(text("⟳").size(16))
             .on_press(Message::Reload)
@@ -1324,15 +1707,28 @@ impl GhitaBrowserApp {
             .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4]));
 
         // Security chip inside the omnibox
-        let active_url = self.browser.active_tab().map(|t| t.url.clone()).unwrap_or_default();
+        let active_url = self
+            .browser
+            .active_tab()
+            .map(|t| t.url.clone())
+            .unwrap_or_default();
         let padlock: Element<'_, Message> = if active_url.starts_with("https://") {
-            text("🔒").size(12).style(iced::theme::Text::from(pal.secure)).into()
+            text("🔒")
+                .size(12)
+                .style(iced::theme::Text::from(pal.secure))
+                .into()
         } else if active_url.starts_with("http://") {
-            text("⚠").size(12).style(iced::theme::Text::from(pal.danger)).into()
+            text("⚠")
+                .size(12)
+                .style(iced::theme::Text::from(pal.danger))
+                .into()
         } else if is_internal_page(&active_url) {
             text("🦀").size(12).into()
         } else {
-            text("🔍").size(12).style(iced::theme::Text::from(pal.text_dim)).into()
+            text("🔍")
+                .size(12)
+                .style(iced::theme::Text::from(pal.text_dim))
+                .into()
         };
 
         let placeholder = format!("Search {} or type a URL", self.search_engine_name());
@@ -1347,14 +1743,17 @@ impl GhitaBrowserApp {
 
         // Bookmark star (Ctrl+D), Chrome-style, inside the omnibox capsule
         let bookmarked = self.browser.storage.is_bookmarked(&active_url);
-        let star_btn = button(
-            text(if bookmarked { "★" } else { "☆" })
-                .size(14)
-                .style(iced::theme::Text::from(if bookmarked { pal.accent } else { pal.text_dim }))
-        )
+        let star_btn = button(text(if bookmarked { "★" } else { "☆" }).size(14).style(
+            iced::theme::Text::from(if bookmarked { pal.accent } else { pal.text_dim }),
+        ))
         .on_press(Message::ToggleBookmark)
         .padding([4, 8])
-        .style(chrome_btn(pal.omnibox, pal.menu_hover, pal.text_dim, [0.0, 14.0, 14.0, 0.0]));
+        .style(chrome_btn(
+            pal.omnibox,
+            pal.menu_hover,
+            pal.text_dim,
+            [0.0, 14.0, 14.0, 0.0],
+        ));
 
         let omnibox = container(
             row![
@@ -1363,11 +1762,15 @@ impl GhitaBrowserApp {
                 star_btn,
             ]
             .spacing(0)
-            .align_items(iced::Alignment::Center)
+            .align_items(iced::Alignment::Center),
         )
         .style(move |_: &Theme| container::Appearance {
             background: Some(iced::Background::Color(pal.omnibox)),
-            border: iced::Border { color: Color::TRANSPARENT, width: 0.0, radius: 14.0.into() },
+            border: iced::Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 14.0.into(),
+            },
             ..Default::default()
         })
         .width(Length::Fill);
@@ -1392,9 +1795,14 @@ impl GhitaBrowserApp {
             });
 
         let bar = row![
-            back_btn, fwd_btn, reload_btn, home_btn,
+            back_btn,
+            fwd_btn,
+            reload_btn,
+            home_btn,
             omnibox,
-            downloads_btn, profile_btn, menu_btn,
+            downloads_btn,
+            profile_btn,
+            menu_btn,
         ]
         .spacing(4)
         .padding([6, 10])
@@ -1417,26 +1825,37 @@ impl GhitaBrowserApp {
         let mut items = column![].spacing(0);
 
         // First row: search with the default engine (like Chrome)
-        let search_label = format!("Search {} for \"{}\"", self.search_engine_name(), truncate_label(&query, 50));
+        let search_label = format!(
+            "Search {} for \"{}\"",
+            self.search_engine_name(),
+            truncate_label(&query, 50)
+        );
         items = items.push(
             button(
                 row![
                     text("🔍").size(12),
-                    text(search_label).size(13).style(iced::theme::Text::from(pal.text)),
-                ].spacing(10).align_items(iced::Alignment::Center)
+                    text(search_label)
+                        .size(13)
+                        .style(iced::theme::Text::from(pal.text)),
+                ]
+                .spacing(10)
+                .align_items(iced::Alignment::Center),
             )
-            .on_press(Message::OpenUrl(self.search_url(&query)))
+            .on_press(Message::OpenUrl(search_page_url(&query)))
             .padding([7, 16])
             .width(Length::Fill)
-            .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [0.0; 4]))
+            .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [0.0; 4])),
         );
 
         // Matching history entries + bookmarks (up to 6)
         let mut seen: Vec<String> = Vec::new();
         let mut matches: Vec<(String, String, &'static str)> = Vec::new();
         for h in self.browser.storage.history() {
-            if matches.len() >= 5 { break; }
-            if (h.url.to_lowercase().contains(&q_lower) || h.title.to_lowercase().contains(&q_lower))
+            if matches.len() >= 5 {
+                break;
+            }
+            if (h.url.to_lowercase().contains(&q_lower)
+                || h.title.to_lowercase().contains(&q_lower))
                 && !seen.contains(&h.url)
             {
                 seen.push(h.url.clone());
@@ -1444,8 +1863,11 @@ impl GhitaBrowserApp {
             }
         }
         for b in self.browser.storage.bookmarks() {
-            if matches.len() >= 6 { break; }
-            if (b.url.to_lowercase().contains(&q_lower) || b.title.to_lowercase().contains(&q_lower))
+            if matches.len() >= 6 {
+                break;
+            }
+            if (b.url.to_lowercase().contains(&q_lower)
+                || b.title.to_lowercase().contains(&q_lower))
                 && !seen.contains(&b.url)
             {
                 seen.push(b.url.clone());
@@ -1458,21 +1880,31 @@ impl GhitaBrowserApp {
                 button(
                     row![
                         text(icon).size(12),
-                        text(truncate_label(&title, 40)).size(13).style(iced::theme::Text::from(pal.text)),
-                        text(truncate_label(&url, 60)).size(12).style(iced::theme::Text::from(pal.text_dim)),
-                    ].spacing(10).align_items(iced::Alignment::Center)
+                        text(truncate_label(&title, 40))
+                            .size(13)
+                            .style(iced::theme::Text::from(pal.text)),
+                        text(truncate_label(&url, 60))
+                            .size(12)
+                            .style(iced::theme::Text::from(pal.text_dim)),
+                    ]
+                    .spacing(10)
+                    .align_items(iced::Alignment::Center),
                 )
                 .on_press(Message::OpenUrl(url))
                 .padding([7, 16])
                 .width(Length::Fill)
-                .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [0.0; 4]))
+                .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [0.0; 4])),
             );
         }
 
         container(items)
             .style(move |_: &Theme| container::Appearance {
                 background: Some(iced::Background::Color(pal.menu_bg)),
-                border: iced::Border { color: pal.divider, width: 1.0, radius: [0.0, 0.0, 8.0, 8.0].into() },
+                border: iced::Border {
+                    color: pal.divider,
+                    width: 1.0,
+                    radius: [0.0, 0.0, 8.0, 8.0].into(),
+                },
                 ..Default::default()
             })
             .width(Length::Fill)
@@ -1484,11 +1916,15 @@ impl GhitaBrowserApp {
         let item = |label: &str, shortcut: &str, msg: Message| -> Element<'_, Message> {
             button(
                 row![
-                    text(label.to_string()).size(13).style(iced::theme::Text::from(pal.text)),
+                    text(label.to_string())
+                        .size(13)
+                        .style(iced::theme::Text::from(pal.text)),
                     horizontal_space(),
-                    text(shortcut.to_string()).size(11).style(iced::theme::Text::from(pal.text_dim)),
+                    text(shortcut.to_string())
+                        .size(11)
+                        .style(iced::theme::Text::from(pal.text_dim)),
                 ]
-                .align_items(iced::Alignment::Center)
+                .align_items(iced::Alignment::Center),
             )
             .on_press(msg)
             .padding([7, 16])
@@ -1510,12 +1946,20 @@ impl GhitaBrowserApp {
 
         // Zoom control row (- 100% +)
         let zoom_row: Element<'_, Message> = row![
-            text("Zoom").size(13).style(iced::theme::Text::from(pal.text)),
+            text("Zoom")
+                .size(13)
+                .style(iced::theme::Text::from(pal.text)),
             horizontal_space(),
-            button(text("−").size(13)).on_press(Message::ZoomOut).padding([2, 10])
+            button(text("−").size(13))
+                .on_press(Message::ZoomOut)
+                .padding([2, 10])
                 .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [4.0; 4])),
-            text(format!("{}%", self.zoom_percent)).size(12).style(iced::theme::Text::from(pal.text_dim)),
-            button(text("+").size(13)).on_press(Message::ZoomIn).padding([2, 10])
+            text(format!("{}%", self.zoom_percent))
+                .size(12)
+                .style(iced::theme::Text::from(pal.text_dim)),
+            button(text("+").size(13))
+                .on_press(Message::ZoomIn)
+                .padding([2, 10])
                 .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text, [4.0; 4])),
         ]
         .spacing(8)
@@ -1525,44 +1969,84 @@ impl GhitaBrowserApp {
 
         let menu = column![
             item("New tab", "Ctrl+T", Message::NewTab),
-            item("New Incognito tab", "Ctrl+Shift+N", Message::NewIncognitoTab),
-            item("Reopen closed tab", "Ctrl+Shift+T", Message::ReopenClosedTab),
+            item(
+                "New Incognito tab",
+                "Ctrl+Shift+N",
+                Message::NewIncognitoTab
+            ),
+            item(
+                "Reopen closed tab",
+                "Ctrl+Shift+T",
+                Message::ReopenClosedTab
+            ),
             divider(),
-            item("History", "Ctrl+H", Message::OpenInternalPage("ghita://history".to_string())),
-            item("Downloads", "Ctrl+J", Message::OpenInternalPage("ghita://downloads".to_string())),
-            item("Bookmarks", "Ctrl+Shift+O", Message::OpenInternalPage("ghita://bookmarks".to_string())),
-            item("Show bookmarks bar", "Ctrl+Shift+B", Message::ToggleBookmarksBar),
+            item(
+                "History",
+                "Ctrl+H",
+                Message::OpenInternalPage("ghita://history".to_string())
+            ),
+            item(
+                "Downloads",
+                "Ctrl+J",
+                Message::OpenInternalPage("ghita://downloads".to_string())
+            ),
+            item(
+                "Bookmarks",
+                "Ctrl+Shift+O",
+                Message::OpenInternalPage("ghita://bookmarks".to_string())
+            ),
+            item(
+                "Show bookmarks bar",
+                "Ctrl+Shift+B",
+                Message::ToggleBookmarksBar
+            ),
             divider(),
             zoom_row,
             item("Find in page...", "Ctrl+F", Message::ToggleFindBar),
             item("Save page as...", "", Message::SavePageAs),
             divider(),
-            item("Settings", "", Message::OpenInternalPage("ghita://settings".to_string())),
+            item(
+                "Settings",
+                "",
+                Message::OpenInternalPage("ghita://settings".to_string())
+            ),
             item("Developer tools", "F12", Message::ToggleDevTools),
-            item("About GhitaBrowser", "", Message::OpenInternalPage("ghita://about".to_string())),
+            item(
+                "About GhitaBrowser",
+                "",
+                Message::OpenInternalPage("ghita://about".to_string())
+            ),
         ]
         .spacing(0);
 
         let panel = container(menu)
             .style(move |_: &Theme| container::Appearance {
                 background: Some(iced::Background::Color(pal.menu_bg)),
-                border: iced::Border { color: pal.divider, width: 1.0, radius: 8.0.into() },
+                border: iced::Border {
+                    color: pal.divider,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
                 shadow: Shadow::default(),
                 ..Default::default()
             })
             .padding([6, 0])
             .width(Length::Fixed(300.0));
 
-        row![horizontal_space(), panel]
-            .padding([0, 8])
-            .into()
+        row![horizontal_space(), panel].padding([0, 8]).into()
     }
 
     /// Chrome bookmarks bar
     fn build_bookmarks_bar(&self, pal: &'static Pal) -> Element<'_, Message> {
-        let mut bar = row![].spacing(2).padding([3, 10]).align_items(iced::Alignment::Center);
+        let mut bar = row![]
+            .spacing(2)
+            .padding([3, 10])
+            .align_items(iced::Alignment::Center);
 
-        let bookmarks: Vec<(String, String)> = self.browser.storage.bookmarks()
+        let bookmarks: Vec<(String, String)> = self
+            .browser
+            .storage
+            .bookmarks()
             .iter()
             .map(|b| (b.title.clone(), b.url.clone()))
             .collect();
@@ -1571,20 +2055,31 @@ impl GhitaBrowserApp {
             bar = bar.push(
                 text("For quick access, place your bookmarks here — press ☆ or Ctrl+D")
                     .size(11)
-                    .style(iced::theme::Text::from(pal.text_dim))
+                    .style(iced::theme::Text::from(pal.text_dim)),
             );
         } else {
             for (title, url) in bookmarks {
                 bar = bar.push(
                     button(
                         row![
-                            text("★").size(10).style(iced::theme::Text::from(pal.accent)),
-                            text(truncate_label(&title, 18)).size(12).style(iced::theme::Text::from(pal.text)),
-                        ].spacing(5).align_items(iced::Alignment::Center)
+                            text("★")
+                                .size(10)
+                                .style(iced::theme::Text::from(pal.accent)),
+                            text(truncate_label(&title, 18))
+                                .size(12)
+                                .style(iced::theme::Text::from(pal.text)),
+                        ]
+                        .spacing(5)
+                        .align_items(iced::Alignment::Center),
                     )
                     .on_press(Message::OpenUrl(url))
                     .padding([3, 8])
-                    .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [10.0; 4]))
+                    .style(chrome_btn(
+                        pal.toolbar,
+                        pal.menu_hover,
+                        pal.text,
+                        [10.0; 4],
+                    )),
                 );
             }
         }
@@ -1592,7 +2087,11 @@ impl GhitaBrowserApp {
         container(bar)
             .style(move |_: &Theme| container::Appearance {
                 background: Some(iced::Background::Color(pal.toolbar)),
-                border: iced::Border { color: pal.divider, width: 0.0, radius: 0.0.into() },
+                border: iced::Border {
+                    color: pal.divider,
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
                 ..Default::default()
             })
             .width(Length::Fill)
@@ -1604,7 +2103,8 @@ impl GhitaBrowserApp {
         let match_count = if self.find_query.is_empty() {
             String::new()
         } else {
-            let n = self.rendered_content
+            let n = self
+                .rendered_content
                 .to_lowercase()
                 .matches(&self.find_query.to_lowercase())
                 .count();
@@ -1620,19 +2120,30 @@ impl GhitaBrowserApp {
                     .padding([5, 10])
                     .width(Length::Fixed(220.0))
                     .style(omnibox_style(pal, 4.0)),
-                text(match_count).size(12).style(iced::theme::Text::from(pal.text_dim)),
+                text(match_count)
+                    .size(12)
+                    .style(iced::theme::Text::from(pal.text_dim)),
                 button(text("✕").size(12))
                     .on_press(Message::ToggleFindBar)
                     .padding([4, 8])
-                    .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text_dim, [4.0; 4])),
+                    .style(chrome_btn(
+                        pal.menu_bg,
+                        pal.menu_hover,
+                        pal.text_dim,
+                        [4.0; 4]
+                    )),
             ]
             .spacing(10)
             .padding(8)
-            .align_items(iced::Alignment::Center)
+            .align_items(iced::Alignment::Center),
         )
         .style(move |_: &Theme| container::Appearance {
             background: Some(iced::Background::Color(pal.menu_bg)),
-            border: iced::Border { color: pal.divider, width: 1.0, radius: [0.0, 0.0, 8.0, 8.0].into() },
+            border: iced::Border {
+                color: pal.divider,
+                width: 1.0,
+                radius: [0.0, 0.0, 8.0, 8.0].into(),
+            },
             ..Default::default()
         });
 
@@ -1643,7 +2154,11 @@ impl GhitaBrowserApp {
 
     /// Dispatch to internal pages or the web view
     fn build_content(&self, pal: &'static Pal) -> Element<'_, Message> {
-        let url = self.browser.active_tab().map(|t| t.url.clone()).unwrap_or_default();
+        let url = self
+            .browser
+            .active_tab()
+            .map(|t| t.url.clone())
+            .unwrap_or_default();
 
         let inner: Element<'_, Message> = match url.as_str() {
             "ghita://newtab" | "about:blank" | "" => self.build_newtab_page(pal),
@@ -1653,6 +2168,7 @@ impl GhitaBrowserApp {
             "ghita://downloads" => self.build_downloads_page(pal),
             "ghita://settings" => self.build_settings_page(pal),
             "ghita://about" => self.build_about_page(pal),
+            _ if url.starts_with("ghita://search") => self.build_search_page(pal),
             _ => self.build_web_view(pal),
         };
 
@@ -1673,7 +2189,11 @@ impl GhitaBrowserApp {
 
         if pixel_mode && !self.display_list.is_empty() {
             let zoom = self.zoom_percent as f32 / 100.0;
-            let base_url = self.browser.active_tab().map(|t| t.url.clone()).unwrap_or_default();
+            let base_url = self
+                .browser
+                .active_tab()
+                .map(|t| t.url.clone())
+                .unwrap_or_default();
 
             // Real pixel painting: backgrounds, borders, styled glyphs, clickable links
             let page = canvas::Canvas::new(PageCanvas {
@@ -1686,19 +2206,18 @@ impl GhitaBrowserApp {
             .height(Length::Fixed(self.display_list.height * zoom));
 
             // Center the page sheet like Chrome does with fixed-width documents
-            let mut items: Vec<Element<'_, Message>> = vec![
-                container(page).width(Length::Fill).center_x().into(),
-            ];
+            let mut items: Vec<Element<'_, Message>> =
+                vec![container(page).width(Length::Fill).center_x().into()];
             if !self.render_stats_text.is_empty() {
                 items.push(
                     container(
                         text(&self.render_stats_text)
                             .size(10)
-                            .style(iced::theme::Text::from(pal.text_dim))
+                            .style(iced::theme::Text::from(pal.text_dim)),
                     )
                     .width(Length::Fill)
                     .center_x()
-                    .into()
+                    .into(),
                 );
             }
 
@@ -1711,12 +2230,10 @@ impl GhitaBrowserApp {
         // Legacy text-mode renderer (also used for error pages)
         let content_size = (13.0 * self.zoom_percent as f32 / 100.0).max(6.0);
 
-        let mut items: Vec<Element<'_, Message>> = vec![
-            text(&self.rendered_content)
-                .size(content_size)
-                .style(iced::theme::Text::from(pal.text))
-                .into(),
-        ];
+        let mut items: Vec<Element<'_, Message>> = vec![text(&self.rendered_content)
+            .size(content_size)
+            .style(iced::theme::Text::from(pal.text))
+            .into()];
 
         if !self.render_stats_text.is_empty() {
             items.push(vertical_space().height(10).into());
@@ -1724,7 +2241,7 @@ impl GhitaBrowserApp {
                 text(&self.render_stats_text)
                     .size(10)
                     .style(iced::theme::Text::from(pal.text_dim))
-                    .into()
+                    .into(),
             );
         }
 
@@ -1739,7 +2256,12 @@ impl GhitaBrowserApp {
 
 /// Convert an engine RGBA color to an Iced color
 fn to_color(c: crate::paint::Rgba) -> Color {
-    Color { r: c.r, g: c.g, b: c.b, a: c.a }
+    Color {
+        r: c.r,
+        g: c.g,
+        b: c.b,
+        a: c.a,
+    }
 }
 
 /// Resolve a (possibly relative) href against the current page URL
@@ -1782,7 +2304,10 @@ impl<'a> canvas::Program<Message> for PageCanvas<'a> {
                 let y = pos.y / self.zoom;
                 if let Some(href) = self.list.link_at(x, y) {
                     let resolved = resolve_href(&self.base_url, href);
-                    return (canvas::event::Status::Captured, Some(Message::OpenUrl(resolved)));
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::OpenUrl(resolved)),
+                    );
                 }
             }
         }
@@ -1811,17 +2336,46 @@ impl<'a> canvas::Program<Message> for PageCanvas<'a> {
                             );
                         }
                     }
-                    DisplayItem::Border { x, y, w, h, width, color } => {
+                    DisplayItem::Border {
+                        x,
+                        y,
+                        w,
+                        h,
+                        width,
+                        color,
+                    } => {
                         let c = to_color(*color);
                         let bw = width.max(0.5);
                         // Four thin rects: top, bottom, left, right
                         frame.fill_rectangle(iced::Point::new(*x, *y), iced::Size::new(*w, bw), c);
-                        frame.fill_rectangle(iced::Point::new(*x, *y + *h - bw), iced::Size::new(*w, bw), c);
+                        frame.fill_rectangle(
+                            iced::Point::new(*x, *y + *h - bw),
+                            iced::Size::new(*w, bw),
+                            c,
+                        );
                         frame.fill_rectangle(iced::Point::new(*x, *y), iced::Size::new(bw, *h), c);
-                        frame.fill_rectangle(iced::Point::new(*x + *w - bw, *y), iced::Size::new(bw, *h), c);
+                        frame.fill_rectangle(
+                            iced::Point::new(*x + *w - bw, *y),
+                            iced::Size::new(bw, *h),
+                            c,
+                        );
                     }
-                    DisplayItem::TextRun { x, y, size, color, content, bold, italic, underline, monospace } => {
-                        let mut font = if *monospace { iced::Font::MONOSPACE } else { iced::Font::default() };
+                    DisplayItem::TextRun {
+                        x,
+                        y,
+                        size,
+                        color,
+                        content,
+                        bold,
+                        italic,
+                        underline,
+                        monospace,
+                    } => {
+                        let mut font = if *monospace {
+                            iced::Font::MONOSPACE
+                        } else {
+                            iced::Font::default()
+                        };
                         if *bold {
                             font.weight = iced::font::Weight::Bold;
                         }
@@ -1860,7 +2414,11 @@ impl<'a> canvas::Program<Message> for PageCanvas<'a> {
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
         if let Some(pos) = cursor.position_in(bounds) {
-            if self.list.link_at(pos.x / self.zoom, pos.y / self.zoom).is_some() {
+            if self
+                .list
+                .link_at(pos.x / self.zoom, pos.y / self.zoom)
+                .is_some()
+            {
                 return mouse::Interaction::Pointer;
             }
         }
@@ -1873,14 +2431,18 @@ impl<'a> canvas::Program<Message> for PageCanvas<'a> {
 impl GhitaBrowserApp {
     /// Chrome New Tab page: wordmark, search box, most-visited tiles
     fn build_newtab_page(&self, pal: &'static Pal) -> Element<'_, Message> {
-        // Colored wordmark, Google-style
+        // Colored wordmark in the brand "Fire" palette
         let wordmark = row![
-            text("G").size(44).style(iced::theme::Text::from(G_BLUE)),
-            text("h").size(44).style(iced::theme::Text::from(G_RED)),
-            text("i").size(44).style(iced::theme::Text::from(G_YELLOW)),
-            text("t").size(44).style(iced::theme::Text::from(G_BLUE)),
-            text("a").size(44).style(iced::theme::Text::from(G_GREEN)),
-            text("Browser").size(44).style(iced::theme::Text::from(pal.text_dim)),
+            text("G").size(44).style(iced::theme::Text::from(GH_ORANGE)),
+            text("h").size(44).style(iced::theme::Text::from(GH_AMBER)),
+            text("i").size(44).style(iced::theme::Text::from(GH_RED)),
+            text("t")
+                .size(44)
+                .style(iced::theme::Text::from(GH_CRIMSON)),
+            text("a").size(44).style(iced::theme::Text::from(GH_EMBER)),
+            text("Browser")
+                .size(44)
+                .style(iced::theme::Text::from(pal.text_dim)),
         ]
         .spacing(1)
         .align_items(iced::Alignment::Center);
@@ -1893,7 +2455,7 @@ impl GhitaBrowserApp {
                 .on_submit(Message::NtpSearchSubmit)
                 .size(14)
                 .padding([10, 20])
-                .style(omnibox_style(pal, 22.0))
+                .style(omnibox_style(pal, 22.0)),
         )
         .width(Length::Fixed(560.0));
 
@@ -1903,14 +2465,24 @@ impl GhitaBrowserApp {
         for chunk in top_sites.chunks(4) {
             let mut tile_row = row![].spacing(12);
             for site in chunk {
-                let initial = site.title.chars().next().unwrap_or('•').to_uppercase().to_string();
+                let initial = site
+                    .title
+                    .chars()
+                    .next()
+                    .unwrap_or('•')
+                    .to_uppercase()
+                    .to_string();
                 let tile = button(
                     column![
-                        text(initial).size(22).style(iced::theme::Text::from(pal.accent)),
-                        text(truncate_label(&site.title, 14)).size(11).style(iced::theme::Text::from(pal.text)),
+                        text(initial)
+                            .size(22)
+                            .style(iced::theme::Text::from(pal.accent)),
+                        text(truncate_label(&site.title, 14))
+                            .size(11)
+                            .style(iced::theme::Text::from(pal.text)),
                     ]
                     .spacing(6)
-                    .align_items(iced::Alignment::Center)
+                    .align_items(iced::Alignment::Center),
                 )
                 .on_press(Message::OpenUrl(site.url.clone()))
                 .padding([14, 10])
@@ -1924,7 +2496,7 @@ impl GhitaBrowserApp {
             tiles_col = tiles_col.push(
                 text("Your most visited sites will appear here")
                     .size(12)
-                    .style(iced::theme::Text::from(pal.text_dim))
+                    .style(iced::theme::Text::from(pal.text_dim)),
             );
         }
 
@@ -1936,14 +2508,20 @@ impl GhitaBrowserApp {
             vertical_space().height(36),
             tiles_col,
             vertical_space().height(24),
-            text("GhitaBrowser v0.5.0 — 100% Rust, 0% C++")
-                .size(11)
-                .style(iced::theme::Text::from(pal.text_dim)),
+            text(format!(
+                "GhitaBrowser v{} — 100% Rust, 0% C++",
+                crate::VERSION
+            ))
+            .size(11)
+            .style(iced::theme::Text::from(pal.text_dim)),
         ]
         .align_items(iced::Alignment::Center)
         .width(Length::Fill);
 
-        scrollable(page).width(Length::Fill).height(Length::Fill).into()
+        scrollable(page)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Chrome incognito New Tab page
@@ -1952,7 +2530,9 @@ impl GhitaBrowserApp {
             vertical_space().height(90),
             text("🕶").size(52),
             vertical_space().height(16),
-            text("You've gone incognito").size(24).style(iced::theme::Text::from(pal.text)),
+            text("You've gone incognito")
+                .size(24)
+                .style(iced::theme::Text::from(pal.text)),
             vertical_space().height(12),
             text("Pages you view in this tab won't appear in the browser history.")
                 .size(13)
@@ -1964,13 +2544,18 @@ impl GhitaBrowserApp {
         .align_items(iced::Alignment::Center)
         .width(Length::Fill);
 
-        scrollable(page).width(Length::Fill).height(Length::Fill).into()
+        scrollable(page)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// chrome://history equivalent
     fn build_history_page(&self, pal: &'static Pal) -> Element<'_, Message> {
         let header = row![
-            text("History").size(24).style(iced::theme::Text::from(pal.text)),
+            text("History")
+                .size(24)
+                .style(iced::theme::Text::from(pal.text)),
             horizontal_space(),
             button(text("Clear browsing data").size(12))
                 .on_press(Message::ClearHistory)
@@ -1995,56 +2580,224 @@ impl GhitaBrowserApp {
             {
                 continue;
             }
-            if shown >= 200 { break; }
+            if shown >= 200 {
+                break;
+            }
             shown += 1;
 
             list = list.push(
                 row![
-                    text(fmt_timestamp(h.visited_at)).size(11)
+                    text(fmt_timestamp(h.visited_at))
+                        .size(11)
                         .style(iced::theme::Text::from(pal.text_dim))
                         .width(Length::Fixed(120.0)),
                     button(
                         column![
-                            text(truncate_label(&h.title, 60)).size(13).style(iced::theme::Text::from(pal.accent)),
-                            text(truncate_label(&h.url, 80)).size(11).style(iced::theme::Text::from(pal.text_dim)),
-                        ].spacing(1)
+                            text(truncate_label(&h.title, 60))
+                                .size(13)
+                                .style(iced::theme::Text::from(pal.accent)),
+                            text(truncate_label(&h.url, 80))
+                                .size(11)
+                                .style(iced::theme::Text::from(pal.text_dim)),
+                        ]
+                        .spacing(1)
                     )
                     .on_press(Message::OpenUrl(h.url.clone()))
                     .padding([4, 8])
                     .width(Length::Fill)
-                    .style(chrome_btn(pal.content_bg, pal.menu_hover, pal.text, [6.0; 4])),
+                    .style(chrome_btn(
+                        pal.content_bg,
+                        pal.menu_hover,
+                        pal.text,
+                        [6.0; 4]
+                    )),
                     button(text("✕").size(11))
                         .on_press(Message::RemoveHistoryItem(h.url.clone()))
                         .padding([4, 8])
-                        .style(chrome_btn(pal.content_bg, pal.menu_hover, pal.text_dim, [6.0; 4])),
+                        .style(chrome_btn(
+                            pal.content_bg,
+                            pal.menu_hover,
+                            pal.text_dim,
+                            [6.0; 4]
+                        )),
                 ]
                 .spacing(8)
-                .align_items(iced::Alignment::Center)
+                .align_items(iced::Alignment::Center),
             );
         }
         if shown == 0 {
             list = list.push(
-                text("No browsing history found").size(13).style(iced::theme::Text::from(pal.text_dim))
+                text("No browsing history found")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text_dim)),
             );
         }
 
-        let page = container(
-            column![header, search, scrollable(list).height(Length::Fill)]
-                .spacing(16)
-        )
-        .padding([24, 60])
-        .width(Length::Fill)
-        .height(Length::Fill);
+        let page =
+            container(column![header, search, scrollable(list).height(Length::Fill)].spacing(16))
+                .padding([24, 60])
+                .width(Length::Fill)
+                .height(Length::Fill);
 
         page.into()
     }
 
+    /// ghita://search — in-app web search results page
+    fn build_search_page(&self, pal: &'static Pal) -> Element<'_, Message> {
+        // Search state is tracked per tab, so each tab keeps its own query
+        // and results (switching tabs never shows another tab's results).
+        let tab_id = self.browser.tabs.active_tab_id().unwrap_or(0);
+        let st = self.search_state.get(&tab_id);
+        let query = st.map(|s| s.query.clone()).unwrap_or_default();
+        let engine_name = self.search_engine_name().to_string();
+        let engine_url = self.search_url(&query);
+        let current_url = self
+            .browser
+            .active_tab()
+            .map(|t| t.url.clone())
+            .unwrap_or_default();
+
+        let header = text(format!("Search results for \"{}\"", query))
+            .size(24)
+            .style(iced::theme::Text::from(pal.text));
+
+        let mut body: Vec<Element<'_, Message>> = Vec::new();
+
+        let Some(st) = st else {
+            // No search was started in this tab yet (e.g. opened the page
+            // directly); show a friendly hint instead of an empty page.
+            body.push(
+                text("Enter a search term in the address bar to get results.")
+                    .size(14)
+                    .style(iced::theme::Text::from(pal.text_dim))
+                    .into(),
+            );
+            let mut page = column![header, vertical_space().height(8)].spacing(14);
+            for el in body {
+                page = page.push(el);
+            }
+            let footer =
+                self.build_engine_link(pal, format!("More on {}", engine_name), engine_url);
+            return container(column![page, footer].spacing(12))
+                .padding([24, 60])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        };
+
+        if st.loading {
+            body.push(
+                text(format!("Searching for \"{}\"…", query))
+                    .size(14)
+                    .style(iced::theme::Text::from(pal.text_dim))
+                    .into(),
+            );
+        } else if let Some(err) = &st.error {
+            body.push(
+                text(format!("Search failed: {}", err))
+                    .size(14)
+                    .style(iced::theme::Text::from(pal.danger))
+                    .into(),
+            );
+            body.push(
+                row![
+                    button(text("Try again").size(12))
+                        .on_press(Message::OpenUrl(current_url))
+                        .padding([6, 14])
+                        .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4])),
+                    self.build_engine_link(
+                        pal,
+                        format!("Open results on {}", engine_name),
+                        engine_url.clone()
+                    ),
+                ]
+                .spacing(10)
+                .into(),
+            );
+        } else if st.results.is_empty() {
+            body.push(
+                text(format!("No results found for \"{}\".", query))
+                    .size(14)
+                    .style(iced::theme::Text::from(pal.text_dim))
+                    .into(),
+            );
+            body.push(self.build_engine_link(
+                pal,
+                format!("Search on {}", engine_name),
+                engine_url.clone(),
+            ));
+        } else {
+            let mut list = column![].spacing(8);
+            for r in &st.results {
+                let url = r.url.clone();
+                list = list.push(
+                    column![
+                        button(text(truncate_label(&r.title, 90)).size(14))
+                            .on_press(Message::OpenUrl(url))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(chrome_btn(
+                                pal.content_bg,
+                                pal.menu_hover,
+                                pal.text,
+                                [6.0; 4]
+                            )),
+                        text(truncate_label(&r.url, 100))
+                            .size(11)
+                            .style(iced::theme::Text::from(pal.secure)),
+                        text(truncate_label(&r.snippet, 240))
+                            .size(12)
+                            .style(iced::theme::Text::from(pal.text_dim)),
+                    ]
+                    .spacing(2),
+                );
+            }
+            body.push(scrollable(list).height(Length::Fill).into());
+        }
+
+        let mut page = column![header, vertical_space().height(8)].spacing(14);
+        for el in body {
+            page = page.push(el);
+        }
+
+        let footer = self.build_engine_link(pal, format!("More on {}", engine_name), engine_url);
+
+        container(column![page, footer].spacing(12))
+            .padding([24, 60])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Rounded pill button that opens the configured search engine for the query
+    fn build_engine_link(
+        &self,
+        pal: &'static Pal,
+        label: String,
+        url: String,
+    ) -> Element<'_, Message> {
+        button(
+            row![text("🔍").size(12), text(label).size(12),]
+                .spacing(8)
+                .align_items(iced::Alignment::Center),
+        )
+        .on_press(Message::OpenUrl(url))
+        .padding([6, 14])
+        .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [16.0; 4]))
+        .into()
+    }
+
     /// chrome://bookmarks equivalent
     fn build_bookmarks_page(&self, pal: &'static Pal) -> Element<'_, Message> {
-        let header = text("Bookmarks").size(24).style(iced::theme::Text::from(pal.text));
+        let header = text("Bookmarks")
+            .size(24)
+            .style(iced::theme::Text::from(pal.text));
 
         let mut list = column![].spacing(2);
-        let bookmarks: Vec<(String, String, i64)> = self.browser.storage.bookmarks()
+        let bookmarks: Vec<(String, String, i64)> = self
+            .browser
+            .storage
+            .bookmarks()
             .iter()
             .map(|b| (b.title.clone(), b.url.clone(), b.added_at))
             .collect();
@@ -2053,7 +2806,7 @@ impl GhitaBrowserApp {
             list = list.push(
                 text("No bookmarks yet — press ☆ in the address bar or Ctrl+D to add one")
                     .size(13)
-                    .style(iced::theme::Text::from(pal.text_dim))
+                    .style(iced::theme::Text::from(pal.text_dim)),
             );
         }
 
@@ -2062,41 +2815,60 @@ impl GhitaBrowserApp {
             let url_remove = url.clone();
             list = list.push(
                 row![
-                    text("★").size(13).style(iced::theme::Text::from(pal.accent)),
+                    text("★")
+                        .size(13)
+                        .style(iced::theme::Text::from(pal.accent)),
                     button(
                         column![
-                            text(truncate_label(&title, 60)).size(13).style(iced::theme::Text::from(pal.accent)),
-                            text(truncate_label(&url, 80)).size(11).style(iced::theme::Text::from(pal.text_dim)),
-                        ].spacing(1)
+                            text(truncate_label(&title, 60))
+                                .size(13)
+                                .style(iced::theme::Text::from(pal.accent)),
+                            text(truncate_label(&url, 80))
+                                .size(11)
+                                .style(iced::theme::Text::from(pal.text_dim)),
+                        ]
+                        .spacing(1)
                     )
                     .on_press(Message::OpenUrl(url_open))
                     .padding([4, 8])
                     .width(Length::Fill)
-                    .style(chrome_btn(pal.content_bg, pal.menu_hover, pal.text, [6.0; 4])),
-                    text(fmt_timestamp(added_at)).size(11).style(iced::theme::Text::from(pal.text_dim)),
+                    .style(chrome_btn(
+                        pal.content_bg,
+                        pal.menu_hover,
+                        pal.text,
+                        [6.0; 4]
+                    )),
+                    text(fmt_timestamp(added_at))
+                        .size(11)
+                        .style(iced::theme::Text::from(pal.text_dim)),
                     button(text("✕").size(11))
                         .on_press(Message::RemoveBookmark(url_remove))
                         .padding([4, 8])
-                        .style(chrome_btn(pal.content_bg, pal.menu_hover, pal.text_dim, [6.0; 4])),
+                        .style(chrome_btn(
+                            pal.content_bg,
+                            pal.menu_hover,
+                            pal.text_dim,
+                            [6.0; 4]
+                        )),
                 ]
                 .spacing(8)
-                .align_items(iced::Alignment::Center)
+                .align_items(iced::Alignment::Center),
             );
         }
 
-        container(
-            column![header, scrollable(list).height(Length::Fill)].spacing(16)
-        )
-        .padding([24, 60])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        container(column![header, scrollable(list).height(Length::Fill)].spacing(16))
+            .padding([24, 60])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// chrome://downloads equivalent
     fn build_downloads_page(&self, pal: &'static Pal) -> Element<'_, Message> {
         let header = row![
-            text("Downloads").size(24).style(iced::theme::Text::from(pal.text)),
+            text("Downloads")
+                .size(24)
+                .style(iced::theme::Text::from(pal.text)),
             horizontal_space(),
             button(text("Clear all").size(12))
                 .on_press(Message::ClearDownloads)
@@ -2115,51 +2887,74 @@ impl GhitaBrowserApp {
 
         if downloads.is_empty() {
             list = list.push(
-                text("Files you download appear here").size(13).style(iced::theme::Text::from(pal.text_dim))
+                text("Files you download appear here")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text_dim)),
             );
         }
 
         for d in downloads {
             let status: Element<'_, Message> = if d.success {
-                text("✓").size(14).style(iced::theme::Text::from(pal.secure)).into()
+                text("✓")
+                    .size(14)
+                    .style(iced::theme::Text::from(pal.secure))
+                    .into()
             } else {
-                text("✗").size(14).style(iced::theme::Text::from(pal.danger)).into()
+                text("✗")
+                    .size(14)
+                    .style(iced::theme::Text::from(pal.danger))
+                    .into()
             };
             list = list.push(
                 container(
                     row![
                         text("📄").size(18),
                         column![
-                            text(truncate_label(&d.file_name, 50)).size(13).style(iced::theme::Text::from(pal.text)),
-                            text(truncate_label(&d.url, 70)).size(11).style(iced::theme::Text::from(pal.text_dim)),
-                            text(truncate_label(&d.path, 70)).size(10).style(iced::theme::Text::from(pal.text_dim)),
-                        ].spacing(1).width(Length::Fill),
+                            text(truncate_label(&d.file_name, 50))
+                                .size(13)
+                                .style(iced::theme::Text::from(pal.text)),
+                            text(truncate_label(&d.url, 70))
+                                .size(11)
+                                .style(iced::theme::Text::from(pal.text_dim)),
+                            text(truncate_label(&d.path, 70))
+                                .size(10)
+                                .style(iced::theme::Text::from(pal.text_dim)),
+                        ]
+                        .spacing(1)
+                        .width(Length::Fill),
                         column![
-                            text(fmt_bytes(d.size_bytes)).size(11).style(iced::theme::Text::from(pal.text_dim)),
-                            text(fmt_timestamp(d.completed_at)).size(11).style(iced::theme::Text::from(pal.text_dim)),
-                        ].spacing(1),
+                            text(fmt_bytes(d.size_bytes))
+                                .size(11)
+                                .style(iced::theme::Text::from(pal.text_dim)),
+                            text(fmt_timestamp(d.completed_at))
+                                .size(11)
+                                .style(iced::theme::Text::from(pal.text_dim)),
+                        ]
+                        .spacing(1),
                         status,
                     ]
                     .spacing(12)
-                    .align_items(iced::Alignment::Center)
+                    .align_items(iced::Alignment::Center),
                 )
                 .style(move |_: &Theme| container::Appearance {
                     background: Some(iced::Background::Color(pal.menu_bg)),
-                    border: iced::Border { color: pal.divider, width: 1.0, radius: 8.0.into() },
+                    border: iced::Border {
+                        color: pal.divider,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
                     ..Default::default()
                 })
                 .padding(12)
-                .width(Length::Fill)
+                .width(Length::Fill),
             );
         }
 
-        container(
-            column![header, hint, scrollable(list).height(Length::Fill)].spacing(14)
-        )
-        .padding([24, 60])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        container(column![header, hint, scrollable(list).height(Length::Fill)].spacing(14))
+            .padding([24, 60])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// chrome://settings equivalent
@@ -2167,16 +2962,28 @@ impl GhitaBrowserApp {
         let settings = &self.browser.storage.settings;
 
         let section = |label: &str| -> Element<'_, Message> {
-            text(label.to_string()).size(16).style(iced::theme::Text::from(pal.accent)).into()
+            text(label.to_string())
+                .size(16)
+                .style(iced::theme::Text::from(pal.accent))
+                .into()
         };
 
         let choice_btn = |label: &str, selected: bool, msg: Message| -> Element<'_, Message> {
             button(
                 row![
-                    text(if selected { "●" } else { "○" }).size(11)
-                        .style(iced::theme::Text::from(if selected { pal.accent } else { pal.text_dim })),
-                    text(label.to_string()).size(13).style(iced::theme::Text::from(pal.text)),
-                ].spacing(8).align_items(iced::Alignment::Center)
+                    text(if selected { "●" } else { "○" })
+                        .size(11)
+                        .style(iced::theme::Text::from(if selected {
+                            pal.accent
+                        } else {
+                            pal.text_dim
+                        })),
+                    text(label.to_string())
+                        .size(13)
+                        .style(iced::theme::Text::from(pal.text)),
+                ]
+                .spacing(8)
+                .align_items(iced::Alignment::Center),
             )
             .on_press(msg)
             .padding([6, 14])
@@ -2194,59 +3001,118 @@ impl GhitaBrowserApp {
         let bar_on = self.show_bookmarks_bar;
 
         let page = column![
-            text("Settings").size(24).style(iced::theme::Text::from(pal.text)),
-
+            text("Settings")
+                .size(24)
+                .style(iced::theme::Text::from(pal.text)),
             section("Appearance"),
             row![
-                text("Theme").size(13).style(iced::theme::Text::from(pal.text)).width(Length::Fixed(180.0)),
+                text("Theme")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text))
+                    .width(Length::Fixed(180.0)),
                 choice_btn("Dark", dark, Message::SetThemeDark(true)),
                 choice_btn("Light", !dark, Message::SetThemeDark(false)),
-            ].spacing(10).align_items(iced::Alignment::Center),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
             row![
-                text("Show bookmarks bar").size(13).style(iced::theme::Text::from(pal.text)).width(Length::Fixed(180.0)),
-                choice_btn(if bar_on { "On" } else { "Off" }, bar_on, Message::ToggleBookmarksBar),
-            ].spacing(10).align_items(iced::Alignment::Center),
-
+                text("Show bookmarks bar")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text))
+                    .width(Length::Fixed(180.0)),
+                choice_btn(
+                    if bar_on { "On" } else { "Off" },
+                    bar_on,
+                    Message::ToggleBookmarksBar
+                ),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
             section("Search engine"),
             row![
-                text("Used in the omnibox").size(13).style(iced::theme::Text::from(pal.text)).width(Length::Fixed(180.0)),
-                choice_btn("Google", engine == "google", Message::SetSearchEngine("google".to_string())),
-                choice_btn("Bing", engine == "bing", Message::SetSearchEngine("bing".to_string())),
-                choice_btn("DuckDuckGo", engine == "duckduckgo", Message::SetSearchEngine("duckduckgo".to_string())),
-            ].spacing(10).align_items(iced::Alignment::Center),
-
+                text("Used in the omnibox")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text))
+                    .width(Length::Fixed(180.0)),
+                choice_btn(
+                    "Google",
+                    engine == "google",
+                    Message::SetSearchEngine("google".to_string())
+                ),
+                choice_btn(
+                    "Bing",
+                    engine == "bing",
+                    Message::SetSearchEngine("bing".to_string())
+                ),
+                choice_btn(
+                    "DuckDuckGo",
+                    engine == "duckduckgo",
+                    Message::SetSearchEngine("duckduckgo".to_string())
+                ),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
             section("On startup"),
             row![
-                text("Homepage").size(13).style(iced::theme::Text::from(pal.text)).width(Length::Fixed(180.0)),
+                text("Homepage")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text))
+                    .width(Length::Fixed(180.0)),
                 text_input("ghita://newtab", &self.homepage_input)
                     .on_input(Message::HomepageChanged)
                     .size(13)
                     .padding([6, 12])
                     .width(Length::Fixed(340.0))
                     .style(omnibox_style(pal, 8.0)),
-            ].spacing(10).align_items(iced::Alignment::Center),
-
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
             section("Page zoom"),
             row![
-                text("Default zoom").size(13).style(iced::theme::Text::from(pal.text)).width(Length::Fixed(180.0)),
-                button(text("−").size(13)).on_press(Message::ZoomOut).padding([4, 12])
+                text("Default zoom")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text))
+                    .width(Length::Fixed(180.0)),
+                button(text("−").size(13))
+                    .on_press(Message::ZoomOut)
+                    .padding([4, 12])
                     .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [6.0; 4])),
-                text(format!("{}%", self.zoom_percent)).size(13).style(iced::theme::Text::from(pal.text)),
-                button(text("+").size(13)).on_press(Message::ZoomIn).padding([4, 12])
+                text(format!("{}%", self.zoom_percent))
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text)),
+                button(text("+").size(13))
+                    .on_press(Message::ZoomIn)
+                    .padding([4, 12])
                     .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [6.0; 4])),
-                button(text("Reset").size(12)).on_press(Message::ZoomReset).padding([4, 12])
+                button(text("Reset").size(12))
+                    .on_press(Message::ZoomReset)
+                    .padding([4, 12])
                     .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [6.0; 4])),
-            ].spacing(10).align_items(iced::Alignment::Center),
-
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
             section("Renderer"),
             row![
-                text("Web page rendering").size(13).style(iced::theme::Text::from(pal.text)).width(Length::Fixed(180.0)),
-                choice_btn("Pixels (Chrome-like)", pixel_on, Message::SetPixelRendering(true)),
-                choice_btn("Text mode (legacy)", !pixel_on, Message::SetPixelRendering(false)),
-            ].spacing(10).align_items(iced::Alignment::Center),
+                text("Web page rendering")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text))
+                    .width(Length::Fixed(180.0)),
+                choice_btn(
+                    "Pixels (Chrome-like)",
+                    pixel_on,
+                    Message::SetPixelRendering(true)
+                ),
+                choice_btn(
+                    "Text mode (legacy)",
+                    !pixel_on,
+                    Message::SetPixelRendering(false)
+                ),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
             text("Pixel mode paints pages on a real graphics canvas with clickable links")
-                .size(11).style(iced::theme::Text::from(pal.text_dim)),
-
+                .size(11)
+                .style(iced::theme::Text::from(pal.text_dim)),
             section("Privacy and security"),
             row![
                 button(text("Clear browsing data").size(12))
@@ -2257,23 +3123,26 @@ impl GhitaBrowserApp {
                     .on_press(Message::ClearDownloads)
                     .padding([6, 14])
                     .style(chrome_btn(pal.toolbar, pal.menu_hover, pal.text, [6.0; 4])),
-            ].spacing(10),
+            ]
+            .spacing(10),
             text("Clears history, cookies and the resource cache")
-                .size(11).style(iced::theme::Text::from(pal.text_dim)),
-
+                .size(11)
+                .style(iced::theme::Text::from(pal.text_dim)),
             section("About"),
-            text("GhitaBrowser v0.5.0 — a Chrome-style browser written 100% in safe Rust")
-                .size(12).style(iced::theme::Text::from(pal.text_dim)),
+            text(format!(
+                "GhitaBrowser v{} — a Chrome-style browser written 100% in safe Rust",
+                crate::VERSION
+            ))
+            .size(12)
+            .style(iced::theme::Text::from(pal.text_dim)),
         ]
         .spacing(14)
         .max_width(720);
 
-        scrollable(
-            container(page).padding([24, 60]).width(Length::Fill)
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        scrollable(container(page).padding([24, 60]).width(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// chrome://about equivalent
@@ -2283,32 +3152,60 @@ impl GhitaBrowserApp {
             text("🦀").size(56),
             vertical_space().height(10),
             row![
-                text("G").size(34).style(iced::theme::Text::from(G_BLUE)),
-                text("h").size(34).style(iced::theme::Text::from(G_RED)),
-                text("i").size(34).style(iced::theme::Text::from(G_YELLOW)),
-                text("t").size(34).style(iced::theme::Text::from(G_BLUE)),
-                text("a").size(34).style(iced::theme::Text::from(G_GREEN)),
-                text("Browser").size(34).style(iced::theme::Text::from(pal.text)),
-            ].spacing(1),
+                text("G").size(34).style(iced::theme::Text::from(GH_ORANGE)),
+                text("h").size(34).style(iced::theme::Text::from(GH_AMBER)),
+                text("i").size(34).style(iced::theme::Text::from(GH_RED)),
+                text("t")
+                    .size(34)
+                    .style(iced::theme::Text::from(GH_CRIMSON)),
+                text("a").size(34).style(iced::theme::Text::from(GH_EMBER)),
+                text("Browser")
+                    .size(34)
+                    .style(iced::theme::Text::from(pal.text)),
+            ]
+            .spacing(1),
             vertical_space().height(8),
-            text("Version 0.5.0 (Official Build) — 100% safe Rust").size(14)
-                .style(iced::theme::Text::from(pal.text_dim)),
+            text(format!(
+                "Version {} (Official Build) — 100% safe Rust",
+                crate::VERSION
+            ))
+            .size(14)
+            .style(iced::theme::Text::from(pal.text_dim)),
             vertical_space().height(24),
             column![
-                text("• Real pixel graphics renderer with clickable links (canvas)").size(12).style(iced::theme::Text::from(pal.text_dim)),
-                text("• Custom HTML5 parser, CSS engine & box-model layout").size(12).style(iced::theme::Text::from(pal.text_dim)),
-                text("• Real HTTP/HTTPS networking with cookies & resource cache").size(12).style(iced::theme::Text::from(pal.text_dim)),
-                text("• Homemade JavaScript engine (JSv)").size(12).style(iced::theme::Text::from(pal.text_dim)),
-                text("• Chrome-style UI: tabs, omnibox, bookmarks, history, downloads").size(12).style(iced::theme::Text::from(pal.text_dim)),
-                text("• GUI: Iced 0.12 (Elm architecture) on tokio").size(12).style(iced::theme::Text::from(pal.text_dim)),
-            ].spacing(4).align_items(iced::Alignment::Center),
+                text("• Real pixel graphics renderer with clickable links (canvas)")
+                    .size(12)
+                    .style(iced::theme::Text::from(pal.text_dim)),
+                text("• Custom HTML5 parser, CSS engine & box-model layout")
+                    .size(12)
+                    .style(iced::theme::Text::from(pal.text_dim)),
+                text("• Real HTTP/HTTPS networking with cookies & resource cache")
+                    .size(12)
+                    .style(iced::theme::Text::from(pal.text_dim)),
+                text("• Homemade JavaScript engine (JSv)")
+                    .size(12)
+                    .style(iced::theme::Text::from(pal.text_dim)),
+                text("• Chrome-style UI: tabs, omnibox, bookmarks, history, downloads")
+                    .size(12)
+                    .style(iced::theme::Text::from(pal.text_dim)),
+                text("• GUI: Iced 0.12 (Elm architecture) on tokio")
+                    .size(12)
+                    .style(iced::theme::Text::from(pal.text_dim)),
+            ]
+            .spacing(4)
+            .align_items(iced::Alignment::Center),
             vertical_space().height(20),
-            text("MIT License").size(11).style(iced::theme::Text::from(pal.text_dim)),
+            text("MIT License")
+                .size(11)
+                .style(iced::theme::Text::from(pal.text_dim)),
         ]
         .align_items(iced::Alignment::Center)
         .width(Length::Fill);
 
-        scrollable(page).width(Length::Fill).height(Length::Fill).into()
+        scrollable(page)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     // ===== DevTools =====
@@ -2337,23 +3234,35 @@ impl GhitaBrowserApp {
         container(
             column![
                 row![
-                    text("DevTools").size(14).style(iced::theme::Text::from(pal.text)),
+                    text("DevTools")
+                        .size(14)
+                        .style(iced::theme::Text::from(pal.text)),
                     horizontal_space(),
                     button(text("✕").size(12))
                         .on_press(Message::ToggleDevTools)
                         .padding([2, 8])
-                        .style(chrome_btn(pal.menu_bg, pal.menu_hover, pal.text_dim, [4.0; 4])),
-                ].align_items(iced::Alignment::Center),
+                        .style(chrome_btn(
+                            pal.menu_bg,
+                            pal.menu_hover,
+                            pal.text_dim,
+                            [4.0; 4]
+                        )),
+                ]
+                .align_items(iced::Alignment::Center),
                 pane_btn("Console", DevPane::Console),
                 pane_btn("Storage", DevPane::Storage),
                 pane_btn("Cache", DevPane::Cache),
                 container(pane_content).height(Length::Fill),
             ]
-            .spacing(8)
+            .spacing(8),
         )
         .style(move |_: &Theme| container::Appearance {
             background: Some(iced::Background::Color(pal.menu_bg)),
-            border: iced::Border { color: pal.divider, width: 1.0, radius: 0.0.into() },
+            border: iced::Border {
+                color: pal.divider,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
             text_color: Some(pal.text),
             ..Default::default()
         })
@@ -2366,7 +3275,9 @@ impl GhitaBrowserApp {
     fn build_console_pane(&self, pal: &'static Pal) -> Element<'_, Message> {
         column![
             scrollable(
-                text(&self.js_console_text).size(11).style(iced::theme::Text::from(pal.text))
+                text(&self.js_console_text)
+                    .size(11)
+                    .style(iced::theme::Text::from(pal.text))
             )
             .width(Length::Fill)
             .height(Length::Fill),
@@ -2382,7 +3293,8 @@ impl GhitaBrowserApp {
                     .on_press(Message::ExecuteJs)
                     .padding([5, 10])
                     .style(chrome_btn(pal.accent, pal.accent, pal.on_accent, [6.0; 4])),
-            ].spacing(4),
+            ]
+            .spacing(4),
         ]
         .spacing(8)
         .into()
@@ -2391,13 +3303,26 @@ impl GhitaBrowserApp {
     fn build_storage_pane(&self, pal: &'static Pal) -> Element<'_, Message> {
         let mut details = column![
             text(format!("Cookies: {}", self.browser.storage.cookie_count()))
-                .size(12).style(iced::theme::Text::from(pal.text)),
-            text(format!("localStorage origins: {}", self.browser.storage.local_storage_origins().len()))
-                .size(12).style(iced::theme::Text::from(pal.text)),
-            text(format!("Bookmarks: {}", self.browser.storage.bookmarks().len()))
-                .size(12).style(iced::theme::Text::from(pal.text)),
-            text(format!("History entries: {}", self.browser.storage.history().len()))
-                .size(12).style(iced::theme::Text::from(pal.text)),
+                .size(12)
+                .style(iced::theme::Text::from(pal.text)),
+            text(format!(
+                "localStorage origins: {}",
+                self.browser.storage.local_storage_origins().len()
+            ))
+            .size(12)
+            .style(iced::theme::Text::from(pal.text)),
+            text(format!(
+                "Bookmarks: {}",
+                self.browser.storage.bookmarks().len()
+            ))
+            .size(12)
+            .style(iced::theme::Text::from(pal.text)),
+            text(format!(
+                "History entries: {}",
+                self.browser.storage.history().len()
+            ))
+            .size(12)
+            .style(iced::theme::Text::from(pal.text)),
         ]
         .spacing(6);
 
@@ -2405,28 +3330,45 @@ impl GhitaBrowserApp {
             if let Some(ls) = self.browser.storage.get_local_storage(&origin) {
                 details = details.push(
                     text(format!("  {} ({} items)", origin, ls.len()))
-                        .size(11).style(iced::theme::Text::from(pal.text_dim))
+                        .size(11)
+                        .style(iced::theme::Text::from(pal.text_dim)),
                 );
             }
         }
 
-        scrollable(details).width(Length::Fill).height(Length::Fill).into()
+        scrollable(details)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn build_cache_pane(&self, pal: &'static Pal) -> Element<'_, Message> {
         let stats = self.browser.cache.stats();
         let hit_rate = if stats.hits + stats.misses > 0 {
-            format!("{:.1}%", (stats.hits as f64 / (stats.hits + stats.misses) as f64) * 100.0)
+            format!(
+                "{:.1}%",
+                (stats.hits as f64 / (stats.hits + stats.misses) as f64) * 100.0
+            )
         } else {
             "0.0%".to_string()
         };
 
         column![
-            text(format!("Entries: {}", stats.entries)).size(12).style(iced::theme::Text::from(pal.text)),
-            text(format!("Hits: {}", stats.hits)).size(12).style(iced::theme::Text::from(pal.secure)),
-            text(format!("Misses: {}", stats.misses)).size(12).style(iced::theme::Text::from(pal.danger)),
-            text(format!("Hit rate: {}", hit_rate)).size(12).style(iced::theme::Text::from(pal.text)),
-            text(format!("Max size: {} MB", stats.max_size / (1024 * 1024))).size(12).style(iced::theme::Text::from(pal.text_dim)),
+            text(format!("Entries: {}", stats.entries))
+                .size(12)
+                .style(iced::theme::Text::from(pal.text)),
+            text(format!("Hits: {}", stats.hits))
+                .size(12)
+                .style(iced::theme::Text::from(pal.secure)),
+            text(format!("Misses: {}", stats.misses))
+                .size(12)
+                .style(iced::theme::Text::from(pal.danger)),
+            text(format!("Hit rate: {}", hit_rate))
+                .size(12)
+                .style(iced::theme::Text::from(pal.text)),
+            text(format!("Max size: {} MB", stats.max_size / (1024 * 1024)))
+                .size(12)
+                .style(iced::theme::Text::from(pal.text_dim)),
         ]
         .spacing(6)
         .into()
@@ -2434,18 +3376,31 @@ impl GhitaBrowserApp {
 
     /// Slim status bar (Chrome shows hover status bottom-left)
     fn build_status_bar(&self, pal: &'static Pal) -> Element<'_, Message> {
-        let load_time_str = self.last_load_time
+        let load_time_str = self
+            .last_load_time
             .map(|t| format!("{}ms", t))
             .unwrap_or_else(|| "—".to_string());
 
         let status_row = row![
-            text(truncate_label(&self.status_msg, 90)).size(10)
+            text(truncate_label(&self.status_msg, 90))
+                .size(10)
                 .style(iced::theme::Text::from(pal.text_dim)),
             horizontal_space(),
-            text(if self.zoom_percent != 100 { format!("{}% ", self.zoom_percent) } else { String::new() })
-                .size(10).style(iced::theme::Text::from(pal.accent)),
-            text(format!("{} | {} tabs | v0.5.0 🦀", load_time_str, self.browser.tab_count()))
-                .size(10).style(iced::theme::Text::from(pal.text_dim)),
+            text(if self.zoom_percent != 100 {
+                format!("{}% ", self.zoom_percent)
+            } else {
+                String::new()
+            })
+            .size(10)
+            .style(iced::theme::Text::from(pal.accent)),
+            text(format!(
+                "{} | {} tabs | v{} 🦀",
+                load_time_str,
+                self.browser.tab_count(),
+                crate::VERSION
+            ))
+            .size(10)
+            .style(iced::theme::Text::from(pal.text_dim)),
         ]
         .spacing(6)
         .padding([2, 10])
@@ -2454,7 +3409,11 @@ impl GhitaBrowserApp {
         container(status_row)
             .style(move |_: &Theme| container::Appearance {
                 background: Some(iced::Background::Color(pal.toolbar)),
-                border: iced::Border { color: pal.divider, width: 0.0, radius: 0.0.into() },
+                border: iced::Border {
+                    color: pal.divider,
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
                 ..Default::default()
             })
             .width(Length::Fill)
@@ -2497,11 +3456,10 @@ fn fmt_timestamp(ts: i64) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-
 pub fn run_gui() -> Result<(), iced::Error> {
     let mut settings = Settings::default();
     settings.window.size = iced::Size::new(1280.0, 900.0);
     settings.window.min_size = Some(iced::Size::new(800.0, 600.0));
-    info!("Starting GhitaBrowser v0.5.0 GUI");
+    info!("Starting GhitaBrowser v{} GUI", crate::VERSION);
     GhitaBrowserApp::run(settings)
 }

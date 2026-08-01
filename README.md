@@ -6,7 +6,23 @@ A Chrome-style lightweight browser written 100% in safe Rust, built from scratch
 
 ## Overview
 
-GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.5.0). The UI is modeled after Google Chrome — tab strip, omnibox, three-dot menu, bookmarks bar, history, downloads, settings — and pages are now painted with **real pixels on a graphics canvas**, while the whole engine (networking, HTML/CSS parsing, layout, painting, JS, storage) remains 100% homemade Rust.
+GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.6.0). The UI is modeled after Google Chrome — tab strip, omnibox, three-dot menu, bookmarks bar, history, downloads, settings — and pages are now painted with **real pixels on a graphics canvas**, while the whole engine (networking, HTML/CSS parsing, layout, painting, JS, storage) remains 100% homemade Rust.
+
+### v0.6.0 New Features — the "Search & Ghita Lửa" release
+
+**Real web search (new!)**
+- ✅ **In-app search results page** — type a query in the omnibox or the New Tab search box and get a clean, native results page (`ghita://search`) powered by DuckDuckGo's lightweight HTML endpoint — no JavaScript required
+- ✅ **Clickable results** — each result shows title, URL and snippet and opens in a new tab; a footer pill links out to your configured engine for more results
+- ✅ **Offline-friendly** — if the search backend is unreachable you get a friendly error page with a direct link to the engine instead of a blank screen
+
+**New branding — "Ghita Lửa" (fire)**
+- ✅ **New logo & app icon** — rounded fire-gradient badge (`#FF8C42 → #A63A2B`) with a bold white "G" and an amber flame inside (see `logo.png` / `icon.ico`)
+- ✅ **Fire color wordmark** — the GhitaBrowser wordmark now uses a custom orange → amber → crimson → ember gradient instead of Google's palette
+- ✅ **No console window on launch** — the release build is a proper Windows GUI application; the terminal never pops up
+
+**Polish & performance**
+- ✅ **Single `VERSION` constant** — the UI, status bar, user-agent and storage state all read from one place, so versions can't drift
+- ✅ **Faster release builds & startup** — LTO, single codegen unit, opt-level 3
 
 ### v0.5.0 New Features — the "Real Pixels" release
 
@@ -26,7 +42,7 @@ GhitaBrowser is a complete web browser implementation written entirely in safe R
 - ✅ **Chrome color palettes** — Pixel-matched dark (`#202124`/`#35363A`/`#8AB4F8`) and light (`#DEE1E6`/`#FFFFFF`/`#1A73E8`) themes
 - ✅ **Chrome tab strip** — Rounded tabs attached to the toolbar, favicon glyphs, in-tab close buttons, `+` button, Chrome-style "activate right neighbor" on close
 - ✅ **Omnibox** — Unified search/address pill with security chip (🔒/⚠), bookmark star (★) inside the box, real keyboard focus (`Ctrl+L`), and dropdown suggestions from history & bookmarks
-- ✅ **Search from the address bar** — Non-URL input searches with Google, Bing or DuckDuckGo (configurable)
+- ✅ **Search from the address bar** — Non-URL input opens the in-app results page (`ghita://search`) using your chosen engine (Google, Bing or DuckDuckGo)
 - ✅ **Three-dot menu (⋮)** — New tab, incognito, history, downloads, bookmarks, zoom controls, find, save page, settings, DevTools, about
 - ✅ **Bookmarks bar** — Toggleable (`Ctrl+Shift+B`), one-click bookmark buttons
 - ✅ **New Tab page** — Colored wordmark, centered search box, most-visited tiles from real browsing history
@@ -41,7 +57,7 @@ GhitaBrowser is a complete web browser implementation written entirely in safe R
 - ✅ **Reopen closed tab** — `Ctrl+Shift+T` restores recently closed tabs
 - ✅ **Find in page** — `Ctrl+F` bar with live match count
 - ✅ **Zoom** — `Ctrl +` / `Ctrl -` / `Ctrl 0` with real Chrome zoom steps (25%–500%)
-- ✅ **Internal pages** — `ghita://newtab`, `history`, `bookmarks`, `downloads`, `settings`, `about`, `incognito` (like `chrome://`)
+- ✅ **Internal pages** — `ghita://newtab`, `history`, `bookmarks`, `downloads`, `settings`, `search`, `about`, `incognito` (like `chrome://`)
 - ✅ **Full Chrome keyboard shortcut set** — see table below
 
 ### Core Engine (Retained & Improved)
@@ -53,24 +69,25 @@ GhitaBrowser is a complete web browser implementation written entirely in safe R
 - ✅ **JavaScript engine** with variables (`let`), functions, `if`/`while` control flow, `console.log`
 - ✅ **Persistent storage** via `serde`+`serde_json` — cookies, localStorage, bookmarks, history, downloads, settings
 - ✅ **Resource cache** with TTL-based expiry and hit/miss tracking
-- ✅ **88 tests** across all modules (74 unit + 14 integration)
+- ✅ **104 tests** across all modules (90 unit + 14 integration)
 
 ### Core Components
 
 | Module | Description | Status |
 |--------|-------------|--------|
-| **Network** | HTTP/HTTPS via ureq, ResourceCache with TTL, binary downloads | ✅ v0.5.0 |
-| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.5.0 |
-| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.5.0 |
-| **Layout** | Box model, text wrapping, block/inline, auto-height, UA font sizes | ✅ v0.5.0 |
-| **Paint** | Display-list painter: rects, borders, text runs, link hit-testing | ✅ v0.5.0 |
-| **Renderer** | Real pixel canvas (wgpu/tiny-skia) + legacy text mode | ✅ v0.5.0 |
-| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.5.0 |
-| **Storage** | Cookies, localStorage, bookmarks, history, downloads, settings | ✅ v0.5.0 |
-| **UI (Iced)** | Chrome-style tab strip, omnibox, menu, bookmarks bar, internal pages, DevTools | ✅ v0.5.0 |
-| **Tabs** | Chrome close behavior, incognito, reopen closed, tab cycling | ✅ v0.5.0 |
-| **Image Loader** | Image cache with memory management | ✅ v0.5.0 |
-| **Performance** | Profiler with per-phase timing | ✅ v0.5.0 |
+| **Network** | HTTP/HTTPS via ureq, ResourceCache with TTL, binary downloads | ✅ v0.6.0 |
+| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.6.0 |
+| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.6.0 |
+| **Layout** | Box model, text wrapping, block/inline, auto-height, UA font sizes | ✅ v0.6.0 |
+| **Paint** | Display-list painter: rects, borders, text runs, link hit-testing | ✅ v0.6.0 |
+| **Renderer** | Real pixel canvas (wgpu/tiny-skia) + legacy text mode | ✅ v0.6.0 |
+| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.6.0 |
+| **Storage** | Cookies, localStorage, bookmarks, history, downloads, settings | ✅ v0.6.0 |
+| **UI (Iced)** | Chrome-style tab strip, omnibox, menu, bookmarks bar, internal pages, DevTools | ✅ v0.6.0 |
+| **Tabs** | Chrome close behavior, incognito, reopen closed, tab cycling | ✅ v0.6.0 |
+| **Image Loader** | Image cache with memory management | ✅ v0.6.0 |
+| **Performance** | Profiler with per-phase timing | ✅ v0.6.0 |
+| **Search** | In-app results page via DuckDuckGo HTML endpoint | ✅ v0.6.0 |
 
 ## Keyboard Shortcuts (Chrome bindings)
 
@@ -105,6 +122,7 @@ GhitaBrowser is a complete web browser implementation written entirely in safe R
 | `ghita://bookmarks` | Bookmark manager |
 | `ghita://downloads` | Downloads |
 | `ghita://settings` | Settings |
+| `ghita://search?q=...` | In-app search results |
 | `ghita://about` | About GhitaBrowser |
 
 ## Building
@@ -126,8 +144,7 @@ cargo test
 
 ## Dependencies
 
-- **winit** 0.29 - Native window creation
-- **iced** 0.12 - GUI framework
+- **iced** 0.12 - GUI framework (window creation, widgets, canvas)
 - **ureq** 2.9 - HTTP/HTTPS client
 - **serde** + **serde_json** - Serialization
 - **image** 0.24 - Image decoding

@@ -59,7 +59,7 @@ impl Element {
         }
         results
     }
-    
+
     /// Get element text content recursively
     pub fn text_content(&self) -> String {
         let mut result = String::new();
@@ -71,23 +71,23 @@ impl Element {
         }
         result
     }
-    
+
     /// Serialize back to HTML string (for debugging)
     pub fn to_html(&self) -> String {
         let mut html = String::new();
-        
+
         if self.tag == "root" {
             for child in &self.children {
                 html.push_str(&child.to_html());
             }
             return html;
         }
-        
+
         let mut attrs_str = String::new();
         for (k, v) in &self.attrs {
             attrs_str.push_str(&format!(" {}=\"{}\"", k, v));
         }
-        
+
         if self.is_void {
             html.push_str(&format!("<{}{} />", self.tag, attrs_str));
         } else {
@@ -100,7 +100,7 @@ impl Element {
             }
             html.push_str(&format!("</{}>", self.tag));
         }
-        
+
         html
     }
 }
@@ -112,101 +112,163 @@ fn escape_html(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Case-insensitive comparison of `chars[pos..]` against an ASCII string.
+/// `pos` is a char index into `chars`, so this avoids byte-slicing the
+/// original `&str` at a position that is not a UTF-8 boundary.
+fn chars_match_ci_at(chars: &[char], pos: usize, s: &str) -> bool {
+    let s: Vec<char> = s.chars().collect();
+    if pos + s.len() > chars.len() {
+        return false;
+    }
+    chars[pos..pos + s.len()]
+        .iter()
+        .zip(s.iter())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 /// Decode HTML character references
 fn decode_html_entities(text: &str) -> String {
     let mut result = String::new();
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut i = 0;
-    
+
     while i < len {
         if chars[i] == '&' {
             let start = i;
-            while i < len && chars[i] != ';' {
-                i += 1;
+            // Scan for the closing ';' within a bounded window. Unbounded
+            // scanning consumed the rest of the text when no ';' existed
+            // (e.g. "R&D" dropped everything after the '&').
+            let mut j = i + 1;
+            while j < len && chars[j] != ';' && j - start <= 32 {
+                j += 1;
             }
-            if i < len && chars[i] == ';' {
-                let entity: String = chars[start + 1..i].iter().collect();
-                    let decoded: String = match entity.as_str() {
-                        "amp" => "&".to_string(),
-                        "lt" => "<".to_string(),
-                        "gt" => ">".to_string(),
-                        "quot" => "\"".to_string(),
-                        "apos" => "'".to_string(),
-                        "nbsp" => " ".to_string(),
-                        "copy" => "©".to_string(),
-                        "reg" => "®".to_string(),
-                        "trade" => "™".to_string(),
-                        _ => {
-                            // Try numeric character reference
-                            if let Some(hex) = entity.strip_prefix("#x") {
-                                if let Ok(codepoint) = u32::from_str_radix(hex, 16) {
-                                    if let Some(c) = char::from_u32(codepoint) {
-                                        c.to_string()
-                                    } else {
-                                        format!("&{};", entity)
-                                    }
-                                } else {
-                                    format!("&{};", entity)
-                                }
-                            } else if let Some(dec) = entity.strip_prefix('#') {
-                                if let Ok(codepoint) = dec.parse::<u32>() {
-                                    if let Some(c) = char::from_u32(codepoint) {
-                                        c.to_string()
-                                    } else {
-                                        format!("&{};", entity)
-                                    }
+            if j < len && chars[j] == ';' && j > start + 1 {
+                let entity: String = chars[start + 1..j].iter().collect();
+                let decoded: String = match entity.as_str() {
+                    "amp" => "&".to_string(),
+                    "lt" => "<".to_string(),
+                    "gt" => ">".to_string(),
+                    "quot" => "\"".to_string(),
+                    "apos" => "'".to_string(),
+                    "nbsp" => " ".to_string(),
+                    "copy" => "©".to_string(),
+                    "reg" => "®".to_string(),
+                    "trade" => "™".to_string(),
+                    _ => {
+                        // Try numeric character reference
+                        if let Some(hex) = entity.strip_prefix("#x") {
+                            if let Ok(codepoint) = u32::from_str_radix(hex, 16) {
+                                if let Some(c) = char::from_u32(codepoint) {
+                                    c.to_string()
                                 } else {
                                     format!("&{};", entity)
                                 }
                             } else {
                                 format!("&{};", entity)
                             }
+                        } else if let Some(dec) = entity.strip_prefix('#') {
+                            if let Ok(codepoint) = dec.parse::<u32>() {
+                                if let Some(c) = char::from_u32(codepoint) {
+                                    c.to_string()
+                                } else {
+                                    format!("&{};", entity)
+                                }
+                            } else {
+                                format!("&{};", entity)
+                            }
+                        } else {
+                            format!("&{};", entity)
                         }
-                    };
-                    result.push_str(&decoded);
-                i += 1; // skip ';'
+                    }
+                };
+                result.push_str(&decoded);
+                i = j + 1; // skip ';'
             } else {
-                result.push(chars[start]);
+                // Unterminated / over-long entity: keep the '&' and move on,
+                // so the following text is preserved.
+                result.push('&');
+                i += 1;
             }
         } else {
             result.push(chars[i]);
             i += 1;
         }
     }
-    
+
     result
 }
 
 /// Tags that are always self-closing/void in HTML5
 fn is_void_tag(tag: &str) -> bool {
-    matches!(tag,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
-        | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
     )
 }
 
-/// Tags that contain raw text (no inner HTML parsing)
+/// Tags that contain raw text (no inner HTML parsing). Only script and style
+/// work this way in HTML5; textarea/pre content is ordinary text (and gets
+/// entity-decoded), so they must not be treated as raw.
 fn is_raw_text_tag(tag: &str) -> bool {
-    matches!(tag, "script" | "style" | "textarea" | "pre")
+    matches!(tag, "script" | "style")
 }
 
 /// Tags that don't need closing (optional closing tags in HTML5)
 fn is_optional_closing_tag(tag: &str) -> bool {
-    matches!(tag, "p" | "li" | "dt" | "dd" | "option" | "thead" | "tbody" | "tfoot" | "tr" | "th" | "td")
+    matches!(
+        tag,
+        "p" | "li" | "dt" | "dd" | "option" | "thead" | "tbody" | "tfoot" | "tr" | "th" | "td"
+    )
 }
 
 /// Autoclose mapping: when we encounter an opening tag, some parent tags should auto-close
 fn should_auto_close_parent(parent_tag: &str, child_tag: &str) -> bool {
     matches!(
         (parent_tag, child_tag),
-        ("p", "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "div" | "ul" | "ol" | "dl" | "table" | "form" | "section" | "article" | "header" | "footer" | "nav" | "main" | "aside")
-            | ("li", "li")
+        (
+            "p",
+            "p" | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "div"
+                | "ul"
+                | "ol"
+                | "dl"
+                | "table"
+                | "form"
+                | "section"
+                | "article"
+                | "header"
+                | "footer"
+                | "nav"
+                | "main"
+                | "aside"
+        ) | ("li", "li")
             | ("dt" | "dd", "dt" | "dd")
             | ("option", "option")
             | ("tr", "tr" | "th" | "td")
             | ("th" | "td", "th" | "td")
-            | ("thead" | "tbody" | "tfoot", "thead" | "tbody" | "tfoot" | "tr")
+            | (
+                "thead" | "tbody" | "tfoot",
+                "thead" | "tbody" | "tfoot" | "tr"
+            )
     )
 }
 
@@ -267,39 +329,48 @@ pub fn parse_html(html: &str) -> Element {
                 }
             } else if pos + 1 < len && (chars[pos + 1] == '!' || chars[pos + 1] == '?') {
                 // Comment or doctype or processing instruction
-                if pos + 3 < len && &html[pos..pos+4] == "<!--" {
+                if chars_match_ci_at(&chars, pos, "<!--") {
                     // HTML comment: skip until -->
                     pos += 4;
-                    while pos + 2 < len && !(chars[pos] == '-' && chars[pos+1] == '-' && chars[pos+2] == '>') {
+                    while pos + 2 < len
+                        && !(chars[pos] == '-' && chars[pos + 1] == '-' && chars[pos + 2] == '>')
+                    {
                         pos += 1;
                     }
                     pos += 3; // skip -->
-                } else if pos + 8 < len && html[pos..pos+9].to_uppercase() == "<!DOCTYPE" {
+                } else if chars_match_ci_at(&chars, pos, "<!doctype") {
                     // DOCTYPE: skip until >
                     while pos < len && chars[pos] != '>' {
                         pos += 1;
                     }
-                    if pos < len { pos += 1; }
+                    if pos < len {
+                        pos += 1;
+                    }
                 } else {
                     // Other markup (<?xml?>, <![CDATA[]]>, etc.)
                     while pos < len && chars[pos] != '>' {
                         pos += 1;
                     }
-                    if pos < len { pos += 1; }
+                    if pos < len {
+                        pos += 1;
+                    }
                 }
             } else {
                 // Opening tag or self-closing
                 pos += 1; // skip '<'
-                
+
                 // Skip whitespace after <
                 while pos < len && chars[pos].is_whitespace() {
                     pos += 1;
                 }
-                
+
                 // Read tag name
                 let start = pos;
-                while pos < len && chars[pos] != '>' && chars[pos] != '/' 
-                    && !chars[pos].is_whitespace() && chars[pos] != '<' 
+                while pos < len
+                    && chars[pos] != '>'
+                    && chars[pos] != '/'
+                    && !chars[pos].is_whitespace()
+                    && chars[pos] != '<'
                 {
                     pos += 1;
                 }
@@ -311,7 +382,9 @@ pub fn parse_html(html: &str) -> Element {
                     while pos < len && chars[pos] != '>' {
                         pos += 1;
                     }
-                    if pos < len { pos += 1; }
+                    if pos < len {
+                        pos += 1;
+                    }
                     continue;
                 }
 
@@ -332,8 +405,11 @@ pub fn parse_html(html: &str) -> Element {
 
                     // Attribute name
                     let k_start = pos;
-                    while pos < len && chars[pos] != '=' && chars[pos] != '>' 
-                        && chars[pos] != '/' && !chars[pos].is_whitespace() 
+                    while pos < len
+                        && chars[pos] != '='
+                        && chars[pos] != '>'
+                        && chars[pos] != '/'
+                        && !chars[pos].is_whitespace()
                     {
                         pos += 1;
                     }
@@ -348,11 +424,11 @@ pub fn parse_html(html: &str) -> Element {
                     let mut val = String::new();
                     if pos < len && chars[pos] == '=' {
                         pos += 1; // skip '='
-                        // Skip whitespace after =
+                                  // Skip whitespace after =
                         while pos < len && chars[pos].is_whitespace() {
                             pos += 1;
                         }
-                        
+
                         if pos < len && (chars[pos] == '"' || chars[pos] == '\'') {
                             // Quoted attribute value
                             let quote = chars[pos];
@@ -368,7 +444,11 @@ pub fn parse_html(html: &str) -> Element {
                         } else if pos < len && chars[pos] != '>' && chars[pos] != '/' {
                             // Unquoted attribute value
                             let v_start = pos;
-                            while pos < len && !chars[pos].is_whitespace() && chars[pos] != '>' && chars[pos] != '/' {
+                            while pos < len
+                                && !chars[pos].is_whitespace()
+                                && chars[pos] != '>'
+                                && chars[pos] != '/'
+                            {
                                 pos += 1;
                             }
                             val = chars[v_start..pos].iter().collect();
@@ -398,7 +478,10 @@ pub fn parse_html(html: &str) -> Element {
                 elem.is_void = is_void || is_self_closing;
 
                 // Handle auto-closing of parent tags
-                if !elem.is_void && stack.len() > 1 && should_auto_close_parent(&stack.last().unwrap().tag, &tag_name) {
+                if !elem.is_void
+                    && stack.len() > 1
+                    && should_auto_close_parent(&stack.last().unwrap().tag, &tag_name)
+                {
                     let completed = stack.pop().unwrap();
                     if let Some(parent) = stack.last_mut() {
                         parent.add_child(completed);
@@ -411,38 +494,42 @@ pub fn parse_html(html: &str) -> Element {
                         parent.add_child(elem);
                     }
                 } else if is_raw {
-                    // Raw text tags: read all content until closing tag
-                    // We need to find the closing tag even with nested content issues
-                    let close_tag = format!("</{}", tag_name);
-                    let close_tag_full = format!("</{}>", tag_name);
-                    
-                    // Find the actual closing tag position
-                    let html_slice = &html[pos.min(len)..];
-                    if let Some(end_pos) = html_slice.find(&close_tag_full) {
-                        // Extract raw text content
-                        let raw_text = &html_slice[..end_pos];
-                        elem.text = raw_text.to_string();
-                        
-                        // Advance past the content and closing tag
-                        pos += end_pos + close_tag_full.len();
-                    } else if let Some(end_pos) = html_slice.find(&close_tag) {
-                        // Partial match - try to find '>'
-                        let rest = &html_slice[end_pos..];
-                        if let Some(gt_pos) = rest.find('>') {
-                            let raw_text = &html_slice[..end_pos];
-                            elem.text = raw_text.to_string();
-                            pos += end_pos + gt_pos + 1;
-                        } else {
-                            // No closing tag found, take rest as content
-                            elem.text = html_slice.to_string();
+                    // Raw text tags (script/style): read all content until the
+                    // closing tag. Work on the char slice so multi-byte UTF-8
+                    // content can't hit a byte-slice panic, and match the
+                    // closing tag case-insensitively (`</SCRIPT>` is valid).
+                    let close_tag: Vec<char> = format!("</{}>", tag_name).chars().collect();
+                    let close_len = close_tag.len();
+
+                    // First case-insensitive occurrence of "</tag>"
+                    let mut end_pos = None;
+                    let mut k = pos;
+                    while k + close_len <= len {
+                        if chars[k..k + close_len]
+                            .iter()
+                            .zip(close_tag.iter())
+                            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                        {
+                            end_pos = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+
+                    match end_pos {
+                        Some(end) => {
+                            let raw_text: String = chars[pos..end].iter().collect();
+                            elem.text = raw_text;
+                            pos = end + close_len;
+                        }
+                        None => {
+                            // No closing tag: consume the rest as raw text
+                            let raw_text: String = chars[pos..len].iter().collect();
+                            elem.text = raw_text;
                             pos = len;
                         }
-                    } else {
-                        // No closing tag, consume rest as raw text
-                        elem.text = html_slice.to_string();
-                        pos = len;
                     }
-                    
+
                     if let Some(parent) = stack.last_mut() {
                         parent.add_child(elem);
                     }
@@ -482,7 +569,7 @@ pub fn parse_html(html: &str) -> Element {
     }
 
     let mut root = stack.pop().unwrap_or_else(|| Element::new("html"));
-    
+
     // Clean up: if root only wraps a single child, return that child directly
     if root.children.len() == 1 && root.text.is_empty() {
         root.children.remove(0)
@@ -536,7 +623,10 @@ mod tests {
         let dom = parse_html(html);
         let links = dom.find_all_tags("a");
         assert_eq!(links.len(), 1);
-        assert_eq!(links[0].get_attr("href"), Some(&"https://example.com".to_string()));
+        assert_eq!(
+            links[0].get_attr("href"),
+            Some(&"https://example.com".to_string())
+        );
         assert_eq!(links[0].get_attr("class"), Some(&"link".to_string()));
     }
 
@@ -606,7 +696,7 @@ mod tests {
         assert_eq!(input.get_attr("disabled"), Some(&"".to_string()));
         assert_eq!(input.get_attr("required"), Some(&"".to_string()));
     }
-    
+
     #[test]
     fn test_invalid_markup_recovery() {
         let html = "<p>Hello << world</p>";
@@ -620,5 +710,50 @@ mod tests {
         let dom = parse_html(html);
         assert!(dom.find_tag("p").is_some());
         assert_eq!(dom.find_tag("b").unwrap().text, "World");
+    }
+
+    #[test]
+    fn test_unterminated_entity_keeps_text() {
+        // "R&D" has no ';' — previously everything after the '&' was dropped
+        assert_eq!(decode_html_entities("Fish & Chips"), "Fish & Chips");
+        assert_eq!(decode_html_entities("R&D"), "R&D");
+        assert_eq!(decode_html_entities("A &amp; B & raw"), "A & B & raw");
+    }
+
+    #[test]
+    fn test_multibyte_utf8_no_panic() {
+        // pos is a char index; byte-slicing the &str at pos used to panic
+        // after multi-byte characters
+        let dom = parse_html("é<!-- comment --><p>ok</p>");
+        assert_eq!(dom.find_tag("p").unwrap().text, "ok");
+
+        let dom = parse_html("héllo<!DOCTYPE html><p>x</p>");
+        assert_eq!(dom.find_tag("p").unwrap().text, "x");
+    }
+
+    #[test]
+    fn test_uppercase_close_script() {
+        let html = "<SCRIPT>var x = 1 < 2</SCRIPT><p>After</p>";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("script").is_some());
+        assert!(dom.find_tag("script").unwrap().text.contains("var x"));
+        assert_eq!(dom.find_tag("p").unwrap().text, "After");
+    }
+
+    #[test]
+    fn test_style_tag_raw_text() {
+        let html = "<style>p { color: red; }</style><p>x</p>";
+        let dom = parse_html(html);
+        assert!(dom.find_tag("style").unwrap().text.contains("color: red"));
+        assert_eq!(dom.find_tag("p").unwrap().text, "x");
+    }
+
+    #[test]
+    fn test_textarea_is_not_raw() {
+        // textarea content is ordinary text: entities are decoded and it is
+        // not treated as raw (the old code kept "&amp;" verbatim)
+        let html = "<textarea>a &amp; b</textarea>";
+        let dom = parse_html(html);
+        assert_eq!(dom.find_tag("textarea").unwrap().text, "a & b");
     }
 }

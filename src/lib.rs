@@ -1,43 +1,53 @@
-// src/lib.rs - Public re-exports for ghitabrowser crate (v0.5.0)
+// src/lib.rs - Public re-exports for ghitabrowser crate (v0.6.0)
 #![allow(dead_code)]
 
 //! # GhitaBrowser
-//! A Chrome-style Rust browser v0.5.0 - built from scratch in safe Rust.
+//! A Chrome-style Rust browser v0.6.0 - built from scratch in safe Rust.
 
-pub mod parser;
-pub mod renderer;
-pub mod network;
-pub mod ui;
-pub mod storage;
+/// Single source of truth for the app version.
+/// Used by the UI (status bar, about), the user-agent strings and storage state.
+pub const VERSION: &str = "0.6.0";
+
 pub mod css_parser;
-pub mod layout;
-pub mod text_renderer;
 pub mod image_loader;
-pub mod tab;
 pub mod javascript;
-pub mod performance;
+pub mod layout;
+pub mod network;
 pub mod paint;
+pub mod parser;
+pub mod performance;
+pub mod renderer;
+pub mod search;
+pub mod storage;
+pub mod tab;
+pub mod text_renderer;
+pub mod ui;
 
-/// Re-export parser module types for convenience
-pub use parser::{Element, parse_html};
-/// Re-export renderer functions
-pub use renderer::render_to_string;
-/// Re-export network functions and cache
-pub use network::{fetch_url, fetch_with_cache, FetchResult, ResourceCache, CacheStats};
-/// Re-export tab system
-pub use tab::{Tab, TabManager};
-/// Re-export storage system
-pub use storage::{StorageManager, Cookie, LocalStorage, CookieStore, Bookmark, HistoryRecord, DownloadRecord, BrowserSettings};
 /// Re-export CSS parser
-pub use css_parser::{parse_css, CssRule, ComputedStyle};
-/// Re-export layout system
-pub use layout::{LayoutNode, create_layout_tree, perform_layout};
+pub use css_parser::{parse_css, ComputedStyle, CssRule};
 /// Re-export JavaScript engine
 pub use javascript::JsvEngine;
+/// Re-export layout system
+pub use layout::{create_layout_tree, perform_layout, LayoutNode};
+/// Re-export network functions and cache
+pub use network::{fetch_url, fetch_with_cache, CacheStats, FetchResult, ResourceCache};
+/// Re-export the pixel painter
+pub use paint::{build_display_list, DisplayItem, DisplayList, LinkRegion, Rgba};
+/// Re-export parser module types for convenience
+pub use parser::{parse_html, Element};
 /// Re-export performance profiler
 pub use performance::Profiler;
-/// Re-export the pixel painter
-pub use paint::{DisplayList, DisplayItem, LinkRegion, Rgba, build_display_list};
+/// Re-export renderer functions
+pub use renderer::render_to_string;
+/// Re-export search results
+pub use search::{search_web, SearchResult};
+/// Re-export storage system
+pub use storage::{
+    Bookmark, BrowserSettings, Cookie, CookieStore, DownloadRecord, HistoryRecord, LocalStorage,
+    StorageManager,
+};
+/// Re-export tab system
+pub use tab::{Tab, TabManager};
 
 /// Performance statistics for monitoring
 #[derive(Debug, Clone)]
@@ -71,6 +81,12 @@ pub struct Browser {
     pub last_render_stats: Option<RenderStats>,
 }
 
+impl Default for Browser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Browser {
     /// Create a new browser instance with default viewport
     pub fn new() -> Self {
@@ -90,31 +106,29 @@ impl Browser {
     /// Load a URL: fetch, parse, style, layout, render
     pub fn load_url(&mut self, url: &str) -> Result<String, String> {
         let start = std::time::Instant::now();
-        
+
         // 1. Fetch HTML (with cache + cookie jar integration)
         let fetch_start = std::time::Instant::now();
-        let fetch_result = network::fetch_with_cache(
-            url,
-            &mut self.cache,
-            Some(self.storage.cookies_mut()),
-        ).map_err(|e| format!("Network error: {}", e))?;
+        let fetch_result =
+            network::fetch_with_cache(url, &mut self.cache, Some(self.storage.cookies_mut()))
+                .map_err(|e| format!("Network error: {}", e))?;
         let fetch_time = fetch_start.elapsed().as_millis() as u64;
         self.profiler.record("fetch", fetch_time);
-        
+
         let html_content = &fetch_result.body;
-        
+
         // 2. Parse HTML
         let parse_start = std::time::Instant::now();
         let dom = parser::parse_html(html_content);
         let parse_time = parse_start.elapsed().as_millis() as u64;
         self.profiler.record("parse", parse_time);
-        
+
         // 3. Extract title from DOM
         let title = extract_title_from_dom(&dom);
-        
+
         // 4. Apply styles - merge global CSS with page <style> tags
         let style_start = std::time::Instant::now();
-        
+
         // Extract and parse <style> tags from the page
         let mut page_css_rules: Vec<css_parser::CssRule> = Vec::new();
         let style_elements = dom.find_all_tags("style");
@@ -125,29 +139,31 @@ impl Browser {
                 page_css_rules.append(&mut rules);
             }
         }
-        
+
         // Merge: global rules first, then page rules (page overrides global)
-        let all_rules: Vec<css_parser::CssRule> = self.css_rules.iter()
+        let all_rules: Vec<css_parser::CssRule> = self
+            .css_rules
+            .iter()
             .cloned()
             .chain(page_css_rules)
             .collect();
-        
+
         let style_time = style_start.elapsed().as_millis() as u64;
         self.profiler.record("style", style_time);
-        
+
         // 5. Create layout with merged CSS rules
         let layout_start = std::time::Instant::now();
         let layout_tree = layout::create_layout_tree(&dom, &all_rules, self.viewport_width);
         let layout_time = layout_start.elapsed().as_millis() as u64;
         self.profiler.record("layout", layout_time);
-        
+
         // Cache layout tree for re-rendering
         if let Some(ref _root) = layout_tree {
             if let Some(tab) = self.tabs.active_tab_mut() {
                 tab.layout = layout_tree.clone();
             }
         }
-        
+
         // 6. Render to text
         let render_start = std::time::Instant::now();
         let rendered = if let Some(root) = layout_tree {
@@ -158,13 +174,13 @@ impl Browser {
         };
         let render_time = render_start.elapsed().as_millis() as u64;
         self.profiler.record("render", render_time);
-        
+
         // Count nodes
         let dom_nodes = count_elements(&dom);
         let layout_nodes = 0; // Simplified
-        
+
         let total_time = start.elapsed().as_millis() as u64;
-        
+
         self.last_render_stats = Some(RenderStats {
             parse_time_ms: parse_time,
             style_time_ms: style_time,
@@ -174,17 +190,16 @@ impl Browser {
             dom_nodes,
             layout_nodes,
         });
-        
-        // Update tab - save history entry then update
+
+        // Update tab - record the freshly loaded page in history (deduped)
         if let Some(tab) = self.tabs.active_tab_mut() {
-            // Save current state to history before navigating
-            let current_entry = crate::tab::HistoryEntry {
-                url: tab.url.clone(),
-                title: tab.title.clone(),
-                dom: tab.dom.clone(),
+            let new_entry = crate::tab::HistoryEntry {
+                url: url.to_string(),
+                title: title.clone(),
+                dom: dom.clone(),
                 layout: tab.layout.clone(),
             };
-            tab.push_history(current_entry);
+            tab.push_history(new_entry);
 
             // Update with new content
             tab.dom = dom;
@@ -203,22 +218,22 @@ impl Browser {
         let title = extract_title_from_dom(&dom);
 
         if let Some(tab) = self.tabs.active_tab_mut() {
-            // Save current state to history
-            let current_entry = crate::tab::HistoryEntry {
-                url: tab.url.clone(),
-                title: tab.title.clone(),
-                dom: tab.dom.clone(),
-                layout: tab.layout.clone(),
+            // Record the freshly loaded page in history (deduped)
+            let new_entry = crate::tab::HistoryEntry {
+                url: url.to_string(),
+                title: title.clone(),
+                dom: dom.clone(),
+                layout: None,
             };
-            tab.push_history(current_entry);
-            
+            tab.push_history(new_entry);
+
             tab.dom = dom;
             tab.title = title;
             tab.url = url.to_string();
         } else {
             self.add_tab(url, dom, &title);
         }
-        
+
         Ok(self.render_current())
     }
 
@@ -270,12 +285,12 @@ impl Browser {
     pub fn viewport_width(&self) -> u32 {
         self.viewport_width
     }
-    
+
     /// Get viewport height
     pub fn viewport_height(&self) -> u32 {
         self.viewport_height
     }
-    
+
     /// Set global CSS rules
     pub fn set_css(&mut self, css: &str) {
         self.css_rules = css_parser::parse_css(css);
@@ -286,15 +301,19 @@ impl Browser {
         if let Some(tab) = self.active_tab() {
             // Use cached layout if available, otherwise rebuild
             if let Some(ref layout_root) = tab.layout {
-                let tr = text_renderer::TextRenderer::new(self.viewport_width, self.viewport_height);
+                let tr =
+                    text_renderer::TextRenderer::new(self.viewport_width, self.viewport_height);
                 tr.render_to_text(layout_root)
             } else {
                 let css_rules = &self.css_rules;
                 match layout::create_layout_tree(&tab.dom, css_rules, self.viewport_width) {
                     Some(root) => {
-                        let tr = text_renderer::TextRenderer::new(self.viewport_width, self.viewport_height);
+                        let tr = text_renderer::TextRenderer::new(
+                            self.viewport_width,
+                            self.viewport_height,
+                        );
                         tr.render_to_text(&root)
-                    },
+                    }
                     None => String::from("[Error rendering content]"),
                 }
             }
@@ -302,11 +321,11 @@ impl Browser {
             String::from("[No active tab]")
         }
     }
-    
+
     /// Get status string for display
     pub fn status_string(&self) -> String {
         let cache_stats = self.cache.stats();
-        
+
         format!(
             "Viewport: {}x{} | {} | Cookies: {} | Tabs: {}",
             self.viewport_width,
@@ -350,7 +369,7 @@ mod tests {
         let mut browser = Browser::new();
         let html = "<html><body><h1>Hello</h1></body></html>";
         let _ = browser.load_html("https://example.com", html);
-        
+
         assert_eq!(browser.tab_count(), 1);
         assert!(browser.active_tab().is_some());
         assert_eq!(browser.active_tab().unwrap().url, "https://example.com");
@@ -359,36 +378,47 @@ mod tests {
     #[test]
     fn test_browser_render() {
         let mut browser = Browser::new();
-        let _ = browser.load_html("https://example.com", "<html><body><h1>Welcome</h1></body></html>");
+        let _ = browser.load_html(
+            "https://example.com",
+            "<html><body><h1>Welcome</h1></body></html>",
+        );
         let rendered = browser.render_current();
         assert!(!rendered.is_empty());
         assert!(rendered.contains("Welcome"));
     }
-    
+
     #[test]
     fn test_browser_with_css() {
         let mut browser = Browser::new();
         browser.set_css("h1 { color: red; font-size: 24px; }");
-        let _ = browser.load_html("https://example.com", "<html><body><h1>Styled</h1></body></html>");
+        let _ = browser.load_html(
+            "https://example.com",
+            "<html><body><h1>Styled</h1></body></html>",
+        );
         let rendered = browser.render_current();
         assert!(rendered.contains("Styled"));
     }
-    
+
     #[test]
     fn test_browser_tab_switching() {
         let mut browser = Browser::new();
         let _ = browser.load_html("https://a.com", "<html><body><h1>Page A</h1></body></html>");
-        browser.add_tab("https://b.com", parser::parse_html("<html><body><h1>Page B</h1></body></html>"), "Page B");
-        
+        browser.add_tab(
+            "https://b.com",
+            parser::parse_html("<html><body><h1>Page B</h1></body></html>"),
+            "Page B",
+        );
+
         assert_eq!(browser.tab_count(), 2);
-        
+
         // Active tab should be the last added one
         assert_eq!(browser.active_tab().unwrap().url, "https://b.com");
     }
-    
+
     #[test]
     fn test_extract_title() {
-        let dom = parser::parse_html("<html><head><title>My Page</title></head><body></body></html>");
+        let dom =
+            parser::parse_html("<html><head><title>My Page</title></head><body></body></html>");
         assert_eq!(extract_title_from_dom(&dom), "My Page");
     }
 }
