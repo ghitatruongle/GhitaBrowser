@@ -1,5 +1,5 @@
 // src/performance.rs - Performance Optimization & Profiling (Phase 21-22)
-#![allow(dead_code)]
+
 
 use super::layout::LayoutNode;
 use std::collections::HashMap;

@@ -1,5 +1,5 @@
-// src/text_renderer.rs - ASCII text rendering of layout tree (v0.6.0)
-#![allow(dead_code)]
+// src/text_renderer.rs - ASCII text rendering of layout tree (v0.6.1)
+
 
 use super::layout::{DisplayType, LayoutNode};
 

@@ -1,8 +1,8 @@
-// src/paint.rs - Pixel painting: layout tree -> display list (v0.6.0)
+// src/paint.rs - Pixel painting: layout tree -> display list (v0.6.1)
 // Turns the layout tree into a flat list of paint commands (rects, borders,
 // text runs, link regions) that the GUI draws onto a real graphics canvas.
 // This module is UI-framework agnostic: colors are plain RGBA floats.
-#![allow(dead_code)]
+
 
 use crate::layout::{effective_font_size, wrap_text, DisplayType, LayoutNode};
 
@@ -58,6 +58,16 @@ pub enum DisplayItem {
         underline: bool,
         monospace: bool,
     },
+    /// A loaded image (rendered as placeholder text if not cached yet)
+    Image {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        url: String,
+        alt: String,
+        cached: bool,
+    },
 }
 
 /// A clickable link region (hit-tested on mouse click)
@@ -110,6 +120,15 @@ struct PaintContext {
 /// Pages paint on a white background with black text — exactly like Chrome,
 /// where the OS/browser theme never darkens actual web content.
 pub fn build_display_list(root: &LayoutNode) -> DisplayList {
+    build_display_list_with_cache(root, None)
+}
+
+/// Build the display list with an optional image cache so <img> tags can
+/// render decoded images when available.
+pub fn build_display_list_with_cache(
+    root: &LayoutNode,
+    image_cache: Option<&crate::image_loader::ImageCache>,
+) -> DisplayList {
     let mut list = DisplayList::default();
 
     let doc_width = root.rect.outer_width().max(1.0) as f32;
@@ -135,7 +154,7 @@ pub fn build_display_list(root: &LayoutNode) -> DisplayList {
         link: false,
         monospace: false,
     };
-    paint_node(root, ctx, &mut list);
+    paint_node(root, ctx, &mut list, image_cache);
 
     list
 }
@@ -170,7 +189,12 @@ fn page_background(root: &LayoutNode) -> Option<Rgba> {
     None
 }
 
-fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
+fn paint_node(
+    node: &LayoutNode,
+    parent: PaintContext,
+    list: &mut DisplayList,
+    image_cache: Option<&crate::image_loader::ImageCache>,
+) {
     if node.rect.display == DisplayType::None {
         return;
     }
@@ -275,7 +299,7 @@ fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
 
     // Text content of this element (direct text only; children paint themselves)
     let text = node.element.text.trim();
-    if !text.is_empty() && tag != "title" {
+    if !text.is_empty() && tag != "title" && tag != "img" {
         let content_x = (node.rect.x + node.rect.padding_left + node.rect.border_left) as f32;
         let content_y = (node.rect.y + node.rect.padding_top + node.rect.border_top) as f32;
         let inner_width = node.rect.content_width();
@@ -284,14 +308,6 @@ fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
         // List bullets, Chrome-style
         let display_text = if node.rect.display == DisplayType::ListItem {
             format!("•  {}", text)
-        } else if tag == "img" {
-            format!(
-                "🖼 [{}]",
-                node.element
-                    .get_attr("alt")
-                    .map(|s| s.as_str())
-                    .unwrap_or("image")
-            )
         } else {
             text.to_string()
         };
@@ -311,6 +327,33 @@ fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
                 monospace,
             });
         }
+    }
+
+    // <img> tag: emit a placeholder or decoded image item
+    if tag == "img" {
+        let src = node.element.get_attr("src").map(|s| s.to_string()).unwrap_or_default();
+        let alt = node
+            .element
+            .get_attr("alt")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "image".to_string());
+        let cached = if src.is_empty() {
+            false
+        } else {
+            image_cache
+                .and_then(|c| c.get(&src))
+                .map(|i| i.loaded)
+                .unwrap_or(false)
+        };
+        list.items.push(DisplayItem::Image {
+            x,
+            y,
+            w,
+            h,
+            url: src,
+            alt,
+            cached,
+        });
     }
 
     // Register the clickable region for links
@@ -337,7 +380,7 @@ fn paint_node(node: &LayoutNode, parent: PaintContext, list: &mut DisplayList) {
         monospace,
     };
     for child in &node.children {
-        paint_node(child, ctx, list);
+        paint_node(child, ctx, list, image_cache);
     }
 }
 

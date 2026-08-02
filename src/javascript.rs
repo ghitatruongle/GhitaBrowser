@@ -1,5 +1,5 @@
-// src/javascript.rs - JavaScript Engine with variables, functions, control flow (v0.6.0)
-#![allow(dead_code)]
+// src/javascript.rs - JavaScript Engine with variables, functions, control flow (v0.6.1)
+
 
 use std::collections::HashMap;
 

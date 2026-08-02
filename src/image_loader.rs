@@ -1,5 +1,5 @@
-// src/image_loader.rs - Image loading, caching, and decoding (v0.6.0)
-#![allow(dead_code)]
+// src/image_loader.rs - Image loading, caching, and decoding (v0.6.1)
+
 
 use log::warn;
 use std::collections::HashMap;
@@ -143,6 +143,20 @@ impl ImageCache {
                 let data = Arc::new(data);
                 self.current_size += size;
                 self.decoded.insert(url.to_string(), data.clone());
+                // Mark the Image metadata as loaded so paint can detect it
+                if let Some(img) = self.inner.get_mut(url) {
+                    img.loaded = true;
+                    img.width = data.width;
+                    img.height = data.height;
+                } else {
+                    self.inner.insert(
+                        url.to_string(),
+                        Image::new(url, data.width, data.height),
+                    );
+                    if let Some(img) = self.inner.get_mut(url) {
+                        img.loaded = true;
+                    }
+                }
                 Some(data)
             }
             Err(e) => {

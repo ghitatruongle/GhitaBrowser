@@ -1,6 +1,6 @@
 [package]
 name = "ghitabrowser"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 authors = ["You"]
 description = "A Chrome-style lightweight browser written 100% in safe Rust"

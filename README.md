@@ -6,23 +6,24 @@ A Chrome-style lightweight browser written 100% in safe Rust, built from scratch
 
 ## Overview
 
-GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.6.0). The UI is modeled after Google Chrome — tab strip, omnibox, three-dot menu, bookmarks bar, history, downloads, settings — and pages are now painted with **real pixels on a graphics canvas**, while the whole engine (networking, HTML/CSS parsing, layout, painting, JS, storage) remains 100% homemade Rust.
+GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.6.1). The UI is modeled after Google Chrome — tab strip, omnibox, three-dot menu, bookmarks bar, history, downloads, settings — and pages are now painted with **real pixels on a graphics canvas**, while the whole engine (networking, HTML/CSS parsing, layout, painting, JS, storage) remains 100% homemade Rust.
 
-### v0.6.0 New Features — the "Search & Ghita Lửa" release
+### v0.6.1 New Features — the "Lõi Vặt & Hiệu Năng" release
 
-**Real web search (new!)**
-- ✅ **In-app search results page** — type a query in the omnibox or the New Tab search box and get a clean, native results page (`ghita://search`) powered by DuckDuckGo's lightweight HTML endpoint — no JavaScript required
-- ✅ **Clickable results** — each result shows title, URL and snippet and opens in a new tab; a footer pill links out to your configured engine for more results
-- ✅ **Offline-friendly** — if the search backend is unreachable you get a friendly error page with a direct link to the engine instead of a blank screen
+**Bug fixes**
+- ✅ **No more silent cookie domain fallback** — `network.rs` now uses the originating domain explicitly when a redirect URL can't be parsed, instead of silently falling back
+- ✅ **Cache TTL parsing is stricter** — invalid `max-age` values now log a warning and fall back to 300s instead of silently accepting garbage
+- ✅ **Real layout node counts** — `layout_nodes` in DevTools/render stats now shows the actual number of layout tree nodes instead of hardcoded `0`
 
-**New branding — "Ghita Lửa" (fire)**
-- ✅ **New logo & app icon** — rounded fire-gradient badge (`#FF8C42 → #A63A2B`) with a bold white "G" and an amber flame inside (see `logo.png` / `icon.ico`)
-- ✅ **Fire color wordmark** — the GhitaBrowser wordmark now uses a custom orange → amber → crimson → ember gradient instead of Google's palette
-- ✅ **No console window on launch** — the release build is a proper Windows GUI application; the terminal never pops up
+**Performance**
+- ✅ **Dead code directives removed** — all 14 `#![allow(dead_code)]` directives stripped; compiler now flags genuinely unused code
+- ✅ **More accurate link underline width** — canvas underline now uses CJK-aware text width estimation instead of a rough character-count heuristic
 
-**Polish & performance**
-- ✅ **Single `VERSION` constant** — the UI, status bar, user-agent and storage state all read from one place, so versions can't drift
-- ✅ **Faster release builds & startup** — LTO, single codegen unit, opt-level 3
+**Image support**
+- ✅ **`<img>` tags in the display list** — `Image` variant added to `DisplayItem`; canvas draws a placeholder box with alt text; decoded images show a green background when loaded
+
+**Under the hood**
+- ✅ **Image cache wired into Browser** — `ImageCache` is now a field on `Browser`, threaded through `build_display_list_with_cache`
 
 ### v0.5.0 New Features — the "Real Pixels" release
 
@@ -75,19 +76,19 @@ GhitaBrowser is a complete web browser implementation written entirely in safe R
 
 | Module | Description | Status |
 |--------|-------------|--------|
-| **Network** | HTTP/HTTPS via ureq, ResourceCache with TTL, binary downloads | ✅ v0.6.0 |
-| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.6.0 |
-| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.6.0 |
-| **Layout** | Box model, text wrapping, block/inline, auto-height, UA font sizes | ✅ v0.6.0 |
-| **Paint** | Display-list painter: rects, borders, text runs, link hit-testing | ✅ v0.6.0 |
-| **Renderer** | Real pixel canvas (wgpu/tiny-skia) + legacy text mode | ✅ v0.6.0 |
-| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.6.0 |
-| **Storage** | Cookies, localStorage, bookmarks, history, downloads, settings | ✅ v0.6.0 |
-| **UI (Iced)** | Chrome-style tab strip, omnibox, menu, bookmarks bar, internal pages, DevTools | ✅ v0.6.0 |
-| **Tabs** | Chrome close behavior, incognito, reopen closed, tab cycling | ✅ v0.6.0 |
-| **Image Loader** | Image cache with memory management | ✅ v0.6.0 |
-| **Performance** | Profiler with per-phase timing | ✅ v0.6.0 |
-| **Search** | In-app results page via DuckDuckGo HTML endpoint | ✅ v0.6.0 |
+| **Network** | HTTP/HTTPS via ureq, ResourceCache with TTL, binary downloads | ✅ v0.6.1 |
+| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.6.1 |
+| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.6.1 |
+| **Layout** | Box model, text wrapping, block/inline, auto-height, UA font sizes | ✅ v0.6.1 |
+| **Paint** | Display-list painter: rects, borders, text runs, link hit-testing | ✅ v0.6.1 |
+| **Renderer** | Real pixel canvas (wgpu/tiny-skia) + legacy text mode | ✅ v0.6.1 |
+| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.6.1 |
+| **Storage** | Cookies, localStorage, bookmarks, history, downloads, settings | ✅ v0.6.1 |
+| **UI (Iced)** | Chrome-style tab strip, omnibox, menu, bookmarks bar, internal pages, DevTools | ✅ v0.6.1 |
+| **Tabs** | Chrome close behavior, incognito, reopen closed, tab cycling | ✅ v0.6.1 |
+| **Image Loader** | Image cache with memory management | ✅ v0.6.1 |
+| **Performance** | Profiler with per-phase timing | ✅ v0.6.1 |
+| **Search** | In-app results page via DuckDuckGo HTML endpoint | ✅ v0.6.1 |
 
 ## Keyboard Shortcuts (Chrome bindings)
 

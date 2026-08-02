@@ -1,5 +1,5 @@
 // src/tab.rs - Tab management system with history navigation (v0.3.0)
-#![allow(dead_code)]
+
 
 use crate::layout::LayoutNode;
 use crate::parser::Element;

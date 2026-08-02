@@ -1,4 +1,4 @@
-# GhitaBrowser v0.6.0 installer: copies fresh build, updates desktop shortcut
+# GhitaBrowser v0.6.1 installer: copies fresh build, updates desktop shortcut
 $ErrorActionPreference = "Stop"
 
 $src  = "E:\GhitaBrowser\target\release\ghitabrowser.exe"
@@ -22,7 +22,7 @@ if (Test-Path $lnk) { Remove-Item $lnk -Force }
 $sc = $ws.CreateShortcut($lnk)
 $sc.TargetPath = $exe
 $sc.WorkingDirectory = $dest
-$sc.Description = "GhitaBrowser v0.6.0"
+$sc.Description = "GhitaBrowser v0.6.1"
 $sc.IconLocation = "$exe,0"
 $sc.Save()
 

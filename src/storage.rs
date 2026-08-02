@@ -1,5 +1,5 @@
-// src/storage.rs - Cookies, localStorage, bookmarks, history, downloads & settings (v0.6.0)
-#![allow(dead_code)]
+// src/storage.rs - Cookies, localStorage, bookmarks, history, downloads & settings (v0.6.1)
+
 
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};

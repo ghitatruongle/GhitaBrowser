@@ -1,5 +1,5 @@
-// src/ui.rs - Chrome-style GUI built with Iced, powered by the Rust engine (v0.6.0)
-#![allow(dead_code)]
+// src/ui.rs - Chrome-style GUI built with Iced, powered by the Rust engine (v0.6.1)
+
 
 use iced::widget::{
     button, canvas, column, container, horizontal_space, row, scrollable, text, text_input,
@@ -1001,6 +1001,10 @@ impl Application for GhitaBrowserApp {
                     1 + el.children.iter().map(count_elements).sum::<usize>()
                 }
                 let dom_nodes = count_elements(&dom);
+                let layout_nodes = layout_tree
+                    .as_ref()
+                    .map(|root| crate::layout::count_layout_nodes(root))
+                    .unwrap_or(0);
 
                 let total_time = start.elapsed().as_millis() as u64;
 
@@ -1011,7 +1015,7 @@ impl Application for GhitaBrowserApp {
                     render_time_ms: render_time,
                     total_time_ms: total_time,
                     dom_nodes,
-                    layout_nodes: 0,
+                    layout_nodes,
                 });
 
                 // 7. Update the originating tab (may differ from the active tab now)
@@ -1066,7 +1070,7 @@ impl Application for GhitaBrowserApp {
                     self.display_list = Arc::new(
                         layout_tree
                             .as_ref()
-                            .map(crate::paint::build_display_list)
+                            .map(|root| crate::paint::build_display_list_with_cache(root, Some(&self.browser.image_cache)))
                             .unwrap_or_default(),
                     );
                     self.canvas_cache.clear();
@@ -1485,7 +1489,7 @@ impl GhitaBrowserApp {
             if is_internal_page(&tab.url) {
                 DisplayList::default()
             } else if let Some(ref root) = tab.layout {
-                crate::paint::build_display_list(root)
+                crate::paint::build_display_list_with_cache(root, Some(&self.browser.image_cache))
             } else {
                 // No cached layout (e.g. restored history entry): re-layout from the DOM
                 crate::layout::create_layout_tree(
@@ -1493,7 +1497,7 @@ impl GhitaBrowserApp {
                     &self.browser.css_rules,
                     self.browser.viewport_width(),
                 )
-                .map(|root| crate::paint::build_display_list(&root))
+                .map(|root| crate::paint::build_display_list_with_cache(&root, Some(&self.browser.image_cache)))
                 .unwrap_or_default()
             }
         } else {
@@ -2392,13 +2396,48 @@ impl<'a> canvas::Program<Message> for PageCanvas<'a> {
                             ..canvas::Text::default()
                         });
                         if *underline {
-                            let text_width = content.chars().count() as f32 * size * 0.6;
+                            let text_width = crate::layout::estimate_text_width(content, *size as f64) as f32;
                             frame.fill_rectangle(
                                 iced::Point::new(*x, *y + size * 1.18),
                                 iced::Size::new(text_width, 1.0),
                                 to_color(*color),
                             );
                         }
+                    }
+                    DisplayItem::Image {
+                        x,
+                        y,
+                        w,
+                        h,
+                        url: _,
+                        alt,
+                        cached,
+                    } => {
+                        let bg = if *cached {
+                            iced::Color::from_rgb(0.78, 0.88, 0.78) // light green = loaded
+                        } else {
+                            iced::Color::from_rgb(0.85, 0.85, 0.85) // gray = not loaded yet
+                        };
+                        frame.fill_rectangle(
+                            iced::Point::new(*x, *y),
+                            iced::Size::new(*w, *h),
+                            bg,
+                        );
+                        // Show a small label inside the image box
+                        let label = if *cached {
+                            format!("📷 {}", alt)
+                        } else {
+                            format!("🖼 {}", alt)
+                        };
+                        frame.fill_text(canvas::Text {
+                            content: label,
+                            position: iced::Point::new(*x + 2.0, *y + 2.0),
+                            color: iced::Color::from_rgb(0.3, 0.3, 0.3),
+                            size: iced::Pixels(12.0),
+                            font: iced::Font::default(),
+                            shaping: iced::widget::text::Shaping::Advanced,
+                            ..canvas::Text::default()
+                        });
                     }
                 }
             }

@@ -1,7 +1,7 @@
-// src/network.rs - Real HTTP Networking & Resource Caching (v0.6.0)
+// src/network.rs - Real HTTP Networking & Resource Caching (v0.6.1)
 // Uses ureq for HTTP/HTTPS fetching with TLS support, integrated with cookie jar
 
-use log::info;
+use log::{info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,11 @@ pub(crate) fn cache_ttl_secs(headers: &HashMap<String, String>) -> u64 {
                     .nth(1)?
                     .split(|c: char| !c.is_ascii_digit())
                     .next()?;
-                Some(max_age_str.parse::<u64>().unwrap_or(300))
+                let max_age_secs = max_age_str.parse::<u64>().unwrap_or_else(|e| {
+                    warn!("Invalid max-age value {:?}: {}", max_age_str, e);
+                    300
+                });
+                Some(max_age_secs)
             } else {
                 None
             }
@@ -105,10 +109,10 @@ pub fn fetch_with_cookies(
     // Parse Set-Cookie headers from response. Attribute them to the host of
     // the FINAL URL (after redirects), so a Set-Cookie sent by the redirect
     // target is not stored under the original host that never sent it.
-    let final_domain = url::Url::parse(&result.url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .unwrap_or(domain);
+    let final_domain = match url::Url::parse(&result.url) {
+        Ok(u) => u.host_str().map(|h| h.to_string()).unwrap_or_else(|| domain.clone()),
+        Err(_) => domain.clone(),
+    };
     for set_cookie_val in &result.set_cookie_headers {
         let cookie = crate::storage::Cookie::from_set_cookie_header(set_cookie_val, &final_domain);
         if !cookie.name.is_empty() {

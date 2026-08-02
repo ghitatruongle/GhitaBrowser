@@ -1,12 +1,12 @@
-// src/lib.rs - Public re-exports for ghitabrowser crate (v0.6.0)
-#![allow(dead_code)]
+// src/lib.rs - Public re-exports for ghitabrowser crate (v0.6.1)
+
 
 //! # GhitaBrowser
-//! A Chrome-style Rust browser v0.6.0 - built from scratch in safe Rust.
+//! A Chrome-style Rust browser v0.6.1 - built from scratch in safe Rust.
 
 /// Single source of truth for the app version.
 /// Used by the UI (status bar, about), the user-agent strings and storage state.
-pub const VERSION: &str = "0.6.0";
+pub const VERSION: &str = "0.6.1";
 
 pub mod css_parser;
 pub mod image_loader;
@@ -32,7 +32,9 @@ pub use layout::{create_layout_tree, perform_layout, LayoutNode};
 /// Re-export network functions and cache
 pub use network::{fetch_url, fetch_with_cache, CacheStats, FetchResult, ResourceCache};
 /// Re-export the pixel painter
-pub use paint::{build_display_list, DisplayItem, DisplayList, LinkRegion, Rgba};
+pub use paint::{build_display_list, build_display_list_with_cache, DisplayItem, DisplayList, LinkRegion, Rgba};
+/// Re-export image cache
+pub use image_loader::ImageCache;
 /// Re-export parser module types for convenience
 pub use parser::{parse_html, Element};
 /// Re-export performance profiler
@@ -79,6 +81,8 @@ pub struct Browser {
     pub css_rules: Vec<CssRule>,
     /// Last render stats
     pub last_render_stats: Option<RenderStats>,
+    /// Decoded image cache (for <img> tags)
+    pub image_cache: ImageCache,
 }
 
 impl Default for Browser {
@@ -100,6 +104,7 @@ impl Browser {
             profiler: Profiler::new(),
             css_rules: Vec::new(),
             last_render_stats: None,
+            image_cache: ImageCache::new(),
         }
     }
 
@@ -164,6 +169,13 @@ impl Browser {
             }
         }
 
+        // Count nodes
+        let dom_nodes = count_elements(&dom);
+        let layout_nodes = layout_tree
+            .as_ref()
+            .map(|root| crate::layout::count_layout_nodes(root))
+            .unwrap_or(0);
+
         // 6. Render to text
         let render_start = std::time::Instant::now();
         let rendered = if let Some(root) = layout_tree {
@@ -174,10 +186,6 @@ impl Browser {
         };
         let render_time = render_start.elapsed().as_millis() as u64;
         self.profiler.record("render", render_time);
-
-        // Count nodes
-        let dom_nodes = count_elements(&dom);
-        let layout_nodes = 0; // Simplified
 
         let total_time = start.elapsed().as_millis() as u64;
 

@@ -1,5 +1,5 @@
-// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.6.0)
-#![allow(dead_code)]
+// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.6.1)
+
 
 use crate::css_parser::{
     compute_computed_style, parse_class_attr, ComputedStyle, CssRule, CssUnit,
@@ -111,9 +111,20 @@ fn default_display_for_tag(tag: &str) -> DisplayType {
 
 /// Estimate text width for a given text in pixels (monospace approximation)
 pub fn estimate_text_width(text: &str, font_size: f64) -> f64 {
-    // Simple character-width estimation (average char width ≈ 0.6 * font_size)
-    let char_width = font_size * 0.6;
-    text.chars().count() as f64 * char_width
+    // CJK/emoji wide chars ≈ font_size; everything else ≈ 0.6 * font_size
+    text.chars()
+        .map(|c| if is_cjk(c) { font_size } else { font_size * 0.6 })
+        .sum()
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}' |   // CJK Unified
+        '\u{3400}'..='\u{4DBF}' |   // CJK Ext A
+        '\u{F900}'..='\u{FAFF}' |   // CJK Compat
+        '\u{3000}'..='\u{303F}' |   // CJK Symbols/Punctuation
+        '\u{1F300}'..='\u{1F9FF}'   // Emoji & Symbols
+    )
 }
 
 /// Get font size from computed style
@@ -463,6 +474,11 @@ fn layout_node_recursive(
         .max(font_size * 1.4); // Minimum height for one line
 
     node.rect.height
+}
+
+/// Recursively count the total number of layout nodes in the tree.
+pub(crate) fn count_layout_nodes(node: &LayoutNode) -> usize {
+    1 + node.children.iter().map(count_layout_nodes).sum::<usize>()
 }
 
 #[cfg(test)]

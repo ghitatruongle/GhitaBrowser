@@ -1,4 +1,4 @@
-// GhitaBrowser v0.6.0 - Main entry point
+// GhitaBrowser v0.6.1 - Main entry point
 #![windows_subsystem = "windows"]
 
 #[cfg(debug_assertions)]
@@ -71,7 +71,7 @@ fn main() {
         let test_html = r#"<html>
             <head><title>GhitaBrowser Test</title></head>
             <body>
-                <h1 class="main-title">Welcome to GhitaBrowser v0.6.0!</h1>
+                <h1 class="main-title">Welcome to GhitaBrowser v0.6.1!</h1>
                 <p>This is a <strong>Rust</strong> browser built from scratch.</p>
                 <img src="logo.png" alt="Logo">
                 <!-- This is a comment -->
@@ -144,7 +144,7 @@ fn main() {
     {
         println!("\n📐 Layout Engine: Box model with text wrapping");
         let test_html = r#"<html><head><title>GhitaBrowser Test</title></head><body>
-            <h1 class="main-title">Welcome to GhitaBrowser v0.6.0!</h1>
+            <h1 class="main-title">Welcome to GhitaBrowser v0.6.1!</h1>
             <p>This is a <strong>Rust</strong> browser built from scratch.</p>
             <ul><li>Item A &amp; B</li><li>Item C</li></ul>
         </body></html>"#;
