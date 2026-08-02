@@ -1,4 +1,4 @@
-// GhitaBrowser v0.6.1 - Main entry point
+// GhitaBrowser main entry point
 #![windows_subsystem = "windows"]
 
 #[cfg(debug_assertions)]

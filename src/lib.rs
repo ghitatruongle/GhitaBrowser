@@ -1,27 +1,48 @@
-// src/lib.rs - Public re-exports for ghitabrowser crate (v0.6.1)
+// GhitaBrowser core module re-exports
 
 
 //! # GhitaBrowser
-//! A Chrome-style Rust browser v0.6.1 - built from scratch in safe Rust.
+//! A Chrome-style Rust browser v1.0.0 - built from scratch in safe Rust.
 
 /// Single source of truth for the app version.
 /// Used by the UI (status bar, about), the user-agent strings and storage state.
-pub const VERSION: &str = "0.6.1";
+pub const VERSION: &str = "1.0.0";
 
+pub mod adblock;
 pub mod css_parser;
 pub mod image_loader;
 pub mod javascript;
 pub mod layout;
+pub mod media_saver;
 pub mod network;
+pub mod notes;
 pub mod paint;
+pub mod parallel_downloader;
 pub mod parser;
+pub mod passwords;
 pub mod performance;
+pub mod pip;
+pub mod reader_mode;
 pub mod renderer;
 pub mod search;
+pub mod sidebar;
 pub mod storage;
 pub mod tab;
+pub mod task_manager;
 pub mod text_renderer;
 pub mod ui;
+pub mod web_capture;
+
+pub use adblock::{AdBlockConfig, AdBlocker, AdBlockStats};
+pub use media_saver::{MediaItem, MediaSaver, MediaType};
+pub use notes::{NoteStore, QuickNote};
+pub use parallel_downloader::{DownloadChunk, ParallelDownloadTask};
+pub use passwords::{PasswordStore, SavedPassword};
+pub use pip::PipState;
+pub use reader_mode::{ReaderArticle, ReaderModeExtractor, ReaderSettings, ReaderTheme};
+pub use sidebar::{PinnedApp, SidebarPanel, SidebarState};
+pub use task_manager::{ProcessTaskInfo, TaskManager};
+pub use web_capture::{CaptureMode, RectRegion, WebCaptureState};
 
 /// Re-export CSS parser
 pub use css_parser::{parse_css, ComputedStyle, CssRule};
@@ -173,7 +194,7 @@ impl Browser {
         let dom_nodes = count_elements(&dom);
         let layout_nodes = layout_tree
             .as_ref()
-            .map(|root| crate::layout::count_layout_nodes(root))
+            .map(crate::layout::count_layout_nodes)
             .unwrap_or(0);
 
         // 6. Render to text

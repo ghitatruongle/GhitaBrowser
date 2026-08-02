@@ -1,11 +1,11 @@
-// src/text_renderer.rs - ASCII text rendering of layout tree (v0.6.1)
+// Layout text renderer
 
 
 use super::layout::{DisplayType, LayoutNode};
 
 pub struct TextRenderer {
-    width: u32,
-    height: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl TextRenderer {

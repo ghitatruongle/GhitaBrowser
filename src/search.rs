@@ -1,6 +1,4 @@
-// src/search.rs - Web search results for GhitaBrowser (v0.6.1)
-// Fetches DuckDuckGo's lightweight HTML endpoint (no JavaScript needed)
-// and parses the result list for display in the in-app results page.
+// Web search result fetcher and parser
 
 use std::time::Duration;
 

@@ -1,7 +1,4 @@
-// src/paint.rs - Pixel painting: layout tree -> display list (v0.6.1)
-// Turns the layout tree into a flat list of paint commands (rects, borders,
-// text runs, link regions) that the GUI draws onto a real graphics canvas.
-// This module is UI-framework agnostic: colors are plain RGBA floats.
+// Display list painter: layout tree to render commands
 
 
 use crate::layout::{effective_font_size, wrap_text, DisplayType, LayoutNode};
@@ -102,6 +99,33 @@ impl DisplayList {
             .rev()
             .find(|l| x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h)
             .map(|l| l.href.as_str())
+    }
+
+    /// Viewport Clipping Optimization:
+    /// Filters out DisplayItems that lie completely outside the visible viewport bounding box.
+    pub fn filter_viewport(&self, viewport_y: f32, viewport_height: f32) -> DisplayList {
+        let margin = 50.0; // Buffer margin in pixels
+        let min_y = viewport_y - margin;
+        let max_y = viewport_y + viewport_height + margin;
+
+        let items = self
+            .items
+            .iter()
+            .filter(|item| match item {
+                DisplayItem::Rect { y, h, .. } => (y + h) >= min_y && *y <= max_y,
+                DisplayItem::Border { y, h, .. } => (y + h) >= min_y && *y <= max_y,
+                DisplayItem::Image { y, h, .. } => (y + h) >= min_y && *y <= max_y,
+                DisplayItem::TextRun { y, size, .. } => (y + size) >= min_y && *y <= max_y,
+            })
+            .cloned()
+            .collect();
+
+        DisplayList {
+            items,
+            links: self.links.clone(),
+            width: self.width,
+            height: self.height,
+        }
     }
 }
 

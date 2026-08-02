@@ -1,5 +1,4 @@
-// src/network.rs - Real HTTP Networking & Resource Caching (v0.6.1)
-// Uses ureq for HTTP/HTTPS fetching with TLS support, integrated with cookie jar
+// HTTP networking and caching
 
 use log::{info, warn};
 use std::collections::HashMap;

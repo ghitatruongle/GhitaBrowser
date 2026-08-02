@@ -1,4 +1,4 @@
-// src/javascript.rs - JavaScript Engine with variables, functions, control flow (v0.6.1)
+// Embedded JavaScript engine
 
 
 use std::collections::HashMap;

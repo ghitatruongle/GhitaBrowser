@@ -1,36 +1,56 @@
-# Build output
-target/
-
-# Cargo
-Cargo.lock
-
-# Backup files
-*.rs.bk
+# Build
+/target/
+**/*.rs.bk
 *.bk
 
-# Editor swap files
-*.swp
-*.swo
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.exp
+*.lib
+GhitaBrowser.exe
 
-# OS artifacts
-.DS_Store
-Thumbs.db
-
-# IDE
-.idea/
-.vscode/
+# Data & Cache
+/user_data/
+/cache/
+/downloads/
+*.sqlite
+*.db-journal
 
 # Environment
 .env
 .env.*
+*.pem
+*.key
 
 # Logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# ZCode
+# IDE & Editor
+.idea/
+.vscode/
+.vs/
+.zed/
+*.swp
+*.swo
+*.code-workspace
+*.sln
+*.vcxproj
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# Tools
 .zcode/
-
-# Build artifacts
-GhitaBrowser.exe
-*.pdb
+.history/
 __pycache__/

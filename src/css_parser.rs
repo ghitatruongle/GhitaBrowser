@@ -1,4 +1,4 @@
-// src/css_parser.rs - Advanced CSS Parser and Style Computation (v0.6.1)
+// CSS parser and style computation
 
 
 use std::collections::HashMap;

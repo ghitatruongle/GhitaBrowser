@@ -1,4 +1,4 @@
-// src/tab.rs - Tab management system with history navigation (v0.3.0)
+// Tab manager and history
 
 
 use crate::layout::LayoutNode;
@@ -32,6 +32,12 @@ pub struct Tab {
     history: Vec<HistoryEntry>,
     /// Current history position (0-indexed)
     history_pos: usize,
+    /// Pinned tabs remain at the beginning of tab strip
+    pub is_pinned: bool,
+    /// Memory Saver: Inactive tab is hibernated to save RAM (Chrome feature)
+    pub is_sleeping: bool,
+    /// Unix timestamp of when the tab was last selected
+    pub last_active_timestamp: i64,
 }
 
 impl Tab {
@@ -52,6 +58,9 @@ impl Tab {
             is_error: false,
             history: vec![entry],
             history_pos: 0,
+            is_pinned: false,
+            is_sleeping: false,
+            last_active_timestamp: chrono::Utc::now().timestamp(),
         }
     }
 
@@ -313,12 +322,26 @@ impl TabManager {
         self.tabs.values()
     }
 
+    /// Position of active tab in tab bar (0-indexed)
+    pub fn active_index(&self) -> usize {
+        self.active_tab_id
+            .and_then(|id| self.tab_order.iter().position(|&tid| tid == id))
+            .unwrap_or(0)
+    }
+
     /// Iterate tabs in UI order
     pub fn iter_tabs(&self) -> Vec<&Tab> {
         self.tab_order
             .iter()
             .filter_map(|id| self.tabs.get(id))
             .collect()
+    }
+
+    /// Alias for iter_tabs: iterate tabs in UI order
+    pub fn iter(&self) -> impl Iterator<Item = &Tab> {
+        self.tab_order
+            .iter()
+            .filter_map(|id| self.tabs.get(id))
     }
 }
 

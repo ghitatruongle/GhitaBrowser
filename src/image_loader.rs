@@ -1,4 +1,4 @@
-// src/image_loader.rs - Image loading, caching, and decoding (v0.6.1)
+// Image loader and cache
 
 
 use log::warn;

@@ -1,4 +1,4 @@
-// src/storage.rs - Cookies, localStorage, bookmarks, history, downloads & settings (v0.6.1)
+// Browser storage and cookie jar
 
 
 use log::{error, info, warn};
@@ -430,6 +430,18 @@ pub struct BrowserSettings {
     /// Real pixel graphics renderer (true) or legacy text mode (false)
     #[serde(default = "default_true")]
     pub pixel_rendering: bool,
+    /// Vertical tabs mode (Edge feature)
+    #[serde(default)]
+    pub vertical_tabs: bool,
+    /// AdBlock & Tracker Blocker enabled (Cốc Cốc feature)
+    #[serde(default = "default_true")]
+    pub adblock_enabled: bool,
+    /// Tab Memory Saver / Sleeping tabs enabled (Chrome feature)
+    #[serde(default = "default_true")]
+    pub tab_memory_saver: bool,
+    /// Custom NewTab wallpaper (Chrome feature)
+    #[serde(default)]
+    pub custom_wallpaper_url: Option<String>,
 }
 
 impl Default for BrowserSettings {
@@ -441,6 +453,10 @@ impl Default for BrowserSettings {
             show_bookmarks_bar: true,
             default_zoom: 100,
             pixel_rendering: true,
+            vertical_tabs: false,
+            adblock_enabled: true,
+            tab_memory_saver: true,
+            custom_wallpaper_url: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-// src/layout.rs - Advanced Layout Engine with Text Wrapping (v0.6.1)
+// Layout engine and box model
 
 
 use crate::css_parser::{

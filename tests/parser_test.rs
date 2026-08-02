@@ -1,4 +1,4 @@
-// tests/unit/parser_test.rs - HTML parser tests
+// HTML parser unit tests
 use ghitabrowser::parser::{fallback_parser, parse_html};
 use rstest::rstest;
 

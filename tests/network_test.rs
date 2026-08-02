@@ -1,4 +1,4 @@
-// tests/network_test.rs - Network integration tests
+// Network integration tests
 use ghitabrowser::network::{FetchResult, ResourceCache};
 use std::collections::HashMap;
 
