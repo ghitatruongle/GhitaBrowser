@@ -18,6 +18,196 @@ use crate::parser::parse_html;
 use crate::search::{search_web, SearchResult};
 use crate::Browser;
 
+/// Detect if a page appears to be a JavaScript SPA (no rendered content).
+/// Returns true if the page has lots of script code but very little text content,
+/// indicating the content is loaded via JavaScript.
+fn is_spa_or_js_rendered(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+
+    // Known JS-heavy sites that block our parser
+    let spa_markers = [
+        "<noscript>",
+        "<ytd-app",
+        "<ytd-",  // YouTube custom elements
+        "ng-version",  // Angular
+        "__nuxt",      // Nuxt
+        "__next",      // Next.js
+        "window.__",   // React/state hydration markers
+        "noscript>",
+        "<div id=\"app\"",
+        "<div id=\"root\"",
+        "<div id=\"__next\"",
+        "data-reactroot",
+        "ng-app",
+    ];
+
+    for marker in &spa_markers {
+        if lower.contains(marker) {
+            return true;
+        }
+    }
+
+    // Heuristic: if there's a lot of script tags but very little text content,
+    // it's likely JS-rendered. SPA pages typically have <10% text ratio.
+    let script_len: usize = lower
+        .match_indices("<script")
+        .map(|(idx, _)| {
+            // Find end of tag and estimate tag size (rough)
+            let end = lower[idx..].find('>').unwrap_or(0);
+            end.min(500)
+        })
+        .sum();
+
+    // Count visible text roughly (between tags, excluding scripts and styles)
+    let stripped = lower
+        .replace("<script", "<<script")
+        .replace("<style", "<<style")
+        .replace("<noscript", "<<noscript");
+    let mut in_skip = false;
+    let mut visible_len = 0;
+    for chunk in stripped.split('<') {
+        if chunk.starts_with("script") || chunk.starts_with("style") || chunk.starts_with("noscript") {
+            in_skip = true;
+            continue;
+        }
+        if in_skip && chunk.starts_with('/') {
+            in_skip = false;
+            continue;
+        }
+        if !in_skip {
+            visible_len += chunk.len();
+        }
+    }
+
+    // If visible text is <2KB on a page >50KB, it's likely SPA
+    let total_len = html.len();
+    if total_len > 50_000 && visible_len < 2000 {
+        return true;
+    }
+
+    // If scripts are dominant (>30% of HTML is scripts)
+    if total_len > 0 && script_len * 3 > total_len {
+        return true;
+    }
+
+    false
+}
+
+/// Extract YouTube video ID from URL (e.g., youtube.com/watch?v=ID, youtu.be/ID)
+/// Returns Some(video_id) if URL is a YouTube watch URL.
+fn extract_youtube_video_id(url: &str) -> Option<String> {
+    if let Ok(parsed) = url::Url::parse(url) {
+        let host = parsed.host_str()?.to_lowercase();
+        let path = parsed.path();
+
+        // youtube.com/watch?v=ID
+        if (host == "youtube.com" || host == "www.youtube.com" || host == "m.youtube.com")
+            && path == "/watch"
+        {
+            return parsed
+                .query_pairs()
+                .find(|(k, _)| k == "v")
+                .map(|(_, v)| v.into_owned());
+        }
+
+        // youtu.be/ID or youtube.com/shorts/ID or /embed/ID
+        if host == "youtu.be" {
+            let id = path.trim_start_matches('/');
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+        if (host == "youtube.com" || host == "www.youtube.com" || host == "m.youtube.com")
+            && (path.starts_with("/shorts/") || path.starts_with("/embed/"))
+        {
+            let id = path.split('/').nth(2).unwrap_or("");
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build a "video info" HTML page for YouTube when JS rendering is not available.
+/// Provides video ID, embed link, and a search alternative.
+fn build_video_info_html(video_id: &str, source_url: &str) -> String {
+    format!(
+        "<html><head><title>YouTube Video {id}</title></head>\
+         <body>\
+         <h1>YouTube Video</h1>\
+         <p>GhitaBrowser cannot render YouTube's JavaScript-based interface, but you can still access this video:</p>\
+         <h2>Video Information</h2>\
+         <p><b>Video ID:</b> <code>{id}</code></p>\
+         <p><b>Source URL:</b> <a href=\"{url}\">{url}</a></p>\
+         <h2>Alternatives</h2>\
+         <ul>\
+         <li>Use the embed URL: <a href=\"https://www.youtube.com/embed/{id}\">/embed/{id}</a></li>\
+         <li>Search for video content via the address bar</li>\
+         <li>Try the Invidious mirror (privacy-focused YouTube frontend)</li>\
+         </ul>\
+         <p style=\"color: gray;\">Note: Full YouTube playback requires JavaScript execution, which is not yet supported.</p>\
+         </body></html>",
+        id = video_id, url = source_url
+    )
+}
+
+/// Human-readable error title and message for network failures.
+/// Converts technical error strings into user-friendly messages.
+fn humanize_error(err: &str) -> (String, String) {
+    let err_lower = err.to_ascii_lowercase();
+
+    if err_lower.contains("timed out") || err_lower.contains("timeout") {
+        (
+            "Page took too long".to_string(),
+            "The server is not responding. Try again later or check your connection.".to_string(),
+        )
+    } else if err_lower.contains("connection refused") {
+        (
+            "Cannot connect".to_string(),
+            "This site refused the connection. The site may be down or blocking your browser.".to_string(),
+        )
+    } else if err_lower.contains("dns") || err_lower.contains("name or service not known") || err_lower.contains("could not resolve") {
+        (
+            "Page not found".to_string(),
+            "Could not find this page. Check the address for typos.".to_string(),
+        )
+    } else if err_lower.contains("status 404") || err_lower.contains("not found") {
+        (
+            "Page not found".to_string(),
+            "The page you requested does not exist on this server.".to_string(),
+        )
+    } else if err_lower.contains("status 500") || err_lower.contains("status 502") || err_lower.contains("status 503") || err_lower.contains("status 504") || err_lower.contains("internal server error") || err_lower.contains("bad gateway") || err_lower.contains("service unavailable") || err_lower.contains("gateway timeout") {
+        (
+            "Server error".to_string(),
+            "Something went wrong on this website. Try again in a few moments.".to_string(),
+        )
+    } else if err_lower.contains("ssl") || err_lower.contains("tls") || err_lower.contains("certificate") || err_lower.contains("secure") {
+        (
+            "Secure connection failed".to_string(),
+            "Your connection is not private. The site may be trying to steal your information.".to_string(),
+        )
+    } else if err_lower.contains("network") || err_lower.contains("no route") || err_lower.contains("unreachable") {
+        (
+            "You're offline".to_string(),
+            "Check your internet connection and try again.".to_string(),
+        )
+    } else if err_lower.contains("no such host") || err_lower.contains("name does not resolve") {
+        (
+            "Page not found".to_string(),
+            "This website does not exist. Check the address for typos.".to_string(),
+        )
+    } else {
+        (
+            "This site can't be reached".to_string(),
+            format!(
+                "{} may be down or blocking your connection. Try checking the address or reload (F5).",
+                err.split(':').next().unwrap_or(err)
+            ),
+        )
+    }
+}
+
 // ===== Chrome color palettes (dark + light), sampled from Google Chrome =====
 
 #[derive(Clone, Copy)]
@@ -1046,7 +1236,8 @@ impl Application for GhitaBrowserApp {
                 if let Some(tab) = self.browser.active_tab() {
                     let html = self.rendered_content.clone();
                     let title = tab.title.clone();
-                    let article = crate::reader_mode::ReaderModeExtractor::extract(&html, &title);
+                    let url = tab.url.clone();
+                    let article = crate::reader_mode::ReaderModeExtractor::extract(&html, &url, &title);
                     self.status_msg = format!("Immersive Reader active: {} (est. {} min read)", article.title, article.estimated_reading_time_mins);
                 }
             }
@@ -1235,13 +1426,129 @@ impl Application for GhitaBrowserApp {
 
                 // 9. Update the visible UI only if the loaded tab is still active
                 if target_is_active {
-                    self.rendered_content = rendered;
-                    self.display_list = Arc::new(
-                        layout_tree
+                    // Check if display list is empty (layout failed) - try Reader Mode fallback
+                    let display_list = layout_tree
+                        .as_ref()
+                        .map(|root| crate::paint::build_display_list_with_cache(root, Some(&self.browser.image_cache)))
+                        .unwrap_or_default();
+
+                    // Detect SPA/JS-rendered pages (e.g., YouTube, Twitter)
+                    // and show a user-friendly fallback instead of empty/skeleton content
+                    let is_spa = is_spa_or_js_rendered(&html) && display_list.items.len() < 10;
+                    let sparse_content = !is_spa && display_list.items.len() < 3 && html.len() > 50000;
+
+                    if is_spa {
+                        // Special handling for YouTube videos - show video info
+                        let page_html = if let Some(video_id) = extract_youtube_video_id(&url) {
+                            self.status_msg = format!("YouTube video {} (JS required for playback)", video_id);
+                            build_video_info_html(&video_id, &url)
+                        } else {
+                            // Generic SPA fallback
+                            self.status_msg = format!(
+                                "JavaScript-only page: {} cannot be rendered without JS engine",
+                                url
+                            );
+                            format!(
+                                "<html><head><title>{title}</title></head>\
+                                 <body>\
+                                 <h1>This page requires JavaScript</h1>\
+                                 <p>The website at <b>{url}</b> uses JavaScript to load its content (a \"Single Page Application\").</p>\
+                                 <p>GhitaBrowser currently does not execute JavaScript, so the content cannot be displayed.</p>\
+                                 <h2>What you can do:</h2>\
+                                 <ul>\
+                                 <li>Use a search engine like DuckDuckGo with <b>site:</b> filter</li>\
+                                 <li>Try the mobile version (m.youtube.com, mobile.twitter.com)</li>\
+                                 <li>Read only the article text via Reader Mode (if available)</li>\
+                                 </ul>\
+                                 <p><b>Address:</b> {url}</p>\
+                                 </body></html>",
+                                title = if title.is_empty() { "JavaScript Required".to_string() } else { title.clone() },
+                                url = url
+                            )
+                        };
+                        let spa_dom = parse_html(&page_html);
+                        let spa_layout = crate::layout::create_layout_tree(
+                            &spa_dom,
+                            &self.browser.css_rules,
+                            self.browser.viewport_width(),
+                        );
+                        let spa_list = spa_layout
                             .as_ref()
                             .map(|root| crate::paint::build_display_list_with_cache(root, Some(&self.browser.image_cache)))
-                            .unwrap_or_default(),
-                    );
+                            .unwrap_or_default();
+                        let spa_rendered = if let Some(ref root) = spa_layout {
+                            let tr = crate::text_renderer::TextRenderer::new(
+                                self.browser.viewport_width(),
+                                self.browser.viewport_height(),
+                            );
+                            tr.render_to_text(root)
+                        } else {
+                            String::new()
+                        };
+                        self.display_list = Arc::new(spa_list);
+                        self.rendered_content = spa_rendered;
+                    } else if display_list.is_empty() && !html.is_empty() {
+                        // Display list empty - try Reader Mode fallback
+                        let article = crate::reader_mode::ReaderModeExtractor::extract(&html, &url, &title);
+                        if !article.text_content.is_empty() {
+                            self.status_msg = format!(
+                                "Loaded (Reader Mode): {} | est. {} min read",
+                                article.title, article.estimated_reading_time_mins
+                            );
+                            self.rendered_content = article.text_content.clone();
+                        } else {
+                            self.rendered_content = rendered;
+                        }
+                        self.display_list = Arc::new(display_list);
+                    } else if sparse_content {
+                        // Page has lots of HTML but little content (e.g., ads-only, JS skeleton)
+                        // Show a notice and fall back to any readable text
+                        let article = crate::reader_mode::ReaderModeExtractor::extract(&html, &url, &title);
+                        let notice_html = format!(
+                            "<html><body>\
+                             <h1>This page is mostly empty</h1>\
+                             <p>The HTML was loaded ({} KB) but only minimal visible content was found.</p>\
+                             <p>This often happens when the page relies heavily on JavaScript to render content.</p>\
+                             <p><b>Address:</b> {}</p>\
+                             {}\
+                             </body></html>",
+                            html.len() / 1024,
+                            url,
+                            if !article.text_content.is_empty() {
+                                format!("<h2>Extracted text:</h2><pre>{}</pre>",
+                                    article.text_content.chars().take(2000).collect::<String>())
+                            } else {
+                                String::new()
+                            }
+                        );
+                        let notice_dom = parse_html(&notice_html);
+                        let notice_layout = crate::layout::create_layout_tree(
+                            &notice_dom,
+                            &self.browser.css_rules,
+                            self.browser.viewport_width(),
+                        );
+                        let notice_list = notice_layout
+                            .as_ref()
+                            .map(|root| crate::paint::build_display_list_with_cache(root, Some(&self.browser.image_cache)))
+                            .unwrap_or_default();
+                        let notice_rendered = if let Some(ref root) = notice_layout {
+                            let tr = crate::text_renderer::TextRenderer::new(
+                                self.browser.viewport_width(),
+                                self.browser.viewport_height(),
+                            );
+                            tr.render_to_text(root)
+                        } else {
+                            String::new()
+                        };
+                        self.status_msg = format!("Limited content: {} (only {} visible items)", url, display_list.items.len());
+                        self.display_list = Arc::new(notice_list);
+                        self.rendered_content = notice_rendered;
+                    } else {
+                        // Normal page - render as usual
+                        self.rendered_content = rendered;
+                        self.display_list = Arc::new(display_list);
+                    }
+
                     self.canvas_cache.clear();
                     self.show_suggestions = false;
                     self.url_input = url.clone();
@@ -1259,17 +1566,19 @@ impl Application for GhitaBrowserApp {
                     return Command::none();
                 }
                 self.is_loading = false;
+                let (title, friendly_msg) = humanize_error(&err);
                 self.status_msg = format!("Error loading {}: {}", url, err);
 
                 // Turn the failure into an error "page" on the originating tab, so the
                 // user actually sees it (even when the load started from an internal page).
                 let error_html = format!(
-                    "<html><head><title>This site can't be reached</title></head>\
-                     <body><h1>This site can't be reached</h1>\
-                     <p>{}</p><p>Error: {}</p>\
+                    "<html><head><title>{}</title></head>\
+                     <body><h1>{}</h1>\
+                     <p>{}</p>\
+                     <p>Address: {}</p>\
                      <p>Try checking the address, your connection, or reload (F5).</p>\
                      </body></html>",
-                    url, err
+                    title, title, friendly_msg, url
                 );
                 let dom = parse_html(&error_html);
                 let target_is_active = self.browser.tabs.active_tab_id() == Some(tab_id);
@@ -1278,7 +1587,7 @@ impl Application for GhitaBrowserApp {
                     // its current history position so Back returns to the last
                     // good page (see Tab::go_back's is_error handling).
                     tab.dom = dom;
-                    tab.title = "This site can't be reached".to_string();
+                    tab.title = title.clone();
                     tab.url = url;
                     tab.layout = None;
                     tab.is_error = true;
@@ -1530,8 +1839,8 @@ impl GhitaBrowserApp {
             async move {
                 tokio::task::spawn_blocking(move || {
                     let mut store = cookie_store;
-                    crate::network::fetch_with_cookies(&fetch_url, &mut store)
-                        .map_err(|e| e.to_string())
+                    // Retry up to 2 times with exponential backoff for transient errors
+                    crate::network::fetch_with_retry(&fetch_url, &mut store, 2)
                 })
                 .await
                 .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
@@ -2961,7 +3270,7 @@ impl GhitaBrowserApp {
                         text(truncate_label(&r.url, 100))
                             .size(11)
                             .style(iced::theme::Text::from(pal.secure)),
-                        text(truncate_label(&r.snippet, 240))
+                        text(truncate_label(&r.snippet, 500))
                             .size(12)
                             .style(iced::theme::Text::from(pal.text_dim)),
                     ]

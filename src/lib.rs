@@ -2,11 +2,11 @@
 
 
 //! # GhitaBrowser
-//! A Chrome-style Rust browser v1.0.0 - built from scratch in safe Rust.
+//! A Chrome-style Rust browser v1.1.0 - built from scratch in safe Rust.
 
 /// Single source of truth for the app version.
 /// Used by the UI (status bar, about), the user-agent strings and storage state.
-pub const VERSION: &str = "1.0.0";
+pub const VERSION: &str = "1.1.0";
 
 pub mod adblock;
 pub mod css_parser;

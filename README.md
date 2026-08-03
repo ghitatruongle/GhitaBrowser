@@ -6,7 +6,29 @@ A Chrome-style lightweight browser written 100% in safe Rust, built from scratch
 
 ## Overview
 
-GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v0.6.1). The UI is modeled after Google Chrome — tab strip, omnibox, three-dot menu, bookmarks bar, history, downloads, settings — and pages are now painted with **real pixels on a graphics canvas**, while the whole engine (networking, HTML/CSS parsing, layout, painting, JS, storage) remains 100% homemade Rust.
+GhitaBrowser is a complete web browser implementation written entirely in safe Rust (v1.1.0). The UI is modeled after Google Chrome — tab strip, omnibox, three-dot menu, bookmarks bar, history, downloads, settings — and pages are now painted with **real pixels on a graphics canvas**, while the whole engine (networking, HTML/CSS parsing, layout, painting, JS, storage) remains 100% homemade Rust.
+
+### v1.1.0 New Features — the "Toàn Bộ Trang" release
+
+**Error handling improvements**
+- ✅ **Human-readable error messages** — network errors are now translated into friendly messages (e.g., "Page took too long" instead of technical connection errors)
+- ✅ **Retry logic with exponential backoff** — failed requests are automatically retried up to 2 times for transient errors (timeouts, 5xx server errors)
+
+**Reader Mode upgrade**
+- ✅ **DOM-based content extraction** — Reader Mode now uses proper HTML parser instead of line-by-line regex stripping
+- ✅ **Semantic content detection** — finds `<article>`, `<main>` tags and scores divs by class/id patterns to find the main content
+- ✅ **Metadata extraction** — extracts author/byline, published date, site name from meta tags (og:title, article:author, etc.)
+- ✅ **Cleaner output** — strips nav, header, footer, aside, script, style, and hidden elements from extracted content
+
+**Fallback chain**
+- ✅ **Canvas → Reader Mode → Text fallback** — when pixel rendering fails (empty display list), automatically falls back to Reader Mode extraction for readable content
+- ✅ **Longer search snippets** — search result snippets now display up to 500 characters instead of 240
+
+**JavaScript-only page handling (new!)**
+- ✅ **SPA detection** — detects JavaScript-only pages (YouTube, Twitter, React/Angular/Vue apps) using known markers and heuristics (script ratio, visible text density)
+- ✅ **YouTube video info page** — when accessing YouTube, extracts the video ID from URL and shows a clean info page with video ID, embed link, and alternatives (instead of empty skeleton)
+- ✅ **Empty/sparse content notice** — pages with large HTML but little visible content get a friendly notice explaining the JS limitation, plus any extracted text
+- ✅ **Useful fallback messages** — instead of showing blank pages, users get clear explanations of why the page can't be rendered and what alternatives they have
 
 ### v0.6.1 New Features — the "Lõi Vặt & Hiệu Năng" release
 
@@ -76,16 +98,17 @@ GhitaBrowser is a complete web browser implementation written entirely in safe R
 
 | Module | Description | Status |
 |--------|-------------|--------|
-| **Network** | HTTP/HTTPS via ureq, ResourceCache with TTL, binary downloads | ✅ v0.6.1 |
-| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v0.6.1 |
-| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v0.6.1 |
-| **Layout** | Box model, text wrapping, block/inline, auto-height, UA font sizes | ✅ v0.6.1 |
-| **Paint** | Display-list painter: rects, borders, text runs, link hit-testing | ✅ v0.6.1 |
-| **Renderer** | Real pixel canvas (wgpu/tiny-skia) + legacy text mode | ✅ v0.6.1 |
-| **JavaScript** | Variables, functions, if/while, console API | ✅ v0.6.1 |
-| **Storage** | Cookies, localStorage, bookmarks, history, downloads, settings | ✅ v0.6.1 |
-| **UI (Iced)** | Chrome-style tab strip, omnibox, menu, bookmarks bar, internal pages, DevTools | ✅ v0.6.1 |
-| **Tabs** | Chrome close behavior, incognito, reopen closed, tab cycling | ✅ v0.6.1 |
+| **Network** | HTTP/HTTPS via ureq, ResourceCache with TTL, retry logic, binary downloads | ✅ v1.1.0 |
+| **HTML Parser** | HTML5 tokenizer, error recovery, DOM tree | ✅ v1.1.0 |
+| **CSS Parser** | Selectors (tag/class/id), specificity, 20+ properties | ✅ v1.1.0 |
+| **Layout** | Box model, text wrapping, block/inline, auto-height, UA font sizes | ✅ v1.1.0 |
+| **Paint** | Display-list painter: rects, borders, text runs, link hit-testing | ✅ v1.1.0 |
+| **Renderer** | Real pixel canvas (wgpu/tiny-skia) + legacy text mode | ✅ v1.1.0 |
+| **JavaScript** | Variables, functions, if/while, console API | ✅ v1.1.0 |
+| **Storage** | Cookies, localStorage, bookmarks, history, downloads, settings | ✅ v1.1.0 |
+| **UI (Iced)** | Chrome-style tab strip, omnibox, menu, bookmarks bar, internal pages, DevTools | ✅ v1.1.0 |
+| **Tabs** | Chrome close behavior, incognito, reopen closed, tab cycling | ✅ v1.1.0 |
+| **Reader Mode** | DOM-based content extraction, semantic detection, fallback chain | ✅ v1.1.0 |
 | **Image Loader** | Image cache with memory management | ✅ v0.6.1 |
 | **Performance** | Profiler with per-phase timing | ✅ v0.6.1 |
 | **Search** | In-app results page via DuckDuckGo HTML endpoint | ✅ v0.6.1 |

@@ -126,6 +126,77 @@ pub fn fetch_with_cookies(
     Ok(result)
 }
 
+/// Check if an error message represents a retryable error.
+/// Retryable: timeouts, 500-503, 504 server/gateway errors, connection issues.
+pub fn is_retryable_error(err: &str) -> bool {
+    let err_lower = err.to_ascii_lowercase();
+
+    // Check for HTTP status codes (500-599)
+    // Pattern: "status XXX" or "XXX Internal/Bad/Gateway/Service"
+    if err_lower.contains("status 5") || err_lower.contains("status 4") {
+        // Extract the status code after "status "
+        if let Some(pos) = err_lower.find("status ") {
+            let after = &err_lower[pos + 7..];
+            let code: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(code_num) = code.parse::<u16>() {
+                return code_num == 408 || code_num == 429 || (500..600).contains(&code_num);
+            }
+        }
+    }
+
+    // Pattern: ureq error format - "http: server error" with status in description
+    // Ureq status 5xx errors are retryable (except those that won't recover)
+    if err_lower.contains("server error") || err_lower.contains("bad gateway")
+        || err_lower.contains("service unavailable") || err_lower.contains("gateway timeout") {
+        return true;
+    }
+
+    // Connection / timeout issues
+    err_lower.contains("timed out")
+        || err_lower.contains("timeout")
+        || err_lower.contains("connection closed")
+        || err_lower.contains("connection reset")
+        || err_lower.contains("connection refused")
+        || err_lower.contains("transport")
+}
+
+/// Fetch with automatic retry for transient errors.
+/// Retries up to `max_retries` times with exponential backoff (1s, 2s, 4s, ...).
+/// Only retries on timeouts, connection issues, and 5xx/408/429 server errors.
+pub fn fetch_with_retry(
+    url_str: &str,
+    cookie_store: &mut crate::storage::CookieStore,
+    max_retries: u32,
+) -> Result<FetchResult, String> {
+    let mut last_error = String::new();
+    let mut backoff_ms = 1000; // Start with 1 second
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            info!("Retry attempt {}/{} for {}", attempt, max_retries, url_str);
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            backoff_ms *= 2; // Exponential backoff: 1s, 2s, 4s...
+        }
+
+        match fetch_with_cookies(url_str, cookie_store) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                let err_str = e.to_string();
+                last_error = err_str.clone();
+                if !is_retryable_error(&err_str) {
+                    // Non-retryable error, fail immediately
+                    return Err(err_str);
+                }
+                if attempt == max_retries {
+                    return Err(err_str);
+                }
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
 /// Internal: execute the actual HTTP request
 fn execute_fetch(
     agent: &ureq::Agent,
@@ -621,5 +692,45 @@ mod tests {
             cache.insert("https://e.com", err_result.clone(), ttl);
         }
         assert!(cache.get("https://e.com").is_none());
+    }
+
+    #[test]
+    fn test_is_retryable_error_server_errors() {
+        // 5xx server errors should retry
+        assert!(is_retryable_error("status 500 Internal Server Error"));
+        assert!(is_retryable_error("status 502 Bad Gateway"));
+        assert!(is_retryable_error("status 503 Service Unavailable"));
+        assert!(is_retryable_error("status 504 Gateway Timeout"));
+
+        // 408 (request timeout) and 429 (too many requests) should also retry
+        assert!(is_retryable_error("status 408 Request Timeout"));
+        assert!(is_retryable_error("status 429 Too Many Requests"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_network_issues() {
+        // Connection / timeout issues should retry
+        assert!(is_retryable_error("Connection timed out"));
+        assert!(is_retryable_error("Request timeout"));
+        assert!(is_retryable_error("Connection closed by server"));
+        assert!(is_retryable_error("Connection reset by peer"));
+        assert!(is_retryable_error("transport error: connection refused"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_client_errors() {
+        // 4xx client errors (except 408, 429) should NOT retry
+        assert!(!is_retryable_error("status 404 Not Found"));
+        assert!(!is_retryable_error("status 403 Forbidden"));
+        assert!(!is_retryable_error("status 401 Unauthorized"));
+
+        // DNS failures are usually not retryable
+        assert!(!is_retryable_error("Could not resolve host: example.invalid"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_ureq_format() {
+        // ureq status 5xx errors format as "http: server error"
+        assert!(is_retryable_error("http: server error"));
     }
 }
