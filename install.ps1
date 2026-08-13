@@ -1,31 +1,36 @@
-# GhitaBrowser installer: copies release build, updates desktop shortcut
+# Local GhitaBrowser developer installer.
 $ErrorActionPreference = "Stop"
 
-$src  = "E:\GhitaBrowser\target\release\ghitabrowser.exe"
-$dest = "$env:LOCALAPPDATA\Programs\GhitaBrowser"
-
-# 1. Install directory + copy the new exe
-if (-not (Test-Path $src)) {
-    throw "Release build not found: $src`nRun 'cargo build --release' first."
+$projectRoot = $PSScriptRoot
+$metadata = cargo metadata --no-deps --format-version 1 --manifest-path (Join-Path $projectRoot "Cargo.toml") | ConvertFrom-Json
+$package = $metadata.packages | Where-Object { $_.name -eq "ghitabrowser" } | Select-Object -First 1
+if (-not $package) {
+    throw "Unable to read the GhitaBrowser package version."
 }
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Copy-Item -Force $src (Join-Path $dest "GhitaBrowser.exe")
-Copy-Item -Force "E:\GhitaBrowser\icon.ico" (Join-Path $dest "icon.ico")
 
-$exe = Join-Path $dest "GhitaBrowser.exe"
+$version = $package.version
+$sourceExe = Join-Path $projectRoot "target\release\ghitabrowser.exe"
+$sourceIcon = Join-Path $projectRoot "icon.ico"
+$destination = Join-Path $env:LOCALAPPDATA "Programs\GhitaBrowser"
 
-# 2. Old shortcut on desktop -> point to new exe, icon from embedded resource
+if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+    throw "Release build not found: $sourceExe`nRun 'cargo build --release --locked' first."
+}
+
+New-Item -ItemType Directory -Force -Path $destination | Out-Null
+Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $destination "GhitaBrowser.exe") -Force
+Copy-Item -LiteralPath $sourceIcon -Destination (Join-Path $destination "icon.ico") -Force
+
+$installedExe = Join-Path $destination "GhitaBrowser.exe"
 $desktop = [Environment]::GetFolderPath("Desktop")
-$lnk = Join-Path $desktop "GhitaBrowser.lnk"
-$ws = New-Object -ComObject WScript.Shell
-if (Test-Path $lnk) { Remove-Item $lnk -Force }
-$sc = $ws.CreateShortcut($lnk)
-$sc.TargetPath = $exe
-$sc.WorkingDirectory = $dest
-$sc.Description = "GhitaBrowser v1.0.0"
-$ico = Join-Path $dest "icon.ico"
-$sc.IconLocation = "$ico,0"
-$sc.Save()
+$shortcutPath = Join-Path $desktop "GhitaBrowser.lnk"
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $installedExe
+$shortcut.WorkingDirectory = $destination
+$shortcut.Description = "GhitaBrowser v$version"
+$shortcut.IconLocation = "$(Join-Path $destination 'icon.ico'),0"
+$shortcut.Save()
 
-Write-Host "INSTALLED: $exe"
-Write-Host "SHORTCUT:  $lnk"
+Write-Host "Installed GhitaBrowser v$version to $installedExe"
+Write-Host "Shortcut: $shortcutPath"

@@ -1,0 +1,27 @@
+GhitaBrowser Proprietary Software License
+
+Copyright (c) 2026 GhitaBrowser. All rights reserved.
+
+GhitaBrowser, including its original source code, user interface, artwork,
+documentation and release binaries (collectively, the "Software"), is
+proprietary software. No permission is granted to copy, reproduce, modify,
+publish, distribute, sublicense, sell, reverse engineer, decompile or create
+derivative works from the Software except under a separate written agreement
+signed by the copyright holder or where applicable law expressly requires an
+exception that cannot be waived.
+
+An authorized end user may install and run an officially supplied binary copy
+of the Software for its intended purpose. This permission is personal,
+non-exclusive, non-transferable and revocable. It does not grant access to or
+rights in the source code.
+
+Third-party libraries and test materials are not relicensed by this document.
+They remain governed by their respective licenses and notices. See
+THIRD_PARTY_NOTICES.md and the locked dependency metadata distributed with the
+corresponding source build.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED
+BY LAW, THE COPYRIGHT HOLDER IS NOT LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.

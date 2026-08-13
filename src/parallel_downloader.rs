@@ -23,9 +23,19 @@ pub struct ParallelDownloadTask {
 }
 
 impl ParallelDownloadTask {
-    pub fn new(id: String, url: String, file_name: String, total_size: u64, num_connections: usize) -> Self {
+    pub fn new(
+        id: String,
+        url: String,
+        file_name: String,
+        total_size: u64,
+        num_connections: usize,
+    ) -> Self {
         let num_connections = num_connections.clamp(1, 16);
-        let chunk_size = if total_size > 0 { total_size / num_connections as u64 } else { 0 };
+        let chunk_size = if total_size > 0 {
+            total_size / num_connections as u64
+        } else {
+            0
+        };
 
         let mut chunks = Vec::new();
         for i in 0..num_connections {

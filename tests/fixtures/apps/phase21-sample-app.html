@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Phase 21 Sample App</title>
+  <style>
+    :root { --accent: #2b6cb0; --space: 8px; }
+    body { font-family: sans-serif; margin: 16px; }
+    .card { color: var(--accent); border: 1px solid #ccc; padding: var(--space); margin-bottom: var(--space); }
+    .card strong { color: #000; }
+    .hidden { display: none; }
+    @media (max-width: 600px) { .card { border-width: 2px; } }
+    nav a { color: var(--accent); text-decoration: none; }
+    #output { white-space: pre-wrap; }
+    canvas { border: 1px solid #ddd; }
+  </style>
+</head>
+<body>
+  <nav><a href="#/home">Home</a></nav>
+  <main id="app">
+    <div id="host" class="card">
+      <span slot="title">Phase 21</span>
+    </div>
+    <form id="search" action="/search" method="get">
+      <input name="q" id="query" placeholder="search...">
+      <select name="sort" id="sort"><option value="new">New</option><option value="top">Top</option></select>
+      <button id="go" type="submit">Search</button>
+    </form>
+    <canvas id="c" width="120" height="60"></canvas>
+    <pre id="output"></pre>
+  </main>
+  <script>
+    let log = [];
+    function record(label, value) { log.push(label + '=' + value); }
+
+    // Persistent runtime: state survives across script tags (see second script).
+    let session = { count: 0, name: 'phase21' };
+
+    // Shadow DOM composition.
+    let host = document.getElementById('host');
+    let root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = '<h2><slot name="title">App</slot></h2><p>shadow body</p>';
+
+    // Events: click listener with retargeted target.
+    document.getElementById('host').addEventListener('click', function (event) {
+      record('click', event.target.id);
+    });
+
+    // History navigation.
+    window.addEventListener('popstate', function (event) { record('popstate', event.detail); });
+    history.pushState('s0', '', '/app');
+    history.pushState('s1', '', '/app/next');
+
+    // Forms: submit listener + validation.
+    document.getElementById('search').addEventListener('submit', function (event) {
+      event.preventDefault();
+      record('submitted', document.getElementById('query').value);
+    });
+
+    // Canvas 2D.
+    let ctx = document.getElementById('c').getContext('2d');
+    ctx.fillStyle = '#2b6cb0';
+    ctx.fillRect(4, 4, 40, 20);
+    record('canvas', ctx.fillStyle);
+
+    // Modern ECMAScript: template literals, ternary, strict equality,
+    // nullish, optional chaining, JSON, String methods, switch.
+    let theme = session.theme ?? 'default';
+    let greeting = `hello ${session.name}`;
+    record('greeting', greeting);
+    record('strict', 1 === 1 ? 'yes' : 'no');
+    record('json', JSON.parse('{"k":3}').k);
+    record('upper', 'miXeD'.toUpperCase());
+    let mode = 'b';
+    let label = '';
+    switch (mode) { case 'a': label = 'A'; break; case 'b': label = 'B'; break; default: label = '?'; }
+    record('switch', label);
+    let maybe = { deep: { value: 7 } };
+    record('optional', maybe?.deep?.value);
+    record('typeof', typeof session.name);
+  </script>
+  <script>
+    // Second script tag: the first script's bindings must still be visible.
+    session.count = session.count + 1;
+    record('persistent', session.count + ':' + session.name);
+
+    // Keyboard input through the input event listener.
+    let query = document.getElementById('query');
+    query.addEventListener('input', function (event) { record('input', query.value); });
+    query.value = 'rust';
+    record('value', query.value);
+  </script>
+  <script>
+    // Third script: dispatch a custom event to the output area.
+    let output = document.getElementById('output');
+    output.addEventListener('render', function (event) { output.textContent = event.detail; });
+    output.dispatchEvent(new CustomEvent('render', { detail: log.join('\n') }));
+  </script>
+</body>
+</html>

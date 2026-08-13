@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SidebarPanel {
-    WebApps,  // Zalo, Messenger, Facebook web
-    Notes,    // Quick notes
+    WebApps, // Zalo, Messenger, Facebook web
+    Notes,   // Quick notes
     Calculator,
     Settings,
 }
@@ -62,7 +62,11 @@ impl SidebarState {
 
     pub fn add_pinned_app(&mut self, name: String, url: String, icon_name: String) {
         if !self.pinned_apps.iter().any(|a| a.url == url) {
-            self.pinned_apps.push(PinnedApp { name, url, icon_name });
+            self.pinned_apps.push(PinnedApp {
+                name,
+                url,
+                icon_name,
+            });
         }
     }
 }

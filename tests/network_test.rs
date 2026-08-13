@@ -5,6 +5,7 @@ use std::collections::HashMap;
 fn make_fetch_result(body: &str, url: &str) -> FetchResult {
     FetchResult {
         body: body.to_string(),
+        binary_body: None,
         url: url.to_string(),
         status_code: 200,
         content_type: "text/html".to_string(),

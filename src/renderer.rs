@@ -1,5 +1,3 @@
-
-
 use super::parser::Element;
 
 pub fn render_to_string(element: &Element) -> String {

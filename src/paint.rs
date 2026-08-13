@@ -1,6 +1,5 @@
 // Display list painter: layout tree to render commands
 
-
 use crate::layout::{effective_font_size, wrap_text, DisplayType, LayoutNode};
 
 /// Plain RGBA color (0.0 - 1.0), independent from any GUI framework
@@ -10,6 +9,41 @@ pub struct Rgba {
     pub g: f32,
     pub b: f32,
     pub a: f32,
+}
+
+/// Multiply a color's alpha by `factor` (for CSS opacity composition).
+fn mul_alpha(color: Rgba, factor: f32) -> Rgba {
+    Rgba {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+        a: (color.a * factor).clamp(0.0, 1.0),
+    }
+}
+
+/// Apply the clip box to a rectangle. `clip = None` means "no clipping" and
+/// the box passes through unchanged; `None` is returned only when the box
+/// is fully outside an ACTIVE clip (item dropped).
+fn clipped_rect(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    clip: Option<(f32, f32, f32, f32)>,
+) -> Option<(f32, f32, f32, f32)> {
+    let (cx, cy, cw, ch) = match clip {
+        Some(c) => c,
+        None => return Some((x, y, w, h)),
+    };
+    let nx = x.max(cx);
+    let ny = y.max(cy);
+    let nx2 = (x + w).min(cx + cw);
+    let ny2 = (y + h).min(cy + ch);
+    if nx2 <= nx || ny2 <= ny {
+        None
+    } else {
+        Some((nx, ny, nx2 - nx, ny2 - ny))
+    }
 }
 
 impl Rgba {
@@ -65,6 +99,40 @@ pub enum DisplayItem {
         alt: String,
         cached: bool,
     },
+    /// A pending image that hasn't been loaded yet (lazy loading).
+    /// Shows a placeholder box until the image is fetched.
+    PendingImage {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        url: String,
+        alt: String,
+    },
+    /// A Canvas 2D or SVG vector shape drawn by the page (Phase 21). The
+    /// position is document-relative; the GUI rasterizes the shape.
+    VectorShape(VectorShape),
+}
+
+/// A page-drawn vector shape with fill and/or stroke.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorShape {
+    pub kind: VectorShapeKind,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub fill: Option<Rgba>,
+    pub stroke: Option<Rgba>,
+    pub stroke_width: f32,
+}
+
+/// Geometric kind of a page-drawn vector shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VectorShapeKind {
+    Rect,
+    Ellipse,
+    Line,
 }
 
 /// A clickable link region (hit-tested on mouse click)
@@ -115,7 +183,9 @@ impl DisplayList {
                 DisplayItem::Rect { y, h, .. } => (y + h) >= min_y && *y <= max_y,
                 DisplayItem::Border { y, h, .. } => (y + h) >= min_y && *y <= max_y,
                 DisplayItem::Image { y, h, .. } => (y + h) >= min_y && *y <= max_y,
+                DisplayItem::PendingImage { y, h, .. } => (y + h) >= min_y && *y <= max_y,
                 DisplayItem::TextRun { y, size, .. } => (y + size) >= min_y && *y <= max_y,
+                DisplayItem::VectorShape(shape) => (shape.y + shape.h) >= min_y && shape.y <= max_y,
             })
             .cloned()
             .collect();
@@ -138,6 +208,26 @@ struct PaintContext {
     italic: bool,
     link: bool,
     monospace: bool,
+    /// CSS opacity multiplier, accumulated down the tree (parent × node).
+    opacity: f32,
+    /// Clip box (x, y, w, h) in document px, from `overflow: hidden`
+    /// ancestors. `None` = no clipping.
+    clip: Option<(f32, f32, f32, f32)>,
+}
+
+/// True when the node has an explicit (fixed) box height from CSS, so
+/// `overflow: hidden` can actually clip overflowing children.
+fn has_fixed_size(style: &crate::css_parser::ComputedStyle) -> bool {
+    style.height.is_some()
+}
+
+/// True when the computed style clips overflowing content (`overflow: hidden`).
+fn clips_overflow(style: &crate::css_parser::ComputedStyle) -> bool {
+    style
+        .overflow
+        .as_deref()
+        .map(|o| o == "hidden")
+        .unwrap_or(false)
 }
 
 /// Build the display list for a laid-out page.
@@ -177,6 +267,8 @@ pub fn build_display_list_with_cache(
         italic: false,
         link: false,
         monospace: false,
+        opacity: 1.0,
+        clip: None,
     };
     paint_node(root, ctx, &mut list, image_cache);
 
@@ -226,6 +318,51 @@ fn paint_node(
     let tag = node.element.tag.as_str();
     let font_size = effective_font_size(&node.computed_style, tag, parent.font_size);
 
+    // CSS opacity composes down the tree (parent × own). Only items emitted
+    // below (background, text, images) need alpha adjustment — children
+    // multiply further in their own frame.
+    let own_opacity = node
+        .computed_style
+        .opacity
+        .map(|o| o.clamp(0.0, 1.0) as f32)
+        .unwrap_or(1.0);
+    let opacity = parent.opacity * own_opacity;
+
+    // overflow:hidden with a fixed size clips children to this node's border
+    // box — intersect with any ancestor clip.
+    let clip = if clips_overflow(&node.computed_style) && has_fixed_size(&node.computed_style) {
+        let own = (
+            node.rect.x as f32,
+            node.rect.y as f32,
+            node.rect.outer_width() as f32,
+            node.rect.outer_height() as f32,
+        );
+        match parent.clip {
+            Some(p) => Some((
+                own.0.max(p.0),
+                own.1.max(p.1),
+                (own.0 + own.2).min(p.0 + p.2) - own.0.max(p.0),
+                (own.1 + own.3).min(p.1 + p.3) - own.1.max(p.1),
+            )),
+            None => Some(own),
+        }
+    } else {
+        parent.clip
+    };
+    // A node whose own box is already fully outside the clip emits nothing
+    // (and neither do its children).
+    if clipped_rect(
+        node.rect.x as f32,
+        node.rect.y as f32,
+        node.rect.outer_width() as f32,
+        node.rect.outer_height() as f32,
+        clip,
+    )
+    .is_none()
+    {
+        return;
+    }
+
     // Resolve inherited text properties (UA defaults + CSS)
     let is_link = parent.link || (tag == "a" && node.element.get_attr("href").is_some());
     let bold = parent.bold
@@ -270,13 +407,15 @@ fn paint_node(
             .as_deref()
             .and_then(parse_css_color)
         {
-            list.items.push(DisplayItem::Rect {
-                x,
-                y,
-                w,
-                h,
-                color: bg,
-            });
+            if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
+                list.items.push(DisplayItem::Rect {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                    color: mul_alpha(bg, opacity),
+                });
+            }
         }
     }
 
@@ -300,25 +439,29 @@ fn paint_node(
             .as_deref()
             .and_then(parse_css_color)
             .unwrap_or(color);
-        list.items.push(DisplayItem::Border {
-            x,
-            y,
-            w,
-            h,
-            width: border_width,
-            color: border_color,
-        });
+        if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
+            list.items.push(DisplayItem::Border {
+                x: cx,
+                y: cy,
+                w: cw,
+                h: ch,
+                width: border_width,
+                color: mul_alpha(border_color, opacity),
+            });
+        }
     }
 
     // Horizontal rule renders as a thin divider
     if tag == "hr" {
-        list.items.push(DisplayItem::Rect {
-            x,
-            y: y + h / 2.0,
-            w,
-            h: 1.0,
-            color: Rgba::rgb(0.8, 0.8, 0.8),
-        });
+        if let Some((cx, cy, cw, ch)) = clipped_rect(x, y + h / 2.0, w, 1.0, clip) {
+            list.items.push(DisplayItem::Rect {
+                x: cx,
+                y: cy,
+                w: cw,
+                h: ch,
+                color: mul_alpha(Rgba::rgb(0.8, 0.8, 0.8), opacity),
+            });
+        }
     }
 
     // Text content of this element (direct text only; children paint themselves)
@@ -339,11 +482,16 @@ fn paint_node(
         let lines = wrap_text(&display_text, inner_width, font_size);
         for (i, line) in lines.iter().enumerate() {
             let line_y = content_y + i as f32 * line_height;
+            // TextRuns are line-boxes: drop whole lines fully outside the
+            // clip (glyph-level clipping is not supported).
+            if clipped_rect(content_x, line_y, inner_width as f32, line_height, clip).is_none() {
+                continue;
+            }
             list.items.push(DisplayItem::TextRun {
                 x: content_x,
                 y: line_y,
                 size: font_size as f32,
-                color,
+                color: mul_alpha(color, opacity),
                 content: line.clone(),
                 bold,
                 italic,
@@ -353,31 +501,54 @@ fn paint_node(
         }
     }
 
-    // <img> tag: emit a placeholder or decoded image item
+    // <img> tag: emit a decoded image, or a pending placeholder for lazy loading
     if tag == "img" {
-        let src = node.element.get_attr("src").map(|s| s.to_string()).unwrap_or_default();
+        let src = node
+            .element
+            .get_attr("src")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let alt = node
             .element
             .get_attr("alt")
             .map(|s| s.to_string())
             .unwrap_or_else(|| "image".to_string());
-        let cached = if src.is_empty() {
-            false
-        } else {
-            image_cache
-                .and_then(|c| c.get(&src))
-                .map(|i| i.loaded)
-                .unwrap_or(false)
-        };
-        list.items.push(DisplayItem::Image {
-            x,
-            y,
-            w,
-            h,
-            url: src,
-            alt,
-            cached,
-        });
+
+        if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
+            if src.is_empty() {
+                // No source — render as a broken image placeholder
+                list.items.push(DisplayItem::PendingImage {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                    url: String::new(),
+                    alt: alt.clone(),
+                });
+            } else if image_cache.is_some_and(|c| c.is_decoded(&src)) {
+                // Image is fully decoded and cached — render it
+                list.items.push(DisplayItem::Image {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                    url: src,
+                    alt,
+                    cached: true,
+                });
+            } else {
+                // Image not yet loaded — render as pending (lazy load placeholder)
+                // The UI will trigger actual loading when this becomes visible
+                list.items.push(DisplayItem::PendingImage {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                    url: src,
+                    alt,
+                });
+            }
+        }
     }
 
     // Register the clickable region for links
@@ -402,6 +573,8 @@ fn paint_node(
         italic,
         link: is_link,
         monospace,
+        opacity,
+        clip,
     };
     for child in &node.children {
         paint_node(child, ctx, list, image_cache);
@@ -463,11 +636,21 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
             } else {
                 1.0
             };
+            // Clamp channels to [0,1] (and guard non-finite values): CSS
+            // `rgb(300,0,0)` must clamp, not paint an out-of-range / inf
+            // color that could corrupt the framebuffer.
+            let clamp = |x: f32| -> f32 {
+                if x.is_finite() {
+                    x.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                }
+            };
             return Some(Rgba {
-                r,
-                g,
-                b,
-                a: a.clamp(0.0, 1.0),
+                r: clamp(r),
+                g: clamp(g),
+                b: clamp(b),
+                a: clamp(a),
             });
         }
         return None;
@@ -702,5 +885,65 @@ mod tests {
             )
         });
         assert!(bullet);
+    }
+
+    #[test]
+    fn test_rgb_channels_are_clamped() {
+        let over = parse_css_color("rgb(300, 0, 0)").unwrap();
+        assert_eq!(over.r, 1.0, "channel above 255 must clamp to 1.0");
+        let negative = parse_css_color("rgb(-50, 255, 128)").unwrap();
+        assert_eq!(negative.r, 0.0, "negative channel must clamp to 0.0");
+        let huge = parse_css_color("rgb(1e400, 0, 0)");
+        // 1e400 parses to inf — must NOT produce an inf color (would corrupt
+        // the framebuffer); treat as finite-clamped.
+        if let Some(c) = huge {
+            assert!(c.r.is_finite(), "inf channel must be clamped");
+            assert!(c.r <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_opacity_multiplies_alpha() {
+        // opacity: 0.5 on a colored paragraph → its text color alpha is halved.
+        let list = build(
+            "<html><body><p style=\"color: rgb(255, 0, 0);\">hello world padded</p></body></html>",
+            "p { opacity: 0.5; }",
+        );
+        let run = list
+            .items
+            .iter()
+            .find(|i| matches!(i, DisplayItem::TextRun { .. }))
+            .expect("text run");
+        if let DisplayItem::TextRun { color, .. } = run {
+            assert!(
+                (color.a - 0.5).abs() < 0.01,
+                "opacity 0.5 must halve the text alpha, got {}",
+                color.a
+            );
+        }
+    }
+
+    #[test]
+    fn test_overflow_hidden_clips_children() {
+        // A fixed-height div with overflow:hidden must not emit items from
+        // children positioned below its box.
+        let list = build(
+            r#"<html><body>
+                <div style="height: 40px; overflow: hidden;">
+                    <p style="margin-top: 400px;">way below</p>
+                </div>
+            </body></html>"#,
+            "",
+        );
+        // The clipped paragraph's runs must not appear in the list.
+        let clipped_runs = list
+            .items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::TextRun { content, .. } if content.contains("way below")))
+            .count();
+        assert_eq!(
+            clipped_runs, 0,
+            "content below overflow:hidden must be clipped"
+        );
     }
 }

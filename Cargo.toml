@@ -1,17 +1,49 @@
 [package]
 name = "ghitabrowser"
-version = "1.1.0"
+version = "2.0.0"
 edition = "2021"
-authors = ["You"]
-description = "A Chrome-style lightweight browser written 100% in safe Rust"
-license = "MIT"
+authors = ["GhitaBrowser"]
+description = "A lightweight document-focused browser written in safe Rust"
+license-file = "LICENSE"
+publish = false
+default-run = "ghitabrowser"
+repository = "https://github.com/GhitaBrowser/ghitabrowser"
+readme = "README.md"
+keywords = ["browser", "html", "css", "rust", "windows"]
+categories = ["gui", "web-programming"]
 
 [dependencies]
-# Iced GUI framework - canvas feature powers the real pixel renderer
-iced = { version = "0.12", features = ["tokio", "image", "canvas"] }
+# Iced GUI framework - canvas feature powers the real pixel renderer.
+# default-features=false keeps Iced on its lightweight CPU renderer. The
+# browser-owned retained scene has a separate optional DX12 compute adapter,
+# so UI-toolkit GPU internals are not part of the page compositor contract.
+iced = { version = "0.12", default-features = false, features = ["tokio", "image", "canvas", "system"] }
+
+# Direct access to renderer traits (image::Renderer, geometry::Renderer)
+# used by the custom web-page widget that paints real image pixels.
+iced_core = "0.12"
+
+# Pure-Rust text shaping, system-font discovery/fallback and glyph
+# rasterization. This is the same audited shaping family already used by the
+# UI toolkit, now owned explicitly by the retained page compositor.
+cosmic-text = "0.10"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+
+# Primary non-blocking browser transport. Rustls keeps certificate/TLS policy
+# in the audited Rust dependency graph; HTTP/2 and streaming decompression are
+# enabled without the blocking compatibility client.
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls",
+    "http2",
+    "charset",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "system-proxy",
+] }
 
 # Image handling
 image = "0.24"
@@ -21,14 +53,22 @@ log = "0.4"
 env_logger = "0.11"
 
 # HTTP client - real networking
-ureq = { version = "2.9", features = ["json"] }
+ureq = { version = "2.9", features = ["json", "brotli", "charset"] }
+
+# WHATWG-compatible response charset decoding (ISO-8859-1 labels map to
+# Windows-1252 as required by modern web content processing).
+encoding_rs = "0.8"
 
 # URL parsing
 url = "2.5"
 
-# Serialization for storage persistence
+# Serialization for storage persistence.
+# `unbounded_depth` lifts serde_json's default 128-container recursion limit
+# so DOM snapshots nested deeper than ~40 levels round-trip (each DOM level
+# costs several JSON containers). The deserializer-side depth is bounded
+# separately in tab.rs before decode, so unbounded depth cannot be abused.
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["unbounded_depth"] }
 
 # Date/time for cookies
 chrono = "0.4"
@@ -36,6 +76,49 @@ chrono = "0.4"
 # Utilities
 anyhow = "1.0"
 dirs = "5.0"
+flate2 = "1.0"
+
+# Package authenticity and reproducible content digests. GhitaBrowser owns the
+# canonical package formats and trust policy; these crates only provide the
+# audited Ed25519 and SHA-256 primitives.
+ed25519-dalek = "2.1"
+sha2 = "0.10"
+
+# Strict semantic-version parsing for update selection and downgrade checks.
+semver = "1.0"
+
+# Portable free-space queries used by the transactional updater before any
+# install tree is modified.
+fs2 = "0.4"
+
+# RFC 6455 framing and TLS transport adapter. GhitaBrowser owns the browser
+# policy, origin checks, budgets, queues and JavaScript bindings around it.
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+
+[target.'cfg(windows)'.dependencies]
+# Media Foundation is the primary Windows codec backend. The browser-owned
+# demux/MSE/state-machine layers remain independent of this platform adapter.
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_JobObjects",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Credentials",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+wgpu = { version = "0.19.4", default-features = false, features = ["dx12", "wgsl"] }
+pollster = "1.0.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 
 [build-dependencies]
 winres = "0.1"
@@ -48,3 +131,7 @@ rstest = "0.18"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[[bench]]
+name = "engine_bench"
+harness = false

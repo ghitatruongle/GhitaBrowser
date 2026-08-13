@@ -43,6 +43,37 @@ pub fn search_web(query: &str) -> Result<Vec<SearchResult>, String> {
     Ok(parse_ddg_html(&body))
 }
 
+pub async fn search_web_async(query: &str) -> Result<Vec<SearchResult>, String> {
+    search_web_async_with_cancellation(
+        query,
+        crate::network_scheduler::CancellationToken::default(),
+    )
+    .await
+}
+
+pub async fn search_web_async_with_cancellation(
+    query: &str,
+    cancellation: crate::network_scheduler::CancellationToken,
+) -> Result<Vec<SearchResult>, String> {
+    let encoded: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    let response = crate::network_scheduler::fetch_shared(
+        format!("{}{}", DDG_HTML_URL, encoded),
+        String::new(),
+        1,
+        crate::network_scheduler::RequestPriority::Navigation,
+        crate::network_scheduler::ResponseMode::Document,
+        cancellation,
+    )
+    .await?;
+    if !(200..300).contains(&response.status_code) {
+        return Err(format!(
+            "Search engine returned status {}",
+            response.status_code
+        ));
+    }
+    Ok(parse_ddg_html(&response.body))
+}
+
 /// Parse DuckDuckGo HTML results into structured search results.
 ///
 /// Result markup looks like:

@@ -1,9 +1,20 @@
-
-
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+/// Maximum DOM nesting depth the parser builds. Deeper nesting is flattened
+/// (become siblings) so recursive walks on the UI thread — layout building,
+/// node counting, `Element::drop` — can never overflow the stack on crafted
+/// HTML with hundreds of thousands of nested tags.
+// Layout, paint and drop still contain bounded recursive walks. Keeping the
+// parsed tree below 128 levels prevents hostile markup from exhausting the
+// default worker-thread stack while preserving deeply nested real documents.
+pub const MAX_DOM_DEPTH: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Element {
+    /// Stable identity supplied by the live DOM. Parsed documents leave this
+    /// empty; it is presentation metadata and never serialized as HTML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u64>,
     pub tag: String,
     pub attrs: HashMap<String, String>,
     pub children: Vec<Element>,
@@ -15,6 +26,7 @@ pub struct Element {
 impl Element {
     pub fn new(tag: &str) -> Self {
         Element {
+            node_id: None,
             tag: tag.to_string(),
             attrs: HashMap::new(),
             children: Vec::new(),
@@ -93,7 +105,11 @@ impl Element {
         } else {
             html.push_str(&format!("<{}{}>", self.tag, attrs_str));
             if !self.text.is_empty() {
-                html.push_str(&escape_html(&self.text));
+                if matches!(self.tag.as_str(), "script" | "style") {
+                    html.push_str(&self.text);
+                } else {
+                    html.push_str(&escape_html(&self.text));
+                }
             }
             for child in &self.children {
                 html.push_str(&child.to_html());
@@ -129,67 +145,71 @@ fn chars_match_ci_at(chars: &[char], pos: usize, s: &str) -> bool {
 /// Decode HTML character references
 fn decode_html_entities(text: &str) -> String {
     let mut result = String::new();
+    let mut i = 0;
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
-    let mut i = 0;
 
     while i < len {
         if chars[i] == '&' {
-            let start = i;
-            // Scan for the closing ';' within a bounded window. Unbounded
-            // scanning consumed the rest of the text when no ';' existed
-            // (e.g. "R&D" dropped everything after the '&').
-            let mut j = i + 1;
-            while j < len && chars[j] != ';' && j - start <= 32 {
-                j += 1;
-            }
-            if j < len && chars[j] == ';' && j > start + 1 {
-                let entity: String = chars[start + 1..j].iter().collect();
-                let decoded: String = match entity.as_str() {
-                    "amp" => "&".to_string(),
-                    "lt" => "<".to_string(),
-                    "gt" => ">".to_string(),
-                    "quot" => "\"".to_string(),
-                    "apos" => "'".to_string(),
-                    "nbsp" => " ".to_string(),
-                    "copy" => "©".to_string(),
-                    "reg" => "®".to_string(),
-                    "trade" => "™".to_string(),
-                    _ => {
-                        // Try numeric character reference
-                        if let Some(hex) = entity.strip_prefix("#x") {
-                            if let Ok(codepoint) = u32::from_str_radix(hex, 16) {
-                                if let Some(c) = char::from_u32(codepoint) {
-                                    c.to_string()
+            // Find the closing ';' within a bounded window (max 32 chars).
+            // Unbounded scanning is O(n²) on pages with many '&' and no ';',
+            // and a single huge entity should never be consumed.
+            let scan_end = (i + 33).min(len);
+            let entity_end = chars[i + 1..scan_end]
+                .iter()
+                .position(|&c| c == ';')
+                .map(|j| i + 1 + j);
+
+            if let Some(entity_end) = entity_end {
+                // Only process entities with at least 2 chars before ';'
+                if entity_end - i > 2 {
+                    let entity: String = chars[i + 1..entity_end].iter().collect();
+                    let decoded: String = match entity.as_str() {
+                        "amp" => "&".to_string(),
+                        "lt" => "<".to_string(),
+                        "gt" => ">".to_string(),
+                        "quot" => "\"".to_string(),
+                        "apos" => "'".to_string(),
+                        "nbsp" => " ".to_string(),
+                        "copy" => "©".to_string(),
+                        "reg" => "®".to_string(),
+                        "trade" => "™".to_string(),
+                        _ => {
+                            // Try numeric character reference
+                            if let Some(hex) = entity.strip_prefix("#x") {
+                                if let Ok(codepoint) = u32::from_str_radix(hex, 16) {
+                                    if let Some(c) = char::from_u32(codepoint) {
+                                        c.to_string()
+                                    } else {
+                                        format!("&{};", entity)
+                                    }
+                                } else {
+                                    format!("&{};", entity)
+                                }
+                            } else if let Some(dec) = entity.strip_prefix('#') {
+                                if let Ok(codepoint) = dec.parse::<u32>() {
+                                    if let Some(c) = char::from_u32(codepoint) {
+                                        c.to_string()
+                                    } else {
+                                        format!("&{};", entity)
+                                    }
                                 } else {
                                     format!("&{};", entity)
                                 }
                             } else {
                                 format!("&{};", entity)
                             }
-                        } else if let Some(dec) = entity.strip_prefix('#') {
-                            if let Ok(codepoint) = dec.parse::<u32>() {
-                                if let Some(c) = char::from_u32(codepoint) {
-                                    c.to_string()
-                                } else {
-                                    format!("&{};", entity)
-                                }
-                            } else {
-                                format!("&{};", entity)
-                            }
-                        } else {
-                            format!("&{};", entity)
                         }
-                    }
-                };
-                result.push_str(&decoded);
-                i = j + 1; // skip ';'
-            } else {
-                // Unterminated / over-long entity: keep the '&' and move on,
-                // so the following text is preserved.
-                result.push('&');
-                i += 1;
+                    };
+                    result.push_str(&decoded);
+                    i = entity_end + 1; // skip ';'
+                    continue;
+                }
             }
+            // Unterminated / over-long entity: keep the '&' and move on,
+            // so the following text is preserved.
+            result.push('&');
+            i += 1;
         } else {
             result.push(chars[i]);
             i += 1;
@@ -235,7 +255,10 @@ fn is_optional_closing_tag(tag: &str) -> bool {
     )
 }
 
-/// Autoclose mapping: when we encounter an opening tag, some parent tags should auto-close
+/// Autoclose mapping: when we encounter an opening tag, some parent tags
+/// should auto-close (pop) first. Closers pop the ENTIRE consecutive chain
+/// from the top of the stack that matches (so `<p><a><p>` closes both the
+/// `<a>` and the first `<p>`, like real browsers).
 fn should_auto_close_parent(parent_tag: &str, child_tag: &str) -> bool {
     matches!(
         (parent_tag, child_tag),
@@ -260,6 +283,9 @@ fn should_auto_close_parent(parent_tag: &str, child_tag: &str) -> bool {
                 | "nav"
                 | "main"
                 | "aside"
+        ) | (
+            "a" | "span" | "em" | "strong" | "b" | "i" | "u" | "code",
+            "p"
         ) | ("li", "li")
             | ("dt" | "dd", "dt" | "dd")
             | ("option", "option")
@@ -441,14 +467,13 @@ pub fn parse_html(html: &str) -> Element {
                             if pos < len && chars[pos] == quote {
                                 pos += 1;
                             }
-                        } else if pos < len && chars[pos] != '>' && chars[pos] != '/' {
-                            // Unquoted attribute value
+                        } else if pos < len && chars[pos] != '>' {
+                            // Unquoted attribute value. '/' IS allowed here —
+                            // `<a href=/foo>` parses to href="/foo". A '/' is
+                            // only a self-closing marker when it is the last
+                            // char before the '>'.
                             let v_start = pos;
-                            while pos < len
-                                && !chars[pos].is_whitespace()
-                                && chars[pos] != '>'
-                                && chars[pos] != '/'
-                            {
+                            while pos < len && !chars[pos].is_whitespace() && chars[pos] != '>' {
                                 pos += 1;
                             }
                             val = chars[v_start..pos].iter().collect();
@@ -464,8 +489,17 @@ pub fn parse_html(html: &str) -> Element {
 
                 let mut is_self_closing = false;
                 if pos < len && chars[pos] == '/' {
-                    is_self_closing = true;
-                    pos += 1;
+                    // '/' is a self-closing marker ONLY when it is the final
+                    // non-whitespace char before the '>'. A '/' inside an
+                    // unquoted value or a trailing attribute is not.
+                    let mut j = pos + 1;
+                    while j < len && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if j < len && chars[j] == '>' {
+                        is_self_closing = true;
+                        pos = j;
+                    }
                 }
                 while pos < len && chars[pos] != '>' {
                     pos += 1;
@@ -477,14 +511,16 @@ pub fn parse_html(html: &str) -> Element {
                 let is_void = is_void_tag(&tag_name);
                 elem.is_void = is_void || is_self_closing;
 
-                // Handle auto-closing of parent tags
-                if !elem.is_void
-                    && stack.len() > 1
-                    && should_auto_close_parent(&stack.last().unwrap().tag, &tag_name)
-                {
-                    let completed = stack.pop().unwrap();
-                    if let Some(parent) = stack.last_mut() {
-                        parent.add_child(completed);
+                // Handle auto-closing of parent tags: pop the whole consecutive chain
+                // that must close (e.g. `<p><a><p>` closes <a> then <p>).
+                if !elem.is_void && stack.len() > 1 {
+                    while stack.len() > 1
+                        && should_auto_close_parent(&stack.last().unwrap().tag, &tag_name)
+                    {
+                        let completed = stack.pop().unwrap();
+                        if let Some(parent) = stack.last_mut() {
+                            parent.add_child(completed);
+                        }
                     }
                 }
 
@@ -530,6 +566,14 @@ pub fn parse_html(html: &str) -> Element {
                         }
                     }
 
+                    if let Some(parent) = stack.last_mut() {
+                        parent.add_child(elem);
+                    }
+                } else if stack.len() + 1 > MAX_DOM_DEPTH {
+                    // Depth cap: beyond MAX_DOM_DEPTH the tree is flattened
+                    // instead of nested, so recursive walks (layout,
+                    // count_elements, Element::drop) can never overflow the
+                    // stack on crafted, extremely nested HTML.
                     if let Some(parent) = stack.last_mut() {
                         parent.add_child(elem);
                     }
@@ -755,5 +799,86 @@ mod tests {
         let html = "<textarea>a &amp; b</textarea>";
         let dom = parse_html(html);
         assert_eq!(dom.find_tag("textarea").unwrap().text, "a & b");
+    }
+
+    #[test]
+    fn test_parse_depth_is_capped() {
+        // 100k nested divs used to crash the renderer later (recursive walks,
+        // Element::drop). The parser must flatten beyond MAX_DOM_DEPTH.
+        let html = format!("<html><body>{}</body></html>", "<div>".repeat(100_000));
+        let dom = parse_html(&html);
+
+        // Walk iteratively and assert the tree depth never exceeds the cap.
+        let mut stack: Vec<(usize, &Element)> = vec![(0, &dom)];
+        let mut max_depth = 0usize;
+        let mut visited = 0usize;
+        while let Some((d, el)) = stack.pop() {
+            visited += 1;
+            max_depth = max_depth.max(d);
+            for c in &el.children {
+                stack.push((d + 1, c));
+            }
+        }
+        assert!(visited > 10_000, "parser should still build many nodes");
+        assert!(
+            max_depth <= MAX_DOM_DEPTH,
+            "DOM depth {} exceeds cap {}",
+            max_depth,
+            MAX_DOM_DEPTH
+        );
+    }
+
+    #[test]
+    fn test_unquoted_attribute_with_slash() {
+        // `<a href=/foo>` must parse href="/foo" — the '/' is part of the
+        // value, not a self-closing marker.
+        let html = "<a href=/foo>text</a>";
+        let dom = parse_html(html);
+        let a = dom.find_tag("a").unwrap();
+        assert_eq!(a.get_attr("href").map(|s| s.as_str()), Some("/foo"));
+        assert!(!a.is_void, "<a href=/foo> must not be self-closing");
+        assert_eq!(a.text, "text", "text after the tag must not be swallowed");
+    }
+
+    #[test]
+    fn test_unquoted_attr_with_trailing_slash_not_self_closing() {
+        // `<a href=/foo/>` → href="/foo/" and NOT self-closing
+        let html = "<a href=/foo/>bar</a>";
+        let dom = parse_html(html);
+        let a = dom.find_tag("a").unwrap();
+        assert_eq!(a.get_attr("href").map(|s| s.as_str()), Some("/foo/"));
+        assert!(!a.is_void);
+        assert_eq!(a.text, "bar");
+    }
+
+    #[test]
+    fn test_self_closing_slash_must_precede_gt() {
+        // `<div class=x />` IS self-closing (slash directly before '>')
+        let html = "<div class=\"x\" />tail";
+        let dom = parse_html(html);
+        let div = dom.find_tag("div").unwrap();
+        assert!(div.is_void);
+    }
+
+    #[test]
+    fn test_p_auto_close_closes_inline_chain() {
+        // <p><a>x<p> — the second <p> closes the <a> AND the first <p> so
+        // the two paragraphs are siblings, not nested.
+        let html = "<p>one<a>two<p>three</p>";
+        let dom = parse_html(html);
+        let ps = dom.find_all_tags("p");
+        assert_eq!(ps.len(), 2, "expected two sibling <p> elements");
+        let p1 = &ps[0];
+        assert_eq!(p1.text, "one");
+        // The <a> must belong to the first <p>
+        assert!(p1.find_tag("a").is_some());
+        // The second <p> must be a sibling of the first (not nested inside)
+        let p1_parent_tag = dom
+            .find_tag("p")
+            .and_then(|_| ps[0].find_tag("a"))
+            .map(|a| a.text.as_str());
+        assert_eq!(p1_parent_tag, Some("two"));
+        let p2 = &ps[1];
+        assert_eq!(p2.text, "three");
     }
 }

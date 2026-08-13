@@ -1,6 +1,5 @@
 // Browser storage and cookie jar
 
-
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -102,7 +101,12 @@ impl Cookie {
                             if secs <= 0 {
                                 expires = Some(0); // expires immediately (deletion)
                             } else {
-                                expires = Some(chrono::Utc::now().timestamp() + secs);
+                                // Guard against i64 overflow: a bogus huge
+                                // Max-Age (e.g. 9223372036854775807) used to
+                                // wrap/panic `now + secs`. Cap at ~100 years.
+                                let now = chrono::Utc::now().timestamp();
+                                let capped = secs.min(100 * 365 * 24 * 60 * 60);
+                                expires = Some(now.saturating_add(capped));
                             }
                         }
                     }
@@ -164,6 +168,15 @@ impl Cookie {
             return false;
         }
 
+        // SameSite=Strict: only sent on same-site requests (approximated by
+        // registrable domain equality). Cross-site requests never receive it.
+        // SameSite=Lax (the default) keeps today's behavior.
+        if self.same_site.eq_ignore_ascii_case("strict")
+            && registrable_domain(&host) != registrable_domain(&base)
+        {
+            return false;
+        }
+
         // Path match: the cookie path must be a path-prefix of the request
         // path (RFC 6265), with a '/' boundary unless the cookie path itself
         // ends in '/' (so path "/app" matches "/app/x" but not "/appx").
@@ -206,10 +219,22 @@ fn is_domain_suffix(domain: &str, host: &str) -> bool {
     domain == host || host.ends_with(&format!(".{}", domain))
 }
 
+/// Approximate "registrable domain" (eTLD+1) with a two-label heuristic —
+/// good enough for SameSite checks on the ordinary web without shipping a
+/// public-suffix list. `www.example.co.uk` → `co.uk` here, which errs on
+/// the side of treating those as the same site (acceptable for this check).
+fn registrable_domain(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() <= 2 {
+        return host.to_string();
+    }
+    labels[labels.len() - 2..].join(".")
+}
+
 /// Parse a standard HTTP-date (RFC 7231) such as
 /// "Wed, 21 Oct 2015 07:28:00 GMT". Returns None for unparseable dates so
 /// callers can treat them as absent rather than guessing.
-fn parse_http_date(s: &str) -> Option<i64> {
+pub(crate) fn parse_http_date(s: &str) -> Option<i64> {
     let s = s.trim();
     // RFC 1123 ("Sun, 06 Nov 1994 08:49:37 GMT"), RFC 850
     // ("Sunday, 06-Nov-94 08:49:37 GMT") and asctime forms. HTTP dates are
@@ -246,10 +271,26 @@ impl CookieStore {
         }
     }
 
-    /// Add a cookie to the store
+    /// Add a cookie to the store.
+    /// Enforces a per-domain cap (RFC 6265 §6.1 suggests 180/domain) so a
+    /// hostile server flooding Set-Cookie headers cannot grow the store (and
+    /// the persisted JSON) without bound. Replacing an existing key (same
+    /// name/domain/path) always succeeds.
     pub fn add_cookie(&mut self, cookie: Cookie) {
+        const MAX_COOKIES_PER_DOMAIN: usize = 180;
+        if cookie.name.is_empty() {
+            return;
+        }
         let domain = cookie.domain.clone();
-        self.cookies.entry(domain).or_default().insert(cookie);
+        let entry = self.cookies.entry(domain.clone()).or_default();
+        if !entry.contains(&cookie) && entry.len() >= MAX_COOKIES_PER_DOMAIN {
+            warn!(
+                "Dropping cookie {} for {}: per-domain limit ({}) reached",
+                cookie.name, domain, MAX_COOKIES_PER_DOMAIN
+            );
+            return;
+        }
+        entry.insert(cookie);
     }
 
     /// Get cookies that match the given domain (supports subdomain matching)
@@ -277,6 +318,11 @@ impl CookieStore {
                     }
                 }
             }
+        }
+
+        // Log warning if no cookies found for domain
+        if result.is_empty() && !domain.is_empty() {
+            log::debug!("No cookies found for domain: {}", domain);
         }
 
         result
@@ -318,6 +364,25 @@ impl CookieStore {
     }
 }
 
+/// Build the `Cookie` request header for a URL from the store, with full URL
+/// validation per cookie (Secure over https, domain/path match,
+/// SameSite=Strict). Used by the GUI fetch path to avoid deep-cloning the
+/// whole jar into the blocking task.
+pub fn cookie_header_for(store: &CookieStore, url: &str) -> String {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return String::new(),
+    };
+    let domain = parsed.host_str().unwrap_or("");
+    store
+        .get_cookies(domain)
+        .iter()
+        .filter(|c| c.matches_url(url))
+        .map(|c| c.to_header_value())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Persistent key-value storage (localStorage equivalent)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalStorage {
@@ -326,6 +391,10 @@ pub struct LocalStorage {
     #[serde(default)]
     created_at: i64,
 }
+
+/// Quota equivalent to browsers' ~5 MB per origin for localStorage. A page
+/// must not be able to fill unbounded RAM + the persisted JSON on disk.
+const LOCAL_STORAGE_QUOTA: usize = 5 * 1024 * 1024;
 
 impl LocalStorage {
     pub fn new(origin: &str) -> Self {
@@ -341,9 +410,25 @@ impl LocalStorage {
         self.data.get(key)
     }
 
-    /// Set a key-value pair
-    pub fn set(&mut self, key: &str, value: &str) {
+    /// Current total bytes stored (UTF-8 length of keys + values).
+    pub fn total_bytes(&self) -> usize {
+        self.data.iter().map(|(k, v)| k.len() + v.len()).sum()
+    }
+
+    /// Set a key-value pair. Returns false when the write would push the
+    /// origin past its quota (replacing an existing key only charges the
+    /// delta; the write is refused entirely rather than partially applied).
+    pub fn set(&mut self, key: &str, value: &str) -> bool {
+        let old = self.data.get(key).map(|v| v.len()).unwrap_or(0);
+        if self.total_bytes() + key.len() + value.len() - old > LOCAL_STORAGE_QUOTA {
+            warn!(
+                "localStorage quota exceeded for origin {} ({} bytes)",
+                self.origin, LOCAL_STORAGE_QUOTA
+            );
+            return false;
+        }
         self.data.insert(key.to_string(), value.to_string());
+        true
     }
 
     /// Remove a key
@@ -410,6 +495,30 @@ pub struct DownloadRecord {
     pub success: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserSession {
+    pub active_index: usize,
+    pub tabs: Vec<SessionTab>,
+    pub groups: Vec<SessionTabGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTab {
+    pub url: String,
+    pub title: String,
+    pub pinned: bool,
+    pub muted: bool,
+    pub group_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTabGroup {
+    pub id: u64,
+    pub name: String,
+    pub color: String,
+    pub collapsed: bool,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -436,9 +545,27 @@ pub struct BrowserSettings {
     /// AdBlock & Tracker Blocker enabled (Cốc Cốc feature)
     #[serde(default = "default_true")]
     pub adblock_enabled: bool,
+    /// Sites where request and cosmetic filtering are explicitly disabled.
+    #[serde(default)]
+    pub adblock_disabled_domains: HashSet<String>,
+    /// Hide conservative, project-authored advertisement placeholders.
+    #[serde(default = "default_true")]
+    pub adblock_cosmetic_filtering: bool,
     /// Tab Memory Saver / Sleeping tabs enabled (Chrome feature)
     #[serde(default = "default_true")]
     pub tab_memory_saver: bool,
+    /// Inactivity threshold in minutes before a tab is put to sleep (0 = never).
+    /// Default 5 minutes, matching Chrome's Memory Saver default.
+    #[serde(default)]
+    pub memory_saver_threshold_minutes: u32,
+    /// Memory pressure threshold in MB. When estimated browser memory exceeds this,
+    /// the least important tab is discarded. 0 = disabled. Default 500 MB.
+    #[serde(default)]
+    pub memory_pressure_threshold_mb: u32,
+    /// Image cache capacity in MB. Default 50 MB. Images are evicted using
+    /// LRU (Least Recently Used) when this limit is reached.
+    #[serde(default)]
+    pub image_cache_capacity_mb: u32,
     /// Custom NewTab wallpaper (Chrome feature)
     #[serde(default)]
     pub custom_wallpaper_url: Option<String>,
@@ -455,7 +582,12 @@ impl Default for BrowserSettings {
             pixel_rendering: true,
             vertical_tabs: false,
             adblock_enabled: true,
+            adblock_disabled_domains: HashSet::new(),
+            adblock_cosmetic_filtering: true,
             tab_memory_saver: true,
+            memory_saver_threshold_minutes: 5,
+            memory_pressure_threshold_mb: 500,
+            image_cache_capacity_mb: 30,
             custom_wallpaper_url: None,
         }
     }
@@ -464,17 +596,35 @@ impl Default for BrowserSettings {
 /// Combined storage state for serialization
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StorageState {
+    #[serde(default = "legacy_storage_schema")]
+    schema_version: u32,
     version: String,
     cookies: HashMap<String, HashSet<Cookie>>,
     local_storage: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
     bookmarks: Vec<Bookmark>,
+    #[serde(default = "default_bookmark_root")]
+    bookmark_tree: crate::bookmarks::BookmarkItem,
     #[serde(default)]
     history: Vec<HistoryRecord>,
     #[serde(default)]
     downloads: Vec<DownloadRecord>,
     #[serde(default)]
     settings: BrowserSettings,
+    #[serde(default)]
+    session: BrowserSession,
+    #[serde(default)]
+    permissions: crate::permissions::PermissionStore,
+}
+
+const STORAGE_SCHEMA_VERSION: u32 = 3;
+
+fn default_bookmark_root() -> crate::bookmarks::BookmarkItem {
+    crate::bookmarks::BookmarksManager::new().root
+}
+
+fn legacy_storage_schema() -> u32 {
+    1
 }
 
 /// Combined storage manager (cookies + localStorage + bookmarks + history + downloads + settings)
@@ -482,6 +632,7 @@ pub struct StorageManager {
     cookies: CookieStore,
     local_storage: HashMap<String, LocalStorage>, // Origin -> LocalStorage
     bookmarks: Vec<Bookmark>,
+    bookmark_tree: crate::bookmarks::BookmarksManager,
     /// Global browsing history, newest first
     history: Vec<HistoryRecord>,
     /// Download records, newest first
@@ -489,6 +640,8 @@ pub struct StorageManager {
     /// User settings (theme, search engine, homepage...)
     pub settings: BrowserSettings,
     storage_dir: Option<PathBuf>,
+    session: BrowserSession,
+    permissions: crate::permissions::PermissionStore,
 }
 
 impl Default for StorageManager {
@@ -500,28 +653,41 @@ impl Default for StorageManager {
 impl StorageManager {
     pub fn new() -> Self {
         let storage_dir = if cfg!(test) {
-            // Use a temp directory during tests to avoid cross-test leaks
-            let tmp =
-                std::env::temp_dir().join(format!("ghitabrowser_test_{}", std::process::id()));
-            Some(tmp)
+            // Unit tests are in-memory unless a test explicitly supplies an
+            // isolated directory. This prevents Drop::save from leaving test
+            // profiles on the developer's machine.
+            None
         } else {
             dirs::data_local_dir()
                 .map(|p| p.join("GhitaBrowser"))
                 .or_else(|| Some(PathBuf::from("./.ghitabrowser_data")))
         };
 
+        Self::from_storage_dir(storage_dir, true)
+    }
+
+    /// Create a storage manager that never reads or writes a profile.
+    pub fn in_memory() -> Self {
+        Self::from_storage_dir(None, false)
+    }
+
+    fn from_storage_dir(storage_dir: Option<PathBuf>, load_existing: bool) -> Self {
         let mut mgr = Self {
             cookies: CookieStore::new(),
             local_storage: HashMap::new(),
             bookmarks: Vec::new(),
+            bookmark_tree: crate::bookmarks::BookmarksManager::new(),
             history: Vec::new(),
             downloads: Vec::new(),
             settings: BrowserSettings::default(),
             storage_dir,
+            session: BrowserSession::default(),
+            permissions: crate::permissions::PermissionStore::new(),
         };
 
-        // Auto-load saved data
-        mgr.load();
+        if load_existing {
+            mgr.load();
+        }
         mgr.cookies.clean_expired();
 
         mgr
@@ -580,29 +746,53 @@ impl StorageManager {
             .collect();
 
         let state = StorageState {
+            schema_version: STORAGE_SCHEMA_VERSION,
             version: crate::VERSION.to_string(),
             cookies: self.cookies.cookies.clone(),
             local_storage: ls_map,
             bookmarks: self.bookmarks.clone(),
+            bookmark_tree: self.bookmark_tree.root.clone(),
             history: self.history.clone(),
             downloads: self.downloads.clone(),
             settings: self.settings.clone(),
+            session: self.session.clone(),
+            permissions: self.permissions.clone(),
         };
 
-        // Rotate the previous file to a backup so a corrupt save can be
-        // recovered (see load()).
-        if path.exists() {
-            let backup = path.with_extension("json.bak");
-            if let Err(e) = std::fs::copy(&path, &backup) {
-                error!("Failed to create storage backup: {}", e);
-            }
-        }
-
         match serde_json::to_string_pretty(&state) {
-            Ok(json) => match std::fs::write(&path, json) {
-                Ok(_) => info!("Storage saved to {:?}", path),
-                Err(e) => error!("Failed to save storage: {}", e),
-            },
+            Ok(json) => {
+                let temporary = path.with_extension("json.tmp");
+                let backup = path.with_extension("json.bak");
+                let write_result = (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create(&temporary)?;
+                    file.write_all(json.as_bytes())?;
+                    file.sync_all()?;
+
+                    if path.exists() {
+                        if backup.exists() {
+                            std::fs::remove_file(&backup)?;
+                        }
+                        std::fs::rename(&path, &backup)?;
+                    }
+
+                    if let Err(error) = std::fs::rename(&temporary, &path) {
+                        if backup.exists() && !path.exists() {
+                            let _ = std::fs::rename(&backup, &path);
+                        }
+                        return Err(error);
+                    }
+                    Ok(())
+                })();
+
+                match write_result {
+                    Ok(()) => info!("Storage saved to {:?}", path),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&temporary);
+                        error!("Failed to save storage transactionally: {}", e);
+                    }
+                }
+            }
             Err(e) => error!("Failed to serialize storage: {}", e),
         }
     }
@@ -610,7 +800,8 @@ impl StorageManager {
     /// Read and parse a storage file, returning None if unreadable or corrupt
     fn read_state(path: &std::path::Path) -> Option<StorageState> {
         let json = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str::<StorageState>(&json).ok()
+        let state = serde_json::from_str::<StorageState>(&json).ok()?;
+        (state.schema_version <= STORAGE_SCHEMA_VERSION).then_some(state)
     }
 
     /// Apply a decoded state into this manager
@@ -628,9 +819,22 @@ impl StorageManager {
 
         // Restore bookmarks, history, downloads and settings
         self.bookmarks = state.bookmarks;
+        self.bookmark_tree = crate::bookmarks::BookmarksManager::from_root(state.bookmark_tree)
+            .unwrap_or_else(|_| crate::bookmarks::BookmarksManager::new());
+        if self.bookmark_tree.root.children.is_empty() {
+            for bookmark in &self.bookmarks {
+                let _ = self.bookmark_tree.add_bookmark(
+                    self.bookmark_tree.root.id,
+                    &bookmark.title,
+                    &bookmark.url,
+                );
+            }
+        }
         self.history = state.history;
         self.downloads = state.downloads;
         self.settings = state.settings;
+        self.session = state.session;
+        self.permissions = state.permissions;
     }
 
     /// Load storage state from persistent file
@@ -673,6 +877,54 @@ impl StorageManager {
         self.storage_dir.as_ref()
     }
 
+    /// Open an isolated named profile below a caller-owned profile root.
+    pub fn for_profile(base_dir: impl AsRef<std::path::Path>, name: &str) -> Result<Self, String> {
+        let name = name.trim();
+        if name.is_empty()
+            || name.len() > 64
+            || !name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '_')
+            })
+        {
+            return Err("Profile name contains unsupported characters".to_string());
+        }
+        Ok(Self::from_storage_dir(
+            Some(base_dir.as_ref().join("Profiles").join(name)),
+            true,
+        ))
+    }
+
+    pub fn session(&self) -> &BrowserSession {
+        &self.session
+    }
+
+    pub fn set_session(&mut self, session: BrowserSession) {
+        self.session = session;
+    }
+
+    pub fn permissions(&self) -> &crate::permissions::PermissionStore {
+        &self.permissions
+    }
+
+    pub fn set_permission(
+        &mut self,
+        origin: &str,
+        permission: crate::permissions::PermissionType,
+        state: crate::permissions::PermissionState,
+    ) -> Result<(), String> {
+        self.permissions.set_permission(origin, permission, state)?;
+        self.save();
+        Ok(())
+    }
+
+    pub fn reset_permissions_for_origin(&mut self, origin: &str) -> bool {
+        let reset = self.permissions.reset_origin(origin);
+        if reset {
+            self.save();
+        }
+        reset
+    }
+
     /// Get total cookies count
     pub fn cookie_count(&self) -> usize {
         self.cookies.len()
@@ -688,11 +940,45 @@ impl StorageManager {
         self.local_storage.keys().cloned().collect()
     }
 
+    /// Clear every persistent localStorage origin.
+    pub fn clear_local_storage(&mut self) {
+        self.local_storage.clear();
+        self.save();
+    }
+
     // ===== Bookmarks =====
 
     /// All bookmarks, in insertion order
     pub fn bookmarks(&self) -> &[Bookmark] {
         &self.bookmarks
+    }
+
+    pub fn bookmark_tree(&self) -> &crate::bookmarks::BookmarkItem {
+        &self.bookmark_tree.root
+    }
+
+    pub fn create_bookmark_folder(&mut self, parent_id: u64, title: &str) -> Result<u64, String> {
+        let id = self.bookmark_tree.create_folder(parent_id, title)?;
+        self.save();
+        Ok(id)
+    }
+
+    pub fn add_bookmark_to_folder(
+        &mut self,
+        parent_id: u64,
+        title: &str,
+        url: &str,
+    ) -> Result<u64, String> {
+        let id = self.bookmark_tree.add_bookmark(parent_id, title, url)?;
+        if !self.bookmarks.iter().any(|bookmark| bookmark.url == url) {
+            self.bookmarks.push(Bookmark {
+                url: url.to_string(),
+                title: title.to_string(),
+                added_at: chrono::Utc::now().timestamp(),
+            });
+        }
+        self.save();
+        Ok(id)
     }
 
     /// Whether a URL is bookmarked
@@ -704,6 +990,7 @@ impl StorageManager {
     pub fn toggle_bookmark(&mut self, url: &str, title: &str) -> bool {
         if self.is_bookmarked(url) {
             self.bookmarks.retain(|b| b.url != url);
+            self.bookmark_tree.remove_url(url);
             false
         } else {
             self.bookmarks.push(Bookmark {
@@ -715,6 +1002,9 @@ impl StorageManager {
                 },
                 added_at: chrono::Utc::now().timestamp(),
             });
+            let _ = self
+                .bookmark_tree
+                .add_bookmark(self.bookmark_tree.root.id, title, url);
             true
         }
     }
@@ -722,6 +1012,7 @@ impl StorageManager {
     /// Remove a bookmark by URL
     pub fn remove_bookmark(&mut self, url: &str) {
         self.bookmarks.retain(|b| b.url != url);
+        self.bookmark_tree.remove_url(url);
     }
 
     // ===== Browsing history =====
@@ -841,8 +1132,8 @@ mod tests {
     #[test]
     fn test_local_storage_basics() {
         let mut ls = LocalStorage::new("https://example.com");
-        ls.set("key1", "value1");
-        ls.set("key2", "value2");
+        assert!(ls.set("key1", "value1"));
+        assert!(ls.set("key2", "value2"));
         assert_eq!(ls.len(), 2);
         assert_eq!(ls.get("key1"), Some(&"value1".to_string()));
 
@@ -851,6 +1142,19 @@ mod tests {
 
         ls.clear();
         assert!(ls.is_empty());
+    }
+
+    #[test]
+    fn test_local_storage_quota() {
+        let mut ls = LocalStorage::new("https://example.com");
+        // Write up to the quota boundary (key part is counted too)
+        let chunk = "x".repeat(LOCAL_STORAGE_QUOTA - 10);
+        assert!(ls.set("big", &chunk));
+        // A write past the quota is refused
+        assert!(!ls.set("more", "data"), "write over quota must be refused");
+        assert!(ls.get("more").is_none());
+        // Replacing an existing key with a smaller value still works
+        assert!(ls.set("big", "small"));
     }
 
     #[test]
@@ -963,6 +1267,50 @@ mod tests {
     }
 
     #[test]
+    fn test_same_site_strict_not_sent_cross_site() {
+        let mut cookie = Cookie::new("s", "1", "example.com", "/");
+        cookie.same_site = "strict".to_string();
+        // Same registrable site (exact and subdomains): allowed
+        assert!(cookie.matches_url("https://example.com/page"));
+        assert!(cookie.matches_url("https://www.example.com/page"));
+        // A host that merely *ends with* the same label sequence count as
+        // cross-site (e.g. shared `.com` label) is rejected by domain match;
+        // SameSite=Strict adds the registrable-domain guard on top.
+        assert!(!cookie.matches_url("https://badexample.com/page"));
+        // Lax (the default) is unaffected: same-domain subhosts still match.
+        let lax = Cookie::new("l", "1", "example.com", "/");
+        assert!(lax.matches_url("https://www.example.com/page"));
+    }
+
+    #[test]
+    fn test_max_age_overflow_is_capped() {
+        // A max-age near i64::MAX must not overflow `now + secs`.
+        let cookie =
+            Cookie::from_set_cookie_header("k=v; Max-Age=9223372036854775807", "example.com");
+        match cookie.expires {
+            Some(ts) => assert!(ts > chrono::Utc::now().timestamp()),
+            None => panic!("huge Max-Age must produce a far-future expiry, not overflow"),
+        }
+    }
+
+    #[test]
+    fn test_cookie_domain_limit_drops_new_cookies() {
+        let mut store = CookieStore::new();
+        // The cap is private; insert more than 180 cookies and verify the
+        // store stays bounded.
+        let mut overflow_dropped = false;
+        for i in 0..200 {
+            let before = store.len();
+            store.add_cookie(Cookie::new(&format!("c{}", i), "1", "example.com", "/"));
+            if store.len() == before {
+                overflow_dropped = true;
+            }
+        }
+        assert!(overflow_dropped, "extra cookies must be dropped at the cap");
+        assert!(store.len() <= 180);
+    }
+
+    #[test]
     fn test_remove_domain_cookies_dot_variants() {
         let mut store = CookieStore::new();
         store.add_cookie(Cookie::new("a", "1", ".example.com", "/"));
@@ -995,13 +1343,17 @@ mod tests {
         let mut store = CookieStore::new();
         store.add_cookie(Cookie::new("sid", "abc", ".example.com", "/"));
         let state = StorageState {
+            schema_version: STORAGE_SCHEMA_VERSION,
             version: crate::VERSION.to_string(),
             cookies: store.cookies,
             local_storage: HashMap::new(),
             bookmarks: Vec::new(),
+            bookmark_tree: default_bookmark_root(),
             history: Vec::new(),
             downloads: Vec::new(),
             settings: BrowserSettings::default(),
+            session: BrowserSession::default(),
+            permissions: crate::permissions::PermissionStore::new(),
         };
         std::fs::write(&backup, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 
@@ -1013,6 +1365,40 @@ mod tests {
         mgr.load();
 
         assert_eq!(mgr.cookie_count(), 1);
+        mgr.storage_dir = None;
+        drop(mgr);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_transactional_save_has_no_temporary_file_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("ghitabrowser_txn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut manager = StorageManager::new();
+        manager.storage_dir = Some(dir.clone());
+        manager
+            .cookies_mut()
+            .add_cookie(Cookie::new("session", "value", "example.com", "/"));
+        manager
+            .local_storage("https://example.com")
+            .set("key", "value");
+        manager.save();
+
+        assert!(dir.join("storage.json").exists());
+        assert!(!dir.join("storage.json.tmp").exists());
+
+        let mut restored = StorageManager::new();
+        restored.storage_dir = Some(dir.clone());
+        restored.load();
+        assert_eq!(restored.cookie_count(), 1);
+        assert_eq!(restored.local_storage_count(), 1);
+
+        restored.clear_local_storage();
+        assert_eq!(restored.local_storage_count(), 0);
+        manager.storage_dir = None;
+        restored.storage_dir = None;
+        drop((manager, restored));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

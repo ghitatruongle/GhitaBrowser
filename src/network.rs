@@ -9,42 +9,63 @@ pub(crate) fn browser_ua() -> String {
     format!("GhitaBrowser/{} (Rust)", crate::VERSION)
 }
 
-/// Cache TTL from the Cache-Control header, falling back to 5 minutes.
+/// Cache TTL from the Cache-Control header, falling back to `Expires` /
+/// `Last-Modified` heuristics, then a 5-minute default.
 /// Returns 0 (do not cache) for no-store/no-cache/private responses, which
 /// the browser must revalidate or never store.
 /// Shared by the headless engine (fetch_with_cache) and the GUI fetch path.
 pub(crate) fn cache_ttl_secs(headers: &HashMap<String, String>) -> u64 {
-    headers
-        .get("cache-control")
-        .and_then(|cc| {
-            let lower = cc.to_ascii_lowercase();
-            // These directives forbid storing/reusing the response
-            if lower.contains("no-store") || lower.contains("no-cache") || lower.contains("private")
-            {
-                return Some(0);
+    let now = chrono::Utc::now().timestamp();
+
+    if let Some(cc) = headers.get("cache-control") {
+        let lower = cc.to_ascii_lowercase();
+        // These directives forbid storing/reusing the response
+        if lower.contains("no-store") || lower.contains("no-cache") || lower.contains("private") {
+            return 0;
+        }
+        if lower.contains("max-age=") {
+            let max_age_str = lower
+                .split("max-age=")
+                .nth(1)
+                .and_then(|v| v.split(|c: char| !c.is_ascii_digit()).next())
+                .unwrap_or("");
+            let max_age_secs = max_age_str.parse::<u64>().unwrap_or_else(|e| {
+                warn!("Invalid max-age value {:?}: {}", max_age_str, e);
+                300
+            });
+            return max_age_secs;
+        }
+    }
+
+    // No Cache-Control: honor `Expires` per RFC 7234 §5.3.
+    if let Some(expires) = headers.get("expires") {
+        if let Some(ts) = crate::storage::parse_http_date(expires) {
+            return (ts - now).max(0) as u64;
+        }
+    }
+
+    // Last-Modified heuristic: old content is likely stable; cache it for a
+    // bounded fraction of its age (capped at 24h) so plain servers without
+    // Cache-Control get conditional revalidation instead of a 5-min default.
+    if let Some(lm) = headers.get("last-modified") {
+        if let Some(ts) = crate::storage::parse_http_date(lm) {
+            let age = (now - ts).max(0);
+            if age > 0 {
+                return (age / 10).clamp(60, 24 * 60 * 60) as u64;
             }
-            if lower.contains("max-age=") {
-                let max_age_str = lower
-                    .split("max-age=")
-                    .nth(1)?
-                    .split(|c: char| !c.is_ascii_digit())
-                    .next()?;
-                let max_age_secs = max_age_str.parse::<u64>().unwrap_or_else(|e| {
-                    warn!("Invalid max-age value {:?}: {}", max_age_str, e);
-                    300
-                });
-                Some(max_age_secs)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(300) // default 5 minutes
+        }
+    }
+
+    300 // default 5 minutes
 }
 
 /// Result of an HTTP fetch operation
 #[derive(Debug, Clone)]
 pub struct FetchResult {
     pub body: String,
+    /// Raw payload for binary documents such as PDF. Text responses keep this
+    /// empty so the body is not retained twice.
+    pub binary_body: Option<Vec<u8>>,
     pub url: String,
     pub status_code: u16,
     pub content_type: String,
@@ -59,11 +80,11 @@ pub fn fetch_url(url_str: &str) -> Result<FetchResult, Box<dyn std::error::Error
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
-        .redirects(5)
+        .redirects(0) // redirects handled manually in execute_fetch
         .user_agent(&browser_ua())
         .build();
 
-    execute_fetch(&agent, url_str, None)
+    execute_fetch(&agent, url_str, None, &[])
 }
 
 /// Fetch with cookie jar integration
@@ -80,14 +101,19 @@ pub fn fetch_with_cookies(
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
-        .redirects(5)
+        .redirects(0) // redirects handled manually in execute_fetch
         .user_agent(&browser_ua())
         .build();
 
-    // Get matching cookies and build Cookie header
+    // Get matching cookies and build Cookie header.
+    // Each cookie must also pass full URL validation: Secure cookies are only
+    // sent over HTTPS and the cookie path must match (RFC 6265 §5.4) — the
+    // domain-only `get_cookies` filter alone would leak Secure cookies over
+    // plain HTTP.
     let matching_cookies = cookie_store.get_cookies(&domain);
     let cookie_header: String = matching_cookies
         .iter()
+        .filter(|c| c.matches_url(url_str))
         .map(|c| c.to_header_value())
         .collect::<Vec<_>>()
         .join("; ");
@@ -95,21 +121,24 @@ pub fn fetch_with_cookies(
     // Execute fetch with or without cookies
     let result = if cookie_header.is_empty() {
         info!("No cookies for domain: {}", domain);
-        execute_fetch(&agent, url_str, None)?
+        execute_fetch(&agent, url_str, None, &[])?
     } else {
         info!(
             "Sending {} cookies for domain: {}",
             matching_cookies.len(),
             domain
         );
-        execute_fetch(&agent, url_str, Some(&cookie_header))?
+        execute_fetch(&agent, url_str, Some(&cookie_header), &[])?
     };
 
     // Parse Set-Cookie headers from response. Attribute them to the host of
     // the FINAL URL (after redirects), so a Set-Cookie sent by the redirect
     // target is not stored under the original host that never sent it.
     let final_domain = match url::Url::parse(&result.url) {
-        Ok(u) => u.host_str().map(|h| h.to_string()).unwrap_or_else(|| domain.clone()),
+        Ok(u) => u
+            .host_str()
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| domain.clone()),
         Err(_) => domain.clone(),
     };
     for set_cookie_val in &result.set_cookie_headers {
@@ -143,26 +172,102 @@ pub fn is_retryable_error(err: &str) -> bool {
             }
         }
     }
-
-    // Pattern: ureq error format - "http: server error" with status in description
-    // Ureq status 5xx errors are retryable (except those that won't recover)
-    if err_lower.contains("server error") || err_lower.contains("bad gateway")
-        || err_lower.contains("service unavailable") || err_lower.contains("gateway timeout") {
+    if err_lower.contains("429") {
         return true;
     }
 
-    // Connection / timeout issues
+    // Pattern: ureq error format - "http: server error" with status in description
+    // Ureq status 5xx errors are retryable (except those that won't recover)
+    if err_lower.contains("server error")
+        || err_lower.contains("bad gateway")
+        || err_lower.contains("service unavailable")
+        || err_lower.contains("gateway timeout")
+    {
+        return true;
+    }
+
+    // Connection / timeout issues. Note: "timeout" covers "timed out" and the
+    // common ureq phrasing; the broad "transport" match was dropped — it also
+    // hit TLS/certificate errors that will never succeed on retry.
     err_lower.contains("timed out")
         || err_lower.contains("timeout")
         || err_lower.contains("connection closed")
         || err_lower.contains("connection reset")
-        || err_lower.contains("connection refused")
-        || err_lower.contains("transport")
+        || err_lower.contains("refused")
 }
 
 /// Fetch with automatic retry for transient errors.
-/// Retries up to `max_retries` times with exponential backoff (1s, 2s, 4s, ...).
-/// Only retries on timeouts, connection issues, and 5xx/408/429 server errors.
+/// Retries up to `max_retries` times with exponential backoff (1s, 2s, 4s...),
+/// capped so a long retry list can't sleep for minutes.
+/// Only retries on timeouts, connection issues, and 408/429/5xx server errors.
+const MAX_BACKOFF_MS: u64 = 30_000;
+
+/// Like `fetch_with_retry`, but sends a pre-built `Cookie` header instead of
+/// borrowing the whole cookie jar. Used by the GUI async path so a navigation
+/// doesn't deep-clone thousands of cookies (and so cookies set by an
+/// in-flight response are visible to the next request, not hidden inside a
+/// stale clone). Set-Cookie headers in the result are applied by the caller.
+pub fn fetch_with_header_and_retry(
+    url_str: &str,
+    cookie_header: &str,
+    max_retries: u32,
+) -> Result<FetchResult, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .redirects(0) // redirects handled manually in execute_fetch
+        .user_agent(&browser_ua())
+        .build();
+
+    fetch_with_agent_and_retry(&agent, url_str, cookie_header, max_retries)
+}
+
+pub(crate) fn fetch_with_agent_and_retry(
+    agent: &ureq::Agent,
+    url_str: &str,
+    cookie_header: &str,
+    max_retries: u32,
+) -> Result<FetchResult, String> {
+    let mut last_error = String::new();
+    let mut backoff_ms = 1000;
+    let header = if cookie_header.is_empty() {
+        None
+    } else {
+        Some(cookie_header)
+    };
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            info!("Retry attempt {}/{} for {}", attempt, max_retries, url_str);
+            std::thread::sleep(std::time::Duration::from_millis(
+                backoff_ms.min(MAX_BACKOFF_MS),
+            ));
+            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+        }
+
+        match execute_fetch(agent, url_str, header, &[]) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                let err_str = e.to_string();
+                last_error = err_str.clone();
+                if !is_retryable_error(&err_str) {
+                    warn!("Non-retryable error for {}: {}", url_str, err_str);
+                    return Err(err_str);
+                }
+                if attempt == max_retries {
+                    warn!(
+                        "Max retries ({}) exceeded for {}: {}",
+                        max_retries, url_str, err_str
+                    );
+                    return Err(err_str);
+                }
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
 pub fn fetch_with_retry(
     url_str: &str,
     cookie_store: &mut crate::storage::CookieStore,
@@ -174,8 +279,10 @@ pub fn fetch_with_retry(
     for attempt in 0..=max_retries {
         if attempt > 0 {
             info!("Retry attempt {}/{} for {}", attempt, max_retries, url_str);
-            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-            backoff_ms *= 2; // Exponential backoff: 1s, 2s, 4s...
+            std::thread::sleep(std::time::Duration::from_millis(
+                backoff_ms.min(MAX_BACKOFF_MS),
+            ));
+            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
         }
 
         match fetch_with_cookies(url_str, cookie_store) {
@@ -185,9 +292,14 @@ pub fn fetch_with_retry(
                 last_error = err_str.clone();
                 if !is_retryable_error(&err_str) {
                     // Non-retryable error, fail immediately
+                    warn!("Non-retryable error for {}: {}", url_str, err_str);
                     return Err(err_str);
                 }
                 if attempt == max_retries {
+                    warn!(
+                        "Max retries ({}) exceeded for {}: {}",
+                        max_retries, url_str, err_str
+                    );
                     return Err(err_str);
                 }
             }
@@ -197,30 +309,67 @@ pub fn fetch_with_retry(
     Err(last_error)
 }
 
-/// Internal: execute the actual HTTP request
+/// Internal: execute the actual HTTP request.
+///
+/// Redirects are followed MANUALLY (the agents are built with `redirects(0)`)
+/// so that `Set-Cookie` headers from EVERY hop survive — ureq's internal
+/// redirect following only exposes the final response, silently dropping
+/// cookies set by intermediate hosts (a real issue for login/session
+/// redirect chains).
 fn execute_fetch(
     agent: &ureq::Agent,
     url_str: &str,
     cookie_header: Option<&str>,
+    extra_headers: &[(&str, &str)],
 ) -> Result<FetchResult, Box<dyn std::error::Error>> {
     let start = Instant::now();
+    const MAX_REDIRECTS: usize = 5;
 
     // Validate and parse URL
-    let parsed = url::Url::parse(url_str)?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("Unsupported URL scheme: {}", scheme).into());
+    let mut current = url_str.to_string();
+    let mut set_cookie_headers: Vec<String> = Vec::new();
+    let mut final_response: Option<ureq::Response> = None;
+
+    for _hop in 0..=MAX_REDIRECTS {
+        let parsed = url::Url::parse(&current)?;
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(format!("Unsupported URL scheme: {}", scheme).into());
+        }
+
+        // Build request with optional cookie header + extra headers
+        let mut request = agent.get(&current);
+        if let Some(cookie_val) = cookie_header {
+            request = request.set("Cookie", cookie_val);
+        }
+        for (k, v) in extra_headers {
+            request = request.set(k, v);
+        }
+        let response = request.call()?;
+
+        // Collect this hop's Set-Cookie headers
+        for cookie_val in response.all("set-cookie") {
+            let trimmed = cookie_val.trim();
+            if !trimmed.is_empty() {
+                set_cookie_headers.push(trimmed.to_string());
+            }
+        }
+
+        // Follow 3xx redirects manually (Location header). Relative
+        // locations resolve against the current hop URL.
+        if let Some(loc) = response.header("location") {
+            let next = url::Url::parse(&current)?.join(loc)?;
+            info!("Redirecting {} -> {}", current, next);
+            current = next.to_string();
+            continue;
+        }
+
+        final_response = Some(response);
+        break;
     }
 
-    info!("Fetching URL: {}", url_str);
-
-    // Build request with optional cookie header
-    let mut request = agent.get(url_str);
-    if let Some(cookie_val) = cookie_header {
-        request = request.set("Cookie", cookie_val);
-    }
-
-    let response = request.call()?;
+    let response = final_response
+        .ok_or_else(|| format!("Too many redirects ({}) for {}", MAX_REDIRECTS, url_str))?;
 
     let status_code = response.status();
     let content_type = response
@@ -228,23 +377,16 @@ fn execute_fetch(
         .unwrap_or("text/html")
         .to_string();
 
-    // Collect all Set-Cookie headers (there can be multiple)
-    let mut set_cookie_headers = Vec::new();
-    for cookie_val in response.all("set-cookie") {
-        let trimmed = cookie_val.trim();
-        if !trimmed.is_empty() {
-            set_cookie_headers.push(trimmed.to_string());
-        }
-    }
-
     // Collect response headers
     let mut headers = HashMap::new();
     for header_name in &[
         "content-type",
+        "content-encoding",
         "content-length",
         "set-cookie",
         "cache-control",
         "last-modified",
+        "vary",
     ] {
         if let Some(val) = response.header(header_name) {
             headers.insert(header_name.to_string(), val.to_string());
@@ -255,26 +397,106 @@ fn execute_fetch(
     // and headers came from a possibly different host than url_str.
     let final_url = response.get_url().to_string();
 
-    // Read body as string
-    let body = response.into_string()?;
+    // Read body as string, capped like the download path. An uncapped read
+    // lets a server allocate gigabytes of RAM in this process (OOM abort).
+    // Read one extra byte so an over-limit response is reported as an error
+    // instead of being silently truncated.
+    use std::io::Read;
+    const MAX_PAGE_BODY: u64 = 50 * 1024 * 1024;
+    let mut bytes: Vec<u8> = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_PAGE_BODY + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PAGE_BODY {
+        return Err("Page exceeds the 50MB body limit".into());
+    }
+    let is_pdf = content_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/pdf"))
+        || final_url.to_ascii_lowercase().ends_with(".pdf");
+    let body_len = bytes.len();
+    let (body, binary_body) = if is_pdf {
+        (String::new(), Some(bytes))
+    } else {
+        (decode_text_response(&bytes, &content_type)?, None)
+    };
     let fetch_time_ms = start.elapsed().as_millis() as u64;
+
+    // Log warning if response body is very large
+    if body_len > 10 * 1024 * 1024 {
+        warn!(
+            "Large response received: {} bytes from {}",
+            body_len, final_url
+        );
+    }
 
     info!(
         "Fetched {} ({} bytes, {} ms, status {})",
-        final_url,
-        body.len(),
-        fetch_time_ms,
-        status_code
+        final_url, body_len, fetch_time_ms, status_code
     );
 
     Ok(FetchResult {
         body,
+        binary_body,
         url: final_url,
         status_code,
         content_type,
         headers,
         fetch_time_ms,
         set_cookie_headers,
+    })
+}
+
+/// Decode an HTTP text response using its declared WHATWG charset. UTF BOMs
+/// take priority; an absent/unknown label first attempts strict UTF-8, then
+/// falls back to Windows-1252 as the compatible legacy web encoding.
+pub(crate) fn decode_text_response(bytes: &[u8], content_type: &str) -> Result<String, String> {
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(rest.to_vec())
+            .map_err(|error| format!("Invalid UTF-8 response body: {error}"));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        if rest.len() % 2 != 0 {
+            return Err("Truncated UTF-16LE response body".to_string());
+        }
+        let units = rest
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+        return String::from_utf16(&units.collect::<Vec<_>>())
+            .map_err(|error| format!("Invalid UTF-16LE response body: {error}"));
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        if rest.len() % 2 != 0 {
+            return Err("Truncated UTF-16BE response body".to_string());
+        }
+        let units = rest
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
+        return String::from_utf16(&units.collect::<Vec<_>>())
+            .map_err(|error| format!("Invalid UTF-16BE response body: {error}"));
+    }
+
+    if let Some(label) = response_charset(content_type) {
+        let encoding = encoding_rs::Encoding::for_label(label.as_bytes())
+            .ok_or_else(|| format!("Unsupported response charset: {label}"))?;
+        let (decoded, _, _) = encoding.decode(bytes);
+        return Ok(decoded.into_owned());
+    }
+    if let Ok(utf8) = std::str::from_utf8(bytes) {
+        return Ok(utf8.to_string());
+    }
+    let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
+    Ok(decoded.into_owned())
+}
+
+fn response_charset(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches(['\'', '"']).to_ascii_lowercase())
     })
 }
 
@@ -343,6 +565,76 @@ pub fn download_url(
     Ok((bytes, file_name, content_type))
 }
 
+/// Download through the shared asynchronous scheduler. Network bytes never
+/// occupy a blocking runtime worker; file-system persistence remains a
+/// separate caller-owned operation.
+pub async fn download_url_async(url_str: &str) -> Result<(Vec<u8>, String, String), String> {
+    let parsed = url::Url::parse(url_str).map_err(|error| error.to_string())?;
+    let response = crate::network_scheduler::fetch_shared(
+        url_str.to_string(),
+        String::new(),
+        1,
+        crate::network_scheduler::RequestPriority::Background,
+        crate::network_scheduler::ResponseMode::Binary,
+        crate::network_scheduler::CancellationToken::default(),
+    )
+    .await?;
+    let bytes = response
+        .binary_body
+        .ok_or_else(|| "Download transport did not return binary data".to_string())?;
+    let mut file_name = response
+        .headers
+        .get("content-disposition")
+        .and_then(|value| value.split("filename=").nth(1))
+        .and_then(|value| value.split(';').next())
+        .map(|value| value.trim().trim_matches('"').trim().to_string())
+        .unwrap_or_default();
+    if file_name.is_empty() {
+        file_name = parsed
+            .path_segments()
+            .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+            .unwrap_or_default()
+            .to_string();
+    }
+    if file_name.is_empty() {
+        file_name = format!("{}.html", parsed.host_str().unwrap_or("download"));
+    }
+    Ok((bytes, file_name, response.content_type))
+}
+
+/// `true` when a response carries a `Vary` header meaning it is served
+/// differently depending on request headers (Cookie, Authorization,
+/// User-Agent, ...). Such responses must never be cached under a bare URL —
+/// a later request from another session/user profile could be served another
+/// user's stateful content (RFC 7234 §4.1).
+pub(crate) fn response_varies(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("vary")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Conditional (If-Modified-Since) revalidation request for cache entries.
+/// Returns the fetched result; callers treat `status_code == 304` as
+/// "not modified — use the cached copy".
+fn fetch_revalidate(
+    url: &str,
+    if_modified_since: &str,
+) -> Result<FetchResult, Box<dyn std::error::Error>> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .redirects(0) // redirects handled manually in execute_fetch
+        .user_agent(&browser_ua())
+        .build();
+    execute_fetch(
+        &agent,
+        url,
+        None,
+        &[("If-Modified-Since", if_modified_since)],
+    )
+}
+
 /// Fetch with caching support - returns cached result if fresh
 /// If cookie_store is provided, integrates cookie jar (inject + parse Set-Cookie)
 pub fn fetch_with_cache(
@@ -357,6 +649,23 @@ pub fn fetch_with_cache(
             let result = cached.result.clone();
             cache.record_hit();
             return Ok(result);
+        }
+
+        // STALE: revalidate with a conditional request when the cached
+        // response carries Last-Modified (RFC 7232). A 304 refreshes the
+        // entry with no re-download; anything else replaces it below.
+        let last_modified = cached.result.headers.get("last-modified").cloned();
+        let cached_result = cached.result.clone();
+        if let Some(lm) = last_modified {
+            info!("Cache STALE for: {} (revalidating)", url);
+            if let Ok(reval) = fetch_revalidate(url, &lm) {
+                if reval.status_code == 304 {
+                    cache.touch(url);
+                    let result = cached_result;
+                    cache.record_hit();
+                    return Ok(result);
+                }
+            }
         } else {
             info!("Cache STALE for: {}", url);
         }
@@ -379,7 +688,10 @@ pub fn fetch_with_cache(
         cache_ttl_secs(&result.headers)
     };
 
-    if ttl > 0 {
+    // RFC 7234 §4.1: responses that vary by request headers must never be
+    // cached under a bare URL — a later request from another session/user
+    // profile could be served another user's stateful content.
+    if ttl > 0 && !response_varies(&result.headers) {
         cache.insert(url, result.clone(), ttl);
     }
 
@@ -397,6 +709,12 @@ pub struct CacheEntry {
 impl CacheEntry {
     pub fn is_expired(&self) -> bool {
         self.cached_at.elapsed() > Duration::from_secs(self.ttl_secs)
+    }
+
+    /// Mark the entry as freshly validated (304 response): restart the TTL
+    /// clock without re-downloading the body.
+    pub fn refresh_timestamp(&mut self) {
+        self.cached_at = Instant::now();
     }
 }
 
@@ -475,6 +793,14 @@ impl ResourceCache {
 
     pub fn get(&self, url: &str) -> Option<&CacheEntry> {
         self.entries.get(url)
+    }
+
+    /// Restart the TTL clock for an entry after a successful conditional
+    /// revalidation (304 Not Modified).
+    pub fn touch(&mut self, url: &str) {
+        if let Some(e) = self.entries.get_mut(url) {
+            e.refresh_timestamp();
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -576,6 +902,7 @@ mod tests {
         let url = "https://example.com";
         let fetch_result = FetchResult {
             body: "Hello World!".to_string(),
+            binary_body: None,
             url: url.to_string(),
             status_code: 200,
             content_type: "text/html".to_string(),
@@ -595,6 +922,7 @@ mod tests {
         let url = "https://test.com";
         let fetch_result = FetchResult {
             body: "Test".to_string(),
+            binary_body: None,
             url: url.to_string(),
             status_code: 200,
             content_type: "text/plain".to_string(),
@@ -612,6 +940,7 @@ mod tests {
         let mut cache = ResourceCache::new();
         let fetch_result = FetchResult {
             body: "Data".to_string(),
+            binary_body: None,
             url: "https://x.com".to_string(),
             status_code: 200,
             content_type: "text/plain".to_string(),
@@ -673,6 +1002,7 @@ mod tests {
         let mut cache = ResourceCache::new();
         let err_result = FetchResult {
             body: "Internal Server Error".to_string(),
+            binary_body: None,
             url: "https://e.com".to_string(),
             status_code: 500,
             content_type: "text/html".to_string(),
@@ -725,7 +1055,9 @@ mod tests {
         assert!(!is_retryable_error("status 401 Unauthorized"));
 
         // DNS failures are usually not retryable
-        assert!(!is_retryable_error("Could not resolve host: example.invalid"));
+        assert!(!is_retryable_error(
+            "Could not resolve host: example.invalid"
+        ));
     }
 
     #[test]

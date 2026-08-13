@@ -52,7 +52,11 @@ impl MediaSaver {
         if let Some(m_type) = media_type {
             let item = MediaItem {
                 url: url.to_string(),
-                title: if title.is_empty() { "Web Media".to_string() } else { title.to_string() },
+                title: if title.is_empty() {
+                    "Web Media".to_string()
+                } else {
+                    title.to_string()
+                },
                 media_type: m_type,
                 mime_type: None,
                 file_size_bytes: None,

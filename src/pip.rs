@@ -53,7 +53,10 @@ mod tests {
         let mut pip = PipState::default();
         assert!(!pip.active);
 
-        pip.enable("https://example.com/stream.mp4".to_string(), "Video Title".to_string());
+        pip.enable(
+            "https://example.com/stream.mp4".to_string(),
+            "Video Title".to_string(),
+        );
         assert!(pip.active);
         assert_eq!(pip.title, "Video Title");
 

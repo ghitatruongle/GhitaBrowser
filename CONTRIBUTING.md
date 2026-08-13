@@ -1,62 +1,47 @@
 # Contributing to GhitaBrowser
 
-Welcome! We're excited to have you help build this Rust-native browser. 🦀
+## Development workflow
 
-## 📜 Code of Conduct
+1. Use the Rust toolchain defined in `rust-toolchain.toml`.
+2. Keep changes inside the documented 2.0 product and security boundaries.
+3. Add unit tests for pure logic and integration tests for complete pipelines.
+4. Run the release checks before submitting a change.
 
-Please adhere to the [Rust Code of Conduct](https://www.rust-lang.org/p/code-of-conduct) in all interactions.
+```powershell
+cargo fmt --all -- --check
+cargo check --all-targets --locked
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+```
 
-## 🛠 Getting Started
+Changes affecting parsing, layout, networking, storage or untrusted input should
+also add a bounded/adversarial regression test. Performance-sensitive changes
+should run `cargo bench --locked` and report the before/after result.
 
-1. **Fork** the repository
-2. **Clone** your fork locally
-3. **Create** a new branch for your feature/fix
-4. **Commit** your changes with clear messages
-5. **Push** to your fork
-6. **Open** a Pull Request
+## Code guidelines
 
-## 🎯 Development Guidelines
+- Keep production Rust safe; isolate and justify any future unsafe code.
+- Prefer explicit size, time, depth and count limits for untrusted input.
+- Do not expose a UI control until its end-to-end behavior and failure state are
+  implemented and tested.
+- Keep asynchronous responses bound to the originating tab and navigation
+  sequence.
+- Preserve incognito isolation and avoid persisting private state.
+- Document public APIs and user-visible limitations.
+- Follow the [clean-room policy](docs/clean-room-policy.md): do not inspect,
+  copy, translate or adapt code from another browser engine.
+- Record new standards inputs in
+  [specification provenance](docs/specification-provenance.md).
+- Do not add a dependency until its license and release-artifact notices have
+  been reviewed.
 
-### Coding Standards
+## Pull-request checklist
 
-- All code must be written in **100% Rust** (no C/C++ exceptions unless absolutely necessary)
-- Follow **Rust style guidelines** (`cargo fmt`)
-- Maintain **100% coverage** for new features (unit tests required)
-- Use **`#[allow(...)]` judiciously** - prefer safe alternatives
-- **Document** all public APIs with doc comments
-- Include **examples** where appropriate
+- Formatting, checks, tests and Clippy pass with the locked dependency graph.
+- New behavior has deterministic tests that do not depend on public internet.
+- Documentation, changelog and version metadata are consistent when relevant.
+- No generated `target/` or `dist/` artifact is included.
+- Security-sensitive changes explain their trust boundary and resource limits.
+- The license metadata audit passes: `pwsh ./tools/audit-licenses.ps1`.
 
-### Performance Requirements
-
-- Memory usage must be optimized (avoid unnecessary allocations)
-- Startup time under 100ms achievable
-- Zero-copy paths for critical rendering operations
-
-### Testing
-
-- Write unit tests for all new functions
-- Integration tests for core browser functionality
-- Performance benchmarks for optimization verification
-
-## 🤝 Submitting Changes
-
-1. Fork and create branch: `git checkout -b feature/my-feature`
-2. Commit changes: `git commit -m "Add my feature"`
-3. Push to branch: `git push origin feature/my-feature`
-4. Open Pull Request against `main` branch
-
-### PR Checklist
-
-- [ ] Tests added/updated
-- [ ] Code formatted (`cargo fmt`)
-- [ ] No Clippy warnings (`cargo clippy`)
-- [ ] Documentation updated
-- [ ] Version bump if applicable
-
-## 📞 Need Help?
-
-Join our Discord or open an issue on GitHub! We're happy to help contributors get started.
-
----
-
-*Thank you for helping us build the future of browsers!* 🔥
+Please follow the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).

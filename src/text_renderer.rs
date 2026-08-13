@@ -1,6 +1,5 @@
 // Layout text renderer
 
-
 use super::layout::{DisplayType, LayoutNode};
 
 pub struct TextRenderer {
@@ -29,7 +28,7 @@ impl TextRenderer {
         let space = "  ".repeat(indent);
 
         match node.rect.display {
-            DisplayType::Block | DisplayType::ListItem => {
+            DisplayType::Block | DisplayType::ListItem | DisplayType::Flex | DisplayType::Grid => {
                 let tag_display = if !node.element.tag.is_empty() && node.element.tag != "root" {
                     format!("<{}>", node.element.tag)
                 } else {
@@ -92,7 +91,7 @@ mod tests {
             display: DisplayType::Block,
         };
         let style = crate::css_parser::ComputedStyle::default();
-        let node = LayoutNode::new(elem, rect, style);
+        let node = LayoutNode::new(elem, rect, style, "GhitaBrowser".to_string());
         let out = tr.render_to_text(&node);
         assert!(out.contains("GhitaBrowser"));
     }

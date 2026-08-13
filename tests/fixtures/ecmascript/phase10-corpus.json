@@ -1,0 +1,52 @@
+[
+  {
+    "name": "live closure mutation",
+    "source": "function counter(){let value=0;return ()=>{value=value+1;return value}}let next=counter();next()*10+next()",
+    "expected": { "kind": "number", "value": 12 }
+  },
+  {
+    "name": "nested lexical arrows",
+    "source": "let make=base=>value=>base+value;make(4)(3)",
+    "expected": { "kind": "number", "value": 7 }
+  },
+  {
+    "name": "prototype and array identity",
+    "source": "let proto={base:3};let object=Object.create(proto);object.value=4;let values=[object];values[0].base+values[0].value",
+    "expected": { "kind": "number", "value": 7 }
+  },
+  {
+    "name": "const assignment rejection",
+    "source": "const fixed=4;fixed=5",
+    "expected": { "kind": "error", "contains": "assignment to constant" }
+  },
+  {
+    "name": "exception and finally completion",
+    "source": "let result='';try{throw 'boom'}catch(error){result=error}finally{result=result+'!'}result",
+    "expected": { "kind": "string", "value": "boom!" }
+  },
+  {
+    "name": "for-of break and continue",
+    "source": "let sum=0;for(let item of [1,2,3,4]){if(item==2){continue}if(item==4){break}sum=sum+item}sum",
+    "expected": { "kind": "number", "value": 4 }
+  },
+  {
+    "name": "promise chain assimilation",
+    "source": "Promise.resolve(1).then(value=>value+1).then(value=>Promise.resolve(value+1))",
+    "expected": { "kind": "promise-number", "value": 3 }
+  },
+  {
+    "name": "promise rejection recovery",
+    "source": "Promise.reject('bad').catch(reason=>reason+'!')",
+    "expected": { "kind": "promise-string", "value": "bad!" }
+  },
+  {
+    "name": "async await fulfillment",
+    "source": "let calculate=async value=>await Promise.resolve(value+1);calculate(4)",
+    "expected": { "kind": "promise-number", "value": 5 }
+  },
+  {
+    "name": "logical short circuit",
+    "source": "false&&missing()",
+    "expected": { "kind": "boolean", "value": false }
+  }
+]

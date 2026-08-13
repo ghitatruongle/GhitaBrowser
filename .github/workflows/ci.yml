@@ -2,40 +2,71 @@ name: CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
   pull_request:
-    branches: [ master ]
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  build-and-test:
+  quality:
+    name: Quality and tests
     runs-on: windows-latest
-
+    timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Setup Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: stable
-        components: clippy, rustfmt
-    
-    - name: Cache dependencies
-      uses: Swatinem/rust-cache@v2
-    
-    - name: Check formatting
-      run: cargo fmt --check
-    
-    - name: Build
-      run: cargo build --verbose
-    
-    - name: Run tests
-      run: cargo test --verbose
-    
-    - name: Clippy
-      run: cargo clippy -- -D warnings
-    
-    - name: Build release
-      run: cargo build --release --verbose
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Check every target
+        run: cargo check --all-targets --locked
+      - name: Audit dependency license metadata
+        shell: pwsh
+        run: ./tools/audit-licenses.ps1
+      - name: Audit RustSec vulnerabilities
+        shell: pwsh
+        run: ./tools/audit-rustsec.ps1
+      - name: Test every target
+        run: cargo test --all-targets --locked
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  release:
+    name: Release artifact
+    needs: quality
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Stage portable files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+          Copy-Item target/release/ghitabrowser.exe portable/GhitaBrowser.exe
+          Copy-Item target/release/ghita-renderer-worker.exe portable/
+          Copy-Item icon.ico,LICENSE,README.md,THIRD_PARTY_NOTICES.md portable/
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: GhitaBrowser-v2.0.0-windows-x64
+          path: portable/
+          if-no-files-found: error

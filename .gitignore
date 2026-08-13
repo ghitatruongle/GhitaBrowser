@@ -1,56 +1,124 @@
-# Build
+# ============================================================
+# GhitaBrowser – .gitignore
+# ============================================================
+
+# ── Rust / Cargo ─────────────────────────────────────────────
 /target/
 **/*.rs.bk
 *.bk
+Cargo.lock.bk
+*.rmeta
+*.d
 
-# Binaries
+# ── Distribution & Packaging ────────────────────────────────
+/dist/
+/portable/
 *.exe
+*.msi
+*.zip
+*.tar.gz
+*.sha256
+*.iss.bak
+
+# ── Generated release-gate evidence ─────────────────────────
+# Produced by tools/make-source-manifest.ps1; the tool itself
+# excludes these outputs from the frozen source manifest.
+phase29-freeze.json
+phase29-freeze.json.sha256.txt
+
+# ── Binaries & Native Libraries ─────────────────────────────
 *.dll
 *.so
 *.dylib
 *.pdb
 *.exp
 *.lib
-GhitaBrowser.exe
+*.a
+*.o
+*.obj
 
-# Data & Cache
+# ── Data, Cache & User State ────────────────────────────────
 /user_data/
 /cache/
 /downloads/
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db
+*.db-shm
+*.db-wal
 *.db-journal
 
-# Environment
+# ── Environment & Secrets ───────────────────────────────────
 .env
 .env.*
+!.env.example
 *.pem
 *.key
+*.p12
+*.pfx
 
-# Logs
+# ── Logs & Temporary Files ──────────────────────────────────
 *.log
+*.tmp
+*.temp
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+crash-*.log
 
-# IDE & Editor
+# ── IDE & Editor ────────────────────────────────────────────
 .idea/
+*.iml
 .vscode/
 .vs/
 .zed/
 *.swp
 *.swo
+*~
 *.code-workspace
 *.sln
 *.vcxproj
+*.vcxproj.*
+*.suo
+*.user
 
-# OS
+# ── OS Generated ────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
 ehthumbs.db
+ehthumbs_vista.db
 $RECYCLE.BIN/
+*.lnk
+Icon?
 
-# Tools
+# ── Internal & Private (not for public distribution) ───────
+# AI-agent working/handoff documents and internal design docs.
+AI_HANDOFF/
+docs/
+
+# ── Tools & AI Agents ──────────────────────────────────────
+# Freebuff desktop app state (SQLite user database).
+.freebuff/
 .zcode/
 .history/
+.agents/
+.gemini/
 __pycache__/
+*.pyc
+*.pyo
+sandbox/
+
+# ── Coverage, Profiling & Benchmarks ───────────────────────
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+/target/criterion/
+
+# ── Windows Resource Build Artifacts ───────────────────────
+*.res
+*.rc.bak

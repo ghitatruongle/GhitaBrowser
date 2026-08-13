@@ -50,7 +50,12 @@ impl WebCaptureState {
     }
 
     pub fn set_selection(&mut self, x: f32, y: f32, width: f32, height: f32) {
-        self.selection = Some(RectRegion { x, y, width, height });
+        self.selection = Some(RectRegion {
+            x,
+            y,
+            width,
+            height,
+        });
     }
 
     pub fn finish_capture(&mut self, fake_png_data: Vec<u8>) {

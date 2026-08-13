@@ -43,9 +43,21 @@ impl Default for ReaderSettings {
 
 /// Tags that should never appear in article content
 const BLOCK_TAGS: &[&str] = &[
-    "script", "style", "nav", "header", "footer", "aside",
-    "iframe", "noscript", "form", "button", "input",
-    "advertisement", "social", "comment", "sidebar",
+    "script",
+    "style",
+    "nav",
+    "header",
+    "footer",
+    "aside",
+    "iframe",
+    "noscript",
+    "form",
+    "button",
+    "input",
+    "advertisement",
+    "social",
+    "comment",
+    "sidebar",
 ];
 
 /// Tags that indicate article content containers
@@ -53,11 +65,50 @@ const ARTICLE_TAGS: &[&str] = &["article", "main", "content", "entry", "post"];
 
 /// Tags that are okay to keep in article content
 const CONTENT_TAGS: &[&str] = &[
-    "p", "h1", "h2", "h3", "h4", "h5", "h6",
-    "ul", "ol", "li", "blockquote", "pre", "code",
-    "figure", "figcaption", "img", "a", "strong", "em", "b", "i", "u",
-    "br", "hr", "table", "thead", "tbody", "tr", "th", "td",
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "blockquote",
+    "pre",
+    "code",
+    "figure",
+    "figcaption",
+    "img",
+    "a",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "u",
+    "br",
+    "hr",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "td",
 ];
+
+/// Budgets bounding reader extraction: a hostile/huge page must not produce
+/// unbounded output text or HTML, and traversal stops past a sane node count.
+const MAX_TRAVERSED_NODES: u64 = 100_000;
+const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TEXT_CHARS: usize = 500_000;
+
+/// Running reader-extraction budget.
+struct Budget {
+    nodes: u64,
+    html_bytes: usize,
+    text_chars: usize,
+}
 
 pub struct ReaderModeExtractor;
 
@@ -240,7 +291,10 @@ impl ReaderModeExtractor {
             )
             .to_lowercase();
 
-            if class_id.contains("author") || class_id.contains("byline") || class_id.contains("writer") {
+            if class_id.contains("author")
+                || class_id.contains("byline")
+                || class_id.contains("writer")
+            {
                 let text = div.text_content().trim().to_string();
                 if !text.is_empty() && text.len() < 200 {
                     return Some(text);
@@ -318,19 +372,48 @@ impl ReaderModeExtractor {
     fn clean_article_content(container: &Element) -> (String, String) {
         let mut content_elements: Vec<String> = Vec::new();
         let mut text_parts: Vec<String> = Vec::new();
+        let mut budget = Budget {
+            nodes: 0,
+            html_bytes: 0,
+            text_chars: 0,
+        };
 
-        Self::collect_content(container, &mut content_elements, &mut text_parts);
+        Self::collect_content(
+            container,
+            &mut content_elements,
+            &mut text_parts,
+            &mut budget,
+        );
 
-        let content_html = content_elements.join("\n");
-        let text_content = text_parts.join(" ");
+        let mut content_html = content_elements.join("\n");
+        if content_html.len() > MAX_HTML_BYTES {
+            content_html.truncate(MAX_HTML_BYTES);
+        }
+        let mut text_content = text_parts.join(" ");
+        if text_content.chars().count() > MAX_TEXT_CHARS {
+            text_content = text_content.chars().take(MAX_TEXT_CHARS).collect();
+        }
 
         (content_html, text_content)
     }
 
     /// Recursively collect content elements, skipping unwanted ones.
     /// Always recurses into children to ensure unwanted tags (script, style, etc.)
-    /// are excluded from the collected text.
-    fn collect_content(el: &Element, html_out: &mut Vec<String>, text_out: &mut Vec<String>) {
+    /// are excluded from the collected text. `budget` bounds total traversal
+    /// and output so reader extraction can't blow up on huge pages.
+    fn collect_content(
+        el: &Element,
+        html_out: &mut Vec<String>,
+        text_out: &mut Vec<String>,
+        budget: &mut Budget,
+    ) {
+        // Hard node budget: stop once a page is unreasonably large instead
+        // of O(N²)-style scans over it.
+        budget.nodes += 1;
+        if budget.nodes > MAX_TRAVERSED_NODES || budget.html_bytes > MAX_HTML_BYTES {
+            return;
+        }
+
         let tag_lower = el.tag.to_lowercase();
 
         // Skip unwanted tags entirely (don't recurse into them)
@@ -339,37 +422,86 @@ impl ReaderModeExtractor {
         }
 
         // Skip hidden elements
-        if let Some(style) = el.get_attr("style") {
-            if style.to_lowercase().contains("display: none")
-                || style.to_lowercase().contains("visibility: hidden")
-            {
-                return;
-            }
+        if Self::is_hidden(el) {
+            return;
         }
 
         // If this is a leaf content tag (like <p>, <h1>, etc.), emit and stop
         if CONTENT_TAGS.contains(&tag_lower.as_str()) {
             let html = el.to_html();
-            if !html.trim().is_empty() {
-                html_out.push(html);
+            let html = html.trim();
+            if !html.is_empty() && budget.html_bytes + html.len() <= MAX_HTML_BYTES {
+                html_out.push(html.to_string());
+                budget.html_bytes += html.len();
             }
-            // Use only the immediate text (not recursive) for content tags
-            // because children are already in their own tags
+            // Text: the element's own text, plus children's text (formatting
+            // tags like <strong>/<em> carry no HTML of their own) — text-only
+            // recursion, never re-emitting HTML.
             let text = el.text.trim().to_string();
             if !text.is_empty() {
-                text_out.push(text);
+                budget.text_chars = budget.text_chars.saturating_add(text.chars().count());
+                if budget.text_chars <= MAX_TEXT_CHARS {
+                    text_out.push(text);
+                }
             }
-            // Recurse to capture nested formatting (strong, em, etc.) into text
             for child in &el.children {
-                Self::collect_content(child, html_out, text_out);
+                Self::collect_text_only(child, text_out, budget);
             }
             return;
         }
 
         // For container tags (div, span, section, body, etc.), just recurse
         for child in &el.children {
-            Self::collect_content(child, html_out, text_out);
+            Self::collect_content(child, html_out, text_out, budget);
         }
+    }
+
+    /// Emit only text for a subtree (used under content tags whose children
+    /// are already serialized into the parent's HTML). Hidden/blocked tags
+    /// are skipped, matching `collect_content`.
+    fn collect_text_only(el: &Element, text_out: &mut Vec<String>, budget: &mut Budget) {
+        budget.nodes += 1;
+        if budget.nodes > MAX_TRAVERSED_NODES || budget.text_chars > MAX_TEXT_CHARS {
+            return;
+        }
+        let tag_lower = el.tag.to_lowercase();
+        if BLOCK_TAGS.contains(&tag_lower.as_str()) {
+            return;
+        }
+        if Self::is_hidden(el) {
+            return;
+        }
+        let text = el.text.trim().to_string();
+        if !text.is_empty() {
+            budget.text_chars = budget.text_chars.saturating_add(text.chars().count());
+            if budget.text_chars <= MAX_TEXT_CHARS {
+                text_out.push(text);
+            }
+        }
+        for child in &el.children {
+            Self::collect_text_only(child, text_out, budget);
+        }
+    }
+
+    /// True when an element is hidden by inline style or the hidden/aria-hidden
+    /// attributes. Normalized (whitespace-agnostic) so `display:none` and
+    /// `display: none` are both caught.
+    fn is_hidden(el: &Element) -> bool {
+        if let Some(style) = el.get_attr("style") {
+            let s = style.to_ascii_lowercase().replace(' ', "");
+            if s.contains("display:none") || s.contains("visibility:hidden") {
+                return true;
+            }
+        }
+        if let Some(h) = el.get_attr("hidden") {
+            let h = h.trim();
+            if h.is_empty() || h.eq_ignore_ascii_case("hidden") || h == "true" {
+                return true;
+            }
+        }
+        el.get_attr("aria-hidden")
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     }
 }
 
@@ -413,16 +545,31 @@ mod tests {
         </html>"#;
 
         let article = ReaderModeExtractor::extract(html, "https://example.com/article", "");
-        assert!(article.title.contains("Social Media Title"), "title: {:?}", article.title);
-        assert!(article.byline.as_deref().unwrap_or("").contains("John Doe"), "byline: {:?}", article.byline);
+        assert!(
+            article.title.contains("Social Media Title"),
+            "title: {:?}",
+            article.title
+        );
+        assert!(
+            article.byline.as_deref().unwrap_or("").contains("John Doe"),
+            "byline: {:?}",
+            article.byline
+        );
         // og:site_name should take precedence, fallback to URL host
         // The fallback to URL should work since url_hint is https://example.com/article
         let site = article.site_name.as_deref().unwrap_or("");
-        assert!(!site.is_empty(), "site_name should not be empty, got: {:?}", article.site_name);
+        assert!(
+            !site.is_empty(),
+            "site_name should not be empty, got: {:?}",
+            article.site_name
+        );
         // Check that site_name is either "Example Site" (from meta) or "example.com" (from URL)
         let site_lower = site.to_lowercase();
-        assert!(site_lower.contains("example") || site_lower.contains("site"),
-            "site_name should contain 'example' or 'site', got: {}", site);
+        assert!(
+            site_lower.contains("example") || site_lower.contains("site"),
+            "site_name should contain 'example' or 'site', got: {}",
+            site
+        );
     }
 
     #[test]
@@ -483,6 +630,45 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_formatting_is_not_duplicated() {
+        // <strong>/<em> inside <p> must not be emitted twice (once via <p>'s
+        // own HTML, once via its own content-tag branch).
+        let html = r#"<html><body>
+            <article>
+                <p>Hello <strong>world</strong>!</p>
+            </article>
+        </body></html>"#;
+
+        let article = ReaderModeExtractor::extract(html, "https://test.com", "");
+        let strong_count = article.content_html.match_indices("<strong>").count();
+        assert_eq!(strong_count, 1, "HTML must contain <strong> exactly once");
+        // Text contains the bold word once
+        assert_eq!(
+            article.text_content.matches("world").count(),
+            1,
+            "bold text must appear exactly once in the text"
+        );
+    }
+
+    #[test]
+    fn test_hidden_attribute_and_no_space_style_are_skipped() {
+        let html = r#"<html><body>
+            <article>
+                <p>Visible paragraph</p>
+                <p style="display:none">Hidden by compact style</p>
+                <p hidden>Hidden by attribute</p>
+                <p aria-hidden="true">Hidden by ARIA</p>
+            </article>
+        </body></html>"#;
+
+        let article = ReaderModeExtractor::extract(html, "https://test.com", "");
+        assert!(article.text_content.contains("Visible paragraph"));
+        assert!(!article.text_content.contains("Hidden by compact style"));
+        assert!(!article.text_content.contains("Hidden by attribute"));
+        assert!(!article.text_content.contains("Hidden by ARIA"));
+    }
+
+    #[test]
     fn test_extract_handles_unicode() {
         let html = r#"<html><body>
             <article>
@@ -518,7 +704,7 @@ mod tests {
         let article = ReaderModeExtractor::extract(
             "<html><body><p>x</p></body></html>",
             "https://www.example.com/path",
-            ""
+            "",
         );
         assert!(article.site_name.is_some());
         let site = article.site_name.as_deref().unwrap();
@@ -531,9 +717,12 @@ mod tests {
         let article = ReaderModeExtractor::extract(
             "<html><body><p>x</p></body></html>",
             "not a valid url",
-            ""
+            "",
         );
         // Site name should be None (URL parsing failed)
-        assert!(article.site_name.is_none() || article.site_name.as_deref().map_or(false, |s| !s.is_empty()));
+        assert!(
+            article.site_name.is_none()
+                || article.site_name.as_deref().is_some_and(|s| !s.is_empty())
+        );
     }
 }
