@@ -29,13 +29,55 @@ pub fn prepare_document(
     viewport_width: u32,
     viewport_height: u32,
 ) -> PreparedDocument {
+    prepare_document_impl(
+        html,
+        fallback_title,
+        base_rules,
+        viewport_width,
+        viewport_height,
+        true,
+    )
+}
+
+/// Prepare an inert document for transfer from the isolated renderer worker.
+/// The UI process owns the persistent page runtime, so scripts must not run in
+/// the disposable worker and then run a second time after transfer.
+pub fn prepare_document_static(
+    html: &str,
+    fallback_title: &str,
+    base_rules: &[CssRule],
+    viewport_width: u32,
+    viewport_height: u32,
+) -> PreparedDocument {
+    prepare_document_impl(
+        html,
+        fallback_title,
+        base_rules,
+        viewport_width,
+        viewport_height,
+        false,
+    )
+}
+
+fn prepare_document_impl(
+    html: &str,
+    fallback_title: &str,
+    base_rules: &[CssRule],
+    viewport_width: u32,
+    viewport_height: u32,
+    execute_scripts: bool,
+) -> PreparedDocument {
     let total_start = Instant::now();
 
     let parse_start = Instant::now();
     let mut dom = parser::parse_html(html);
     let parse_time_ms = parse_start.elapsed().as_millis() as u64;
 
-    let runtime = crate::web_runtime::run_inline_scripts(&mut dom, fallback_title);
+    let runtime = if execute_scripts {
+        crate::web_runtime::run_inline_scripts(&mut dom, fallback_title)
+    } else {
+        crate::web_runtime::RuntimeReport::default()
+    };
 
     let title = dom
         .find_tag("title")
@@ -145,6 +187,20 @@ mod tests {
     fn uses_fallback_title_for_untitled_document() {
         let prepared = prepare_document("<p>hello</p>", "https://example.com", &[], 800, 600);
         assert_eq!(prepared.title, "https://example.com");
+    }
+
+    #[test]
+    fn static_preparation_defers_scripts_to_the_persistent_embedder_runtime() {
+        let prepared = prepare_document_static(
+            "<p id='value'>before</p><script>document.getElementById('value').textContent='after'</script>",
+            "https://example.test/",
+            &[],
+            800,
+            600,
+        );
+        assert_eq!(prepared.runtime.scripts_executed, 0);
+        assert!(prepared.rendered_text.contains("before"));
+        assert!(!prepared.rendered_text.contains("after"));
     }
 
     #[test]

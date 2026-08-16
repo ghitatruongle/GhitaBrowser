@@ -1,0 +1,213 @@
+:root {
+  --font-family-base: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Liberation Sans", sans-serif;
+  --background-color-base: #ffffff;
+  --color-base: #202122;
+  --color-subtle: #54595d;
+  --color-link: #3366cc;
+  --color-link-visited: #795cb2;
+  --border-color-base: #a2a9b1;
+  --border-color-subtle: #c8ccd1;
+  --box-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.1);
+  --border-radius-base: 2px;
+  --content-padding: 16px;
+  --sidebar-width: 240px;
+}
+
+@layer reset, base, components, utilities;
+
+@layer base {
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--background-color-base, #ffffff);
+    color: var(--color-base, #202122);
+    font-family: var(--font-family-base);
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    color: #000000;
+    font-family: 'Linux Libertine', 'Georgia', 'Times', serif;
+    line-height: 1.3;
+    margin-top: 1em;
+    margin-bottom: 0.25em;
+  }
+
+  h1.firstHeading {
+    font-size: 1.8em;
+    border-bottom: 1px solid var(--border-color-subtle, #c8ccd1);
+    padding-bottom: 0.25em;
+  }
+
+  p {
+    margin: 0.5em 0 1em 0;
+  }
+
+  a {
+    color: var(--color-link);
+    text-decoration: none;
+  }
+
+  a:hover {
+    text-decoration: underline;
+  }
+
+  a:visited {
+    color: var(--color-link-visited);
+  }
+}
+
+@layer components {
+  .mw-parser-output .infobox {
+    border: 1px solid var(--border-color-base);
+    background-color: #f8f9fa;
+    color: #202122;
+    padding: 0.4em;
+    margin: 0.5em 0 0.5em 1em;
+    float: right;
+    clear: right;
+    width: 22em;
+    font-size: 88%;
+    line-height: 1.5em;
+  }
+
+  .infobox th {
+    text-align: left;
+    padding: 0.2em 0.4em;
+  }
+
+  .infobox td {
+    padding: 0.2em 0.4em;
+  }
+
+  .mw-parser-output table.wikitable {
+    background-color: #ffffff;
+    color: #202122;
+    margin: 1em 0;
+    border: 1px solid var(--border-color-base);
+    border-collapse: collapse;
+  }
+
+  table.wikitable>tr>th,
+  table.wikitable>tr>td,
+  table.wikitable>*>tr>th,
+  table.wikitable>*>tr>td {
+    border: 1px solid var(--border-color-base);
+    padding: 0.3em 0.6em;
+  }
+
+  table.wikitable>tr>th,
+  table.wikitable>*>tr>th {
+    background-color: #eaecf0;
+    text-align: center;
+  }
+
+  .vector-header-container {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background-color: #ffffff;
+    border-bottom: 1px solid var(--border-color-subtle);
+  }
+
+  .vector-menu-portal {
+    margin: 0 0 1.5em 0;
+  }
+
+  .vector-menu-portal .vector-menu-heading {
+    color: var(--color-subtle);
+    font-size: 0.75em;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .toc,
+  .mw-warning,
+  .toccolours {
+    background-color: #f8f9fa;
+    border: 1px solid var(--border-color-subtle);
+    padding: 5px;
+    font-size: 95%;
+  }
+
+  .toc ul {
+    margin: 0.3em 0 0 1.5em;
+    padding: 0;
+    list-style-type: square;
+  }
+
+  .mw-content-container {
+    padding: var(--content-padding);
+    max-width: calc(100vw - var(--sidebar-width));
+  }
+
+  .vector-search-box-input {
+    width: 100%;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid var(--border-color-base);
+    border-radius: var(--border-radius-base);
+    box-sizing: border-box;
+  }
+
+  .vector-search-box-input:focus {
+    border-color: var(--color-link);
+    box-shadow: inset 0 0 0 1px var(--color-link);
+  }
+
+  .vector-search-box-input[disabled] {
+    background-color: #f8f9fa;
+    color: #72777d;
+  }
+
+  .cdx-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    border: 1px solid var(--border-color-base);
+    border-radius: 2px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+
+  .cdx-button:hover:not(:disabled) {
+    background-color: rgba(0, 24, 73, 0.027);
+  }
+
+  .cdx-button--action-progressive {
+    background-color: #3366cc;
+    color: #ffffff !important;
+    border-color: #3366cc;
+  }
+}
+
+@media (max-width: 768px) {
+  .mw-content-container {
+    padding: 8px;
+    max-width: 100vw;
+  }
+
+  .infobox {
+    float: none !important;
+    width: 100% !important;
+    margin: 1em 0 !important;
+  }
+}
+
+@supports (display: grid) {
+  .vector-body-layout {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 16px;
+  }
+}

@@ -1,12 +1,11 @@
-//! Phase 21 conformance: original Test262-style assertions executed against
-//! the expanded ECMAScript surface. These cases are written from the
-//! ECMA-262 specification (the same style contract as the separately
-//! licensed external Test262 checkout: `assert.sameValue` semantics) but are
-//! original — nothing is copied from Test262 or any engine.
-//!
-//! The external Test262 checkout itself remains a separate, ignored gate
-//! (`test262_subset_test.rs`, requires `TEST262_ROOT`); this file records
-//! the bounded original corpus that always runs offline.
+// original Test262-style assertions executed against
+// the expanded ECMAScript surface. These cases are written from the
+// ECMA-262 specification (the same style contract as the separately
+// licensed external Test262 checkout: `assert.sameValue` semantics) but are
+// original — nothing is copied from Test262 or any engine.
+// The external Test262 checkout itself remains a separate, ignored gate
+// (`test262_subset_test.rs`, requires `TEST262_ROOT`); this file records
+// the bounded original corpus that always runs offline.
 
 use ghitabrowser::javascript::JsvEngine;
 
@@ -20,7 +19,6 @@ impl Harness {
             failures: Vec::new(),
         }
     }
-
     /// `assert.sameValue(actual, expected)` semantics: strict equality
     /// between the evaluated result and the expected literal.
     fn same_value(&mut self, script: &str, expected: &str) {

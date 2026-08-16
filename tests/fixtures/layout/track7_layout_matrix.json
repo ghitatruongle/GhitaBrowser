@@ -1,0 +1,67 @@
+{
+  "track": "Track 07 - Layout Formatting Contexts, Text, and Paint",
+  "version": "2.0.5",
+  "features": {
+    "box_model": {
+      "box_sizing": ["content-box", "border-box"],
+      "dimensions": ["width", "height", "min-width", "max-width", "min-height", "max-height"],
+      "margins": ["margin-top", "margin-right", "margin-bottom", "margin-left", "auto-margin-centering"],
+      "padding": ["padding-top", "padding-right", "padding-bottom", "padding-left"],
+      "border": ["border-width", "border-style", "border-color", "border-radius"]
+    },
+    "inline_formatting_context": {
+      "text_wrapping": ["normal", "nowrap", "pre", "pre-wrap"],
+      "word_breaking": ["normal", "break-all", "break-word"],
+      "character_advance": ["latin", "vietnamese", "cjk", "rtl_arabic", "punctuation"],
+      "nested_inline_elements": ["span", "a", "b", "strong", "i", "em", "code", "small", "sub", "sup"],
+      "vertical_metrics": ["line-height", "baseline-alignment"]
+    },
+    "block_formatting_context": {
+      "margin_collapsing": ["adjacent-siblings", "parent-first-child", "parent-last-child"],
+      "floats": ["float-left", "float-right"],
+      "clearance": ["clear-left", "clear-right", "clear-both"],
+      "bfc_establishment": ["flow-root", "overflow-hidden", "flex", "grid", "table-cell"]
+    },
+    "positioning_and_containing_blocks": {
+      "schemes": ["static", "relative", "absolute", "fixed", "sticky"],
+      "offsets": ["top", "right", "bottom", "left", "percentage-resolution"],
+      "containing_blocks": ["nearest-block", "nearest-positioned-ancestor", "viewport", "scroll-container"]
+    },
+    "flexbox_formatting_context": {
+      "direction": ["row", "row-reverse", "column", "column-reverse"],
+      "wrapping": ["nowrap", "wrap", "wrap-reverse"],
+      "justify_content": ["flex-start", "flex-end", "center", "space-between", "space-around", "space-evenly"],
+      "align_items": ["stretch", "flex-start", "flex-end", "center", "baseline"],
+      "item_sizing": ["flex-basis", "flex-grow", "flex-shrink", "min-width-clamping"],
+      "ordering_and_gaps": ["order", "gap", "row-gap", "column-gap"]
+    },
+    "grid_formatting_context": {
+      "templates": ["grid-template-columns", "grid-template-rows", "repeat", "fr-units", "minmax", "auto-tracks"],
+      "placement": ["explicit-span", "grid-column-start-end", "auto-placement"],
+      "alignment_and_gaps": ["gap", "row-gap", "column-gap"]
+    },
+    "table_formatting_context": {
+      "elements": ["table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption"],
+      "column_distribution": ["intrinsic-min-max", "proportional-distribution"],
+      "spanning": ["colspan", "rowspan"],
+      "borders": ["border-collapse", "border-spacing"]
+    },
+    "replaced_elements": {
+      "elements": ["img", "video", "canvas", "svg", "input", "button", "select", "textarea"],
+      "aspect_ratio": ["intrinsic-dimensions", "css-aspect-ratio", "placeholder-reservation"]
+    },
+    "stacking_contexts_and_paint": {
+      "paint_order_phases": [
+        "1. background-and-borders",
+        "2. negative-z-index-children",
+        "3. in-flow-non-inline-blocks",
+        "4. non-positioned-floats",
+        "5. in-flow-inlines-and-text",
+        "6. zero-and-auto-z-positioned",
+        "7. positive-z-index-children"
+      ],
+      "visual_effects": ["border-radius", "box-shadow", "text-decoration", "text-transform", "visibility", "opacity-compounding"],
+      "visible_metrics": ["painted-area-px", "visible-text-chars", "contrast-score", "completeness-score"]
+    }
+  }
+}

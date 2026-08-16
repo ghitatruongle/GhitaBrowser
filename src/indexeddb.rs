@@ -2,15 +2,22 @@
 //! Provides transactional key-value & indexed storage with full rollback support on abort.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub const MAX_DBS_PER_ORIGIN: usize = 64;
 pub const MAX_STORES_PER_DB: usize = 256;
 pub const MAX_INDEXES_PER_STORE: usize = 1024;
 pub const MAX_RECORDS_PER_ORIGIN: usize = 100_000;
 pub const MAX_RECORD_VALUE_BYTES: usize = 2 * 1024 * 1024; // 2 MB per record
+pub const MAX_CURSOR_RESULTS: usize = 10_000;
+pub const MAX_INDEX_SCAN_MATCHES: usize = 100_000;
+pub const MAX_KEY_BYTES: usize = 64 * 1024;
+pub const MAX_OBJECT_STORE_VALUE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_ORIGIN_VALUE_BYTES: usize = 256 * 1024 * 1024;
 
 /// W3C IndexedDB Key type with canonical comparison ordering:
 /// Array > String > Date > Number > Binary.
@@ -97,10 +104,90 @@ pub struct IDBIndexConfig {
     pub multi_entry: bool,
 }
 
+/// Inclusive/exclusive bounds used by deterministic cursor and index scans.
+/// A missing bound is unbounded in that direction.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IDBKeyRange {
+    pub lower: Option<IDBKey>,
+    pub upper: Option<IDBKey>,
+    pub lower_open: bool,
+    pub upper_open: bool,
+}
+
+impl IDBKeyRange {
+    pub fn only(key: IDBKey) -> Self {
+        Self {
+            lower: Some(key.clone()),
+            upper: Some(key),
+            lower_open: false,
+            upper_open: false,
+        }
+    }
+
+    pub fn contains(&self, key: &IDBKey) -> bool {
+        let lower_ok = self.lower.as_ref().is_none_or(|lower| {
+            if self.lower_open {
+                key > lower
+            } else {
+                key >= lower
+            }
+        });
+        let upper_ok = self.upper.as_ref().is_none_or(|upper| {
+            if self.upper_open {
+                key < upper
+            } else {
+                key <= upper
+            }
+        });
+        lower_ok && upper_ok
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IDBCursorDirection {
+    Next,
+    NextUnique,
+    Prev,
+    PrevUnique,
+}
+
+/// Snapshot cursor with deterministic ordering. It intentionally carries
+/// cloned records so a later mutation cannot invalidate a page-visible cursor
+/// or leak an internal borrow across an asynchronous JavaScript turn.
+#[derive(Debug, Clone)]
+pub struct IDBCursor {
+    records: Vec<IDBRecord>,
+    position: usize,
+}
+
+impl IDBCursor {
+    pub fn from_records(records: Vec<IDBRecord>) -> Self {
+        Self {
+            records,
+            position: 0,
+        }
+    }
+
+    pub fn current(&self) -> Option<&IDBRecord> {
+        self.records.get(self.position)
+    }
+
+    pub fn advance(&mut self, count: usize) -> Option<&IDBRecord> {
+        self.position = self.position.saturating_add(count.max(1));
+        self.current()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.records.len().saturating_sub(self.position)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IDBRecord {
     pub key: IDBKey,
-    pub value: String, // JSON payload
+    /// Shared immutable JSON payload. Cursor and transaction snapshots clone
+    /// only this pointer instead of duplicating every record body in RAM.
+    pub value: Arc<str>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -144,12 +231,35 @@ impl IDBObjectStore {
             None => return Err("Key required when autoIncrement is false".to_string()),
         };
 
+        validate_key_budget(&key, 0)?;
+        let previous_bytes = self
+            .records
+            .iter()
+            .find(|record| record.key == key)
+            .map(|record| record.value.len())
+            .unwrap_or(0);
+        let retained_bytes = self
+            .records
+            .iter()
+            .map(|record| record.value.len())
+            .sum::<usize>();
+        let projected_bytes = retained_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(value.len());
+        if projected_bytes > MAX_OBJECT_STORE_VALUE_BYTES {
+            return Err("Object store value-byte budget exceeded".to_string());
+        }
+        if previous_bytes == 0 && self.records.len() >= MAX_RECORDS_PER_ORIGIN {
+            return Err("Object store record budget exceeded".to_string());
+        }
+
+        self.validate_indexes(&key, &value)?;
         if let Some(pos) = self.records.iter().position(|r| r.key == key) {
-            self.records[pos].value = value;
+            self.records[pos].value = Arc::from(value);
         } else {
             self.records.push(IDBRecord {
                 key: key.clone(),
-                value,
+                value: Arc::from(value),
             });
             self.records.sort_by(|a, b| a.key.cmp(&b.key));
         }
@@ -159,12 +269,12 @@ impl IDBObjectStore {
 
     pub fn add(&mut self, key: Option<IDBKey>, value: String) -> Result<IDBKey, String> {
         let actual_key = match &key {
-            Some(k) => k,
-            None if self.auto_increment => &IDBKey::Number(self.auto_increment_counter as f64),
+            Some(k) => k.clone(),
+            None if self.auto_increment => IDBKey::Number(self.auto_increment_counter as f64),
             None => return Err("Key required when autoIncrement is false".to_string()),
         };
 
-        if self.get(actual_key).is_some() {
+        if self.get(&actual_key).is_some() {
             return Err("Key already exists in object store".to_string());
         }
 
@@ -190,15 +300,166 @@ impl IDBObjectStore {
 
     pub fn get_by_index(&self, index_name: &str, index_key: &IDBKey) -> Option<&IDBRecord> {
         let config = self.indexes.get(index_name)?;
-        for record in &self.records {
-            if let Ok(extracted_key) = extract_key_from_json(&record.value, &config.key_path) {
-                if &extracted_key == index_key {
-                    return Some(record);
+        self.records.iter().find(|record| {
+            extract_keys_from_json(&record.value, config)
+                .ok()
+                .is_some_and(|keys| keys.iter().any(|key| key == index_key))
+        })
+    }
+
+    pub fn create_index(&mut self, config: IDBIndexConfig) -> Result<(), String> {
+        if config.name.is_empty() || config.name.len() > 256 || config.key_path.is_empty() {
+            return Err("Index name and key path are required".to_string());
+        }
+        if self.indexes.len() >= MAX_INDEXES_PER_STORE && !self.indexes.contains_key(&config.name) {
+            return Err("Max indexes per object store exceeded".to_string());
+        }
+        if self.indexes.contains_key(&config.name) {
+            return Err(format!("Index '{}' already exists", config.name));
+        }
+        if config.unique {
+            let mut seen = BTreeSet::new();
+            for record in &self.records {
+                for key in extract_keys_from_json(&record.value, &config)? {
+                    if !seen.insert(key) {
+                        return Err(
+                            "ConstraintError: unique index contains duplicate keys".to_string()
+                        );
+                    }
                 }
             }
         }
-        None
+        self.indexes.insert(config.name.clone(), config);
+        Ok(())
     }
+
+    pub fn delete_index(&mut self, name: &str) -> bool {
+        self.indexes.remove(name).is_some()
+    }
+
+    pub fn get_all_by_index(
+        &self,
+        index_name: &str,
+        range: Option<&IDBKeyRange>,
+        limit: usize,
+    ) -> Result<Vec<IDBRecord>, String> {
+        let config = self
+            .indexes
+            .get(index_name)
+            .ok_or_else(|| format!("Index '{index_name}' does not exist"))?;
+        let mut results: Vec<(IDBKey, &IDBRecord)> = Vec::new();
+        for record in &self.records {
+            for key in extract_keys_from_json(&record.value, config)? {
+                if range.is_none_or(|range| range.contains(&key)) {
+                    if results.len() >= MAX_INDEX_SCAN_MATCHES {
+                        return Err(
+                            "QuotaExceededError: IndexedDB index scan exceeds budget".to_string()
+                        );
+                    }
+                    results.push((key, record));
+                }
+            }
+        }
+        results.sort_by(|(left_key, left_record), (right_key, right_record)| {
+            left_key
+                .cmp(right_key)
+                .then_with(|| left_record.key.cmp(&right_record.key))
+        });
+        let mut unique_primary = Vec::new();
+        let mut seen_primary = BTreeSet::new();
+        for (_, record) in results {
+            if seen_primary.insert(record.key.clone()) {
+                unique_primary.push(record.clone());
+            }
+            if unique_primary.len() >= limit.min(MAX_CURSOR_RESULTS) {
+                break;
+            }
+        }
+        Ok(unique_primary)
+    }
+
+    pub fn open_cursor(
+        &self,
+        range: Option<&IDBKeyRange>,
+        direction: IDBCursorDirection,
+    ) -> IDBCursor {
+        let mut records: Vec<IDBRecord> = if matches!(
+            direction,
+            IDBCursorDirection::Prev | IDBCursorDirection::PrevUnique
+        ) {
+            self.records
+                .iter()
+                .rev()
+                .filter(|record| range.is_none_or(|range| range.contains(&record.key)))
+                .take(MAX_CURSOR_RESULTS)
+                .cloned()
+                .collect()
+        } else {
+            self.records
+                .iter()
+                .filter(|record| range.is_none_or(|range| range.contains(&record.key)))
+                .take(MAX_CURSOR_RESULTS)
+                .cloned()
+                .collect()
+        };
+        if matches!(
+            direction,
+            IDBCursorDirection::NextUnique | IDBCursorDirection::PrevUnique
+        ) {
+            records.dedup_by(|left, right| left.key == right.key);
+        }
+        IDBCursor::from_records(records)
+    }
+
+    fn validate_indexes(&self, primary_key: &IDBKey, value: &str) -> Result<(), String> {
+        for config in self.indexes.values().filter(|config| config.unique) {
+            let proposed_keys = extract_keys_from_json(value, config)?;
+            for record in &self.records {
+                if &record.key == primary_key {
+                    continue;
+                }
+                let existing_keys = extract_keys_from_json(&record.value, config)?;
+                if proposed_keys
+                    .iter()
+                    .any(|proposed| existing_keys.iter().any(|existing| existing == proposed))
+                {
+                    return Err(format!(
+                        "ConstraintError: unique index '{}' already contains this key",
+                        config.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_key_budget(key: &IDBKey, depth: usize) -> Result<usize, String> {
+    if depth > 32 {
+        return Err("IndexedDB key nesting budget exceeded".to_string());
+    }
+    let bytes = match key {
+        IDBKey::Array(values) => {
+            if values.len() > 1_024 {
+                return Err("IndexedDB array key element budget exceeded".to_string());
+            }
+            let mut bytes = 0usize;
+            for value in values {
+                bytes = bytes.saturating_add(validate_key_budget(value, depth + 1)?);
+                if bytes > MAX_KEY_BYTES {
+                    break;
+                }
+            }
+            bytes
+        }
+        IDBKey::String(value) => value.len(),
+        IDBKey::Binary(value) => value.len(),
+        IDBKey::Date(_) | IDBKey::Number(_) => std::mem::size_of::<f64>(),
+    };
+    if bytes > MAX_KEY_BYTES {
+        return Err("IndexedDB key byte budget exceeded".to_string());
+    }
+    Ok(bytes)
 }
 
 fn extract_key_from_json(json_str: &str, key_path: &str) -> Result<IDBKey, String> {
@@ -210,12 +471,36 @@ fn extract_key_from_json(json_str: &str, key_path: &str) -> Result<IDBKey, Strin
             .get(part)
             .ok_or_else(|| format!("Key path '{key_path}' not found in JSON"))?;
     }
-    match current {
-        serde_json::Value::Number(n) => Ok(IDBKey::Number(
-            n.as_f64().ok_or_else(|| "Invalid number".to_string())?,
-        )),
-        serde_json::Value::String(s) => Ok(IDBKey::String(s.clone())),
-        _ => Err(format!("Unsupported key type at '{key_path}'")),
+    json_value_to_key(current).map_err(|_| format!("Unsupported key type at '{key_path}'"))
+}
+
+fn json_value_to_key(value: &serde_json::Value) -> Result<IDBKey, String> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .map(IDBKey::Number)
+            .ok_or_else(|| "Invalid number key".to_string()),
+        serde_json::Value::String(value) if value.len() <= 64 * 1024 => {
+            Ok(IDBKey::String(value.clone()))
+        }
+        serde_json::Value::Array(values) if values.len() <= 1_024 => values
+            .iter()
+            .map(json_value_to_key)
+            .collect::<Result<Vec<_>, _>>()
+            .map(IDBKey::Array),
+        _ => Err("Unsupported IndexedDB key value".to_string()),
+    }
+}
+
+fn extract_keys_from_json(json_str: &str, config: &IDBIndexConfig) -> Result<Vec<IDBKey>, String> {
+    let key = extract_key_from_json(json_str, &config.key_path)?;
+    if !config.multi_entry {
+        return Ok(vec![key]);
+    }
+    match key {
+        IDBKey::Array(values) => Ok(values),
+        value => Ok(vec![value]),
     }
 }
 
@@ -353,6 +638,20 @@ impl IndexedDBEngine {
         if tx.aborted {
             return Err("Transaction was aborted".to_string());
         }
+        let retained_bytes = self
+            .databases
+            .values()
+            .flat_map(|database| database.object_stores.values())
+            .flat_map(|store| store.records.iter())
+            .map(|record| record.value.len())
+            .sum::<usize>();
+        if self.total_records() > MAX_RECORDS_PER_ORIGIN || retained_bytes > MAX_ORIGIN_VALUE_BYTES
+        {
+            if let Some(snapshot) = tx.rollback_snapshot.take() {
+                self.databases.insert(tx.db_name.clone(), snapshot);
+            }
+            return Err("IndexedDB origin storage budget exceeded".to_string());
+        }
         tx.committed = true;
         tx.rollback_snapshot = None;
         let _ = self.save_to_disk();
@@ -403,14 +702,20 @@ impl IndexedDBEngine {
             origin: &'a str,
             databases: &'a HashMap<String, IDBDatabase>,
         }
-        let bytes = serde_json::to_vec(&Persisted {
-            schema: 1,
-            origin: &self.origin,
-            databases: &self.databases,
-        })
-        .map_err(std::io::Error::other)?;
         let temporary = path.with_extension("tmp");
-        fs::write(&temporary, bytes)?;
+        let file = fs::File::create(&temporary)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(
+            &mut writer,
+            &Persisted {
+                schema: 1,
+                origin: &self.origin,
+                databases: &self.databases,
+            },
+        )
+        .map_err(std::io::Error::other)?;
+        writer.flush()?;
+        drop(writer);
         fs::rename(temporary, path)
     }
 
@@ -427,12 +732,40 @@ impl IndexedDBEngine {
             origin: String,
             databases: HashMap<String, IDBDatabase>,
         }
-        let bytes = fs::read(path)?;
-        let persisted: Persisted = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if fs::metadata(path)?.len()
+            > (MAX_ORIGIN_VALUE_BYTES as u64).saturating_add(16 * 1024 * 1024)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IndexedDB persistence file exceeds budget",
+            ));
+        }
+        let file = fs::File::open(path)?;
+        let persisted: Persisted =
+            serde_json::from_reader(BufReader::new(file)).map_err(std::io::Error::other)?;
         if persisted.schema != 1 || persisted.origin != self.origin {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "IndexedDB origin/schema mismatch",
+            ));
+        }
+        let records = persisted
+            .databases
+            .values()
+            .flat_map(|database| database.object_stores.values())
+            .flat_map(|store| store.records.iter());
+        let mut record_count = 0usize;
+        let mut value_bytes = 0usize;
+        for record in records {
+            validate_key_budget(&record.key, 0)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            record_count = record_count.saturating_add(1);
+            value_bytes = value_bytes.saturating_add(record.value.len());
+        }
+        if record_count > MAX_RECORDS_PER_ORIGIN || value_bytes > MAX_ORIGIN_VALUE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IndexedDB persisted data exceeds origin budget",
             ));
         }
         self.databases = persisted.databases;
@@ -478,5 +811,23 @@ mod tests {
         let db_after = engine.databases.get("test_db").unwrap();
         let store_after = db_after.object_stores.get("users").unwrap();
         assert_eq!(store_after.count(), 0);
+    }
+
+    #[test]
+    fn previous_cursor_keeps_the_highest_bounded_records() {
+        let mut store = IDBObjectStore::new("bounded", None, false);
+        store.records = (0..(MAX_CURSOR_RESULTS + 5))
+            .map(|index| IDBRecord {
+                key: IDBKey::Number(index as f64),
+                value: Arc::from("{}"),
+            })
+            .collect();
+
+        let cursor = store.open_cursor(None, IDBCursorDirection::Prev);
+        assert_eq!(
+            cursor.current().map(|record| record.key.clone()),
+            Some(IDBKey::Number((MAX_CURSOR_RESULTS + 4) as f64))
+        );
+        assert_eq!(cursor.remaining(), MAX_CURSOR_RESULTS);
     }
 }

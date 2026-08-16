@@ -1,4 +1,4 @@
-// Integration tests for Phase 25 — Cosmetic Content Control & HTTPS-Only Upgrades.
+// Cosmetic Content Control & HTTPS-Only Upgrades.
 
 use ghitabrowser::content_control::ContentControlEngine;
 use ghitabrowser::https_upgrade::{HttpsMode, HttpsUpgradeEngine, HttpsUpgradeResult};

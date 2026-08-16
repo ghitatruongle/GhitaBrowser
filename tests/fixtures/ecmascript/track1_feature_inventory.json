@@ -1,0 +1,64 @@
+{
+  "track": 1,
+  "name": "ECMAScript and Module Compatibility",
+  "features": {
+    "syntax": {
+      "for_in": {"status": "missing", "phase": 2, "test_cases": [
+        {"id": "for-in-basic", "code": "var keys = []; var obj = {a: 1, b: 2}; for (var k in obj) { keys.push(k); } keys.join(',')", "expected": "a,b"},
+        {"id": "for-in-let", "code": "var keys = []; var obj = {x: 10, y: 20}; for (let k in obj) { keys.push(k); } keys.join(',')", "expected": "x,y"},
+        {"id": "for-in-empty", "code": "var count = 0; for (var k in {}) { count++; } count", "expected": "0"},
+        {"id": "for-in-break", "code": "var first = ''; var obj = {a: 1, b: 2, c: 3}; for (var k in obj) { first = k; break; } first", "expected": "a"}
+      ]},
+      "do_while": {"status": "missing", "phase": 2, "test_cases": [
+        {"id": "do-while-basic", "code": "var i = 0; do { i++; } while (i < 3); i", "expected": "3"},
+        {"id": "do-while-false-cond", "code": "var x = 0; do { x = 42; } while (false); x", "expected": "42"},
+        {"id": "do-while-break", "code": "var n = 0; do { n++; if (n > 5) break; } while (true); n", "expected": "6"}
+      ]},
+      "labelled_statements": {"status": "missing", "phase": 2, "test_cases": [
+        {"id": "label-break", "code": "var result = 0; outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { if (j === 1) break outer; result++; } } result", "expected": "1"},
+        {"id": "label-continue", "code": "var sum = 0; outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { if (j === 1) continue outer; sum += j; } } sum", "expected": "0"},
+        {"id": "nested-labels", "code": "var r = ''; a: { r += 'a'; b: { r += 'b'; break a; r += 'c'; } r += 'd'; } r", "expected": "ab"}
+      ]},
+      "async_generator": {"status": "missing", "phase": 2, "test_cases": [
+        {"id": "async-gen-basic", "code": "async function* gen() { yield 1; yield 2; } typeof gen", "expected": "function"},
+        {"id": "async-gen-expr", "code": "var g = async function*() { yield 1; }; typeof g", "expected": "function"}
+      ]},
+      "top_level_await": {"status": "missing", "phase": 2, "test_cases": [
+        {"id": "tla-module", "code": "const v = await Promise.resolve(42); v", "expected": "42", "context": "module"}
+      ]}
+    },
+    "builtins": {
+      "string_matchAll": {"status": "missing", "phase": 3, "test_cases": [{"id": "string-matchAll", "code": "var results = []; for (var m of 'abcabc'.matchAll(/a/g)) { results.push(m[0]); } results.join(',')", "expected": "a,a"}]},
+      "string_replaceAll": {"status": "missing", "phase": 3, "test_cases": [{"id": "string-replaceAll", "code": "'aaa'.replaceAll('a', 'b')", "expected": "bbb"}]},
+      "string_at": {"status": "missing", "phase": 3, "test_cases": [{"id": "string-at-positive", "code": "'abc'.at(1)", "expected": "b"}, {"id": "string-at-negative", "code": "'abc'.at(-1)", "expected": "c"}]},
+      "intl_datetimeformat": {"status": "stub", "phase": 3, "test_cases": [{"id": "intl-dtf-construct", "code": "typeof new Intl.DateTimeFormat().format", "expected": "function"}]},
+      "intl_numberformat": {"status": "stub", "phase": 3, "test_cases": [{"id": "intl-nf-construct", "code": "typeof new Intl.NumberFormat().format", "expected": "function"}]},
+      "reflect_complete": {"status": "partial", "phase": 3, "test_cases": [
+        {"id": "reflect-get", "code": "Reflect.get({a: 1}, 'a')", "expected": "1"},
+        {"id": "reflect-set", "code": "var o = {}; Reflect.set(o, 'x', 42); o.x", "expected": "42"},
+        {"id": "reflect-has", "code": "Reflect.has({a: 1}, 'a')", "expected": "true"},
+        {"id": "reflect-ownKeys", "code": "Reflect.ownKeys({a: 1, b: 2}).join(',')", "expected": "a,b"},
+        {"id": "reflect-deleteProperty", "code": "var o = {a: 1}; Reflect.deleteProperty(o, 'a'); 'a' in o", "expected": "false"},
+        {"id": "reflect-apply", "code": "Reflect.apply(function(a, b) { return a + b; }, null, [1, 2])", "expected": "3"},
+        {"id": "reflect-isExtensible", "code": "Reflect.isExtensible({})", "expected": "true"},
+        {"id": "reflect-preventExtensions", "code": "var o = {}; Reflect.preventExtensions(o); Reflect.isExtensible(o)", "expected": "false"}
+      ]},
+      "weakref_finalizationregistry": {"status": "placeholder", "phase": 3, "test_cases": [
+        {"id": "weakref-construct", "code": "var wr = new WeakRef({}); typeof wr.deref", "expected": "function"},
+        {"id": "finalizationregistry-construct", "code": "var fr = new FinalizationRegistry(function(v) {}); typeof fr.register", "expected": "function"}
+      ]}
+    },
+    "modules": {
+      "export_star": {"status": "missing", "phase": 4, "test_cases": [{"id": "export-star", "code": "export * from './other.js'", "expected": "re-export-all", "context": "module"}]},
+      "export_as": {"status": "missing", "phase": 4, "test_cases": [{"id": "export-as", "code": "var x = 1; export { x as y }", "expected": "renamed-export", "context": "module"}]},
+      "namespace_export": {"status": "missing", "phase": 4, "test_cases": [{"id": "namespace-import", "code": "import * as ns from './mod.js'", "expected": "namespace-object", "context": "module"}]},
+      "module_caching": {"status": "partial", "phase": 4, "test_cases": [{"id": "module-cache-canonical", "code": "same module imported twice should evaluate once", "expected": "single-evaluation", "context": "module"}]}
+    }
+  },
+  "hostile_fixtures": {
+    "deep_nesting": {"description": "Deeply nested block/loop/if statements to test stack/budget limits", "generate": "Generate 200 levels of nested while(true){} blocks", "expected_behavior": "Should hit MAX_CALL_DEPTH or step budget gracefully"},
+    "large_input": {"description": "Source exceeding MAX_STRING_LENGTH", "generate": "String literal > 2MB", "expected_behavior": "Should reject with string length error"},
+    "budget_exhaustion": {"description": "Tight infinite loop to exhaust MAX_EVAL_STEPS", "generate": "while(true){}", "expected_behavior": "Should terminate with step budget exhaustion"},
+    "deep_module_graph": {"description": "Module dependency chain exceeding depth limit", "generate": "Chain of 70 modules each importing the next", "expected_behavior": "Should reject with module dependency depth exceeded"}
+  }
+}

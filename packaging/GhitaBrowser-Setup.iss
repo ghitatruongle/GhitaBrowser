@@ -2,7 +2,7 @@
 
 #define MyAppName "GhitaBrowser"
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.0"
+  #define MyAppVersion "2.0.6"
 #endif
 #define MyAppPublisher "GhitaBrowser contributors"
 #define MyAppURL "https://github.com/GhitaBrowser/ghitabrowser"

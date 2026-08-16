@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Persistent Runtime Timer</title>
+  </head>
+  <body>
+    <main>
+      <h1 id="status">Timer pending</h1>
+      <p>The page runtime must update this document after the initial load.</p>
+    </main>
+    <script>
+      let statusNode = document.getElementById("status");
+      setTimeout(() => {
+        statusNode.textContent = "Timer complete";
+      }, 250);
+    </script>
+  </body>
+</html>

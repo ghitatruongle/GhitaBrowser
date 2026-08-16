@@ -528,7 +528,7 @@ pub fn run_worker_stdio() -> Result<(), WorkerError> {
     } else {
         match serde_json::from_slice::<PreparationRequest>(&payload) {
             Ok(request) => {
-                PreparationResponse::Prepared(Box::new(crate::document::prepare_document(
+                PreparationResponse::Prepared(Box::new(crate::document::prepare_document_static(
                     &request.html,
                     &request.fallback_title,
                     &request.base_rules,
@@ -645,7 +645,7 @@ fn prepare_pdf_request(payload: &[u8]) -> PreparationResponse {
         Ok(html) => html,
         Err(error) => return PreparationResponse::Error(error.to_string()),
     };
-    PreparationResponse::Prepared(Box::new(crate::document::prepare_document(
+    PreparationResponse::Prepared(Box::new(crate::document::prepare_document_static(
         &html,
         &meta.fallback_title,
         &meta.base_rules,

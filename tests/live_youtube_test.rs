@@ -1,5 +1,4 @@
-//! Phase 17D live black-box network/player gate.
-//!
+//! Live black-box network/player gate
 //! This target is ignored in the normal offline suite because it intentionally
 //! contacts the current YouTube service. The release Phase 17 gate runs it
 //! explicitly with `--ignored` and records the exact date/network result.

@@ -171,11 +171,78 @@ async fn post_live_json<T: Serialize>(
         .map_err(|error| format!("YouTube response is not valid JSON: {error}"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum YouTubeRoute {
     Home,
-    Search { query: String },
-    Watch { video_id: String },
+    Search {
+        query: String,
+    },
+    Watch {
+        video_id: String,
+    },
+    Playlist {
+        playlist_id: String,
+        video_id: Option<String>,
+    },
+    Channel {
+        channel_id: String,
+    },
+    Shorts {
+        video_id: String,
+    },
+    Embed {
+        video_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum YouTubeDisplayMode {
+    SiteApplication,
+    DegradedShell { results_count: usize },
+    MediaOnlyFallback { video_id: String },
+    Unsupported { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YouTubeKeyboardAction {
+    TogglePlayPause,
+    SeekRelative(i64),
+    SeekPercent(u8),
+    ToggleMute,
+    ToggleFullscreen,
+    IncreaseVolume,
+    DecreaseVolume,
+    IncreaseRate,
+    DecreaseRate,
+}
+
+impl YouTubeKeyboardAction {
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            " " | "k" | "K" => Some(Self::TogglePlayPause),
+            "j" | "J" => Some(Self::SeekRelative(-10)),
+            "l" | "L" => Some(Self::SeekRelative(10)),
+            "ArrowLeft" => Some(Self::SeekRelative(-5)),
+            "ArrowRight" => Some(Self::SeekRelative(5)),
+            "ArrowUp" => Some(Self::IncreaseVolume),
+            "ArrowDown" => Some(Self::DecreaseVolume),
+            "m" | "M" => Some(Self::ToggleMute),
+            "f" | "F" => Some(Self::ToggleFullscreen),
+            ">" => Some(Self::IncreaseRate),
+            "<" => Some(Self::DecreaseRate),
+            "0" => Some(Self::SeekPercent(0)),
+            "1" => Some(Self::SeekPercent(10)),
+            "2" => Some(Self::SeekPercent(20)),
+            "3" => Some(Self::SeekPercent(30)),
+            "4" => Some(Self::SeekPercent(40)),
+            "5" => Some(Self::SeekPercent(50)),
+            "6" => Some(Self::SeekPercent(60)),
+            "7" => Some(Self::SeekPercent(70)),
+            "8" => Some(Self::SeekPercent(80)),
+            "9" => Some(Self::SeekPercent(90)),
+            _ => None,
+        }
+    }
 }
 
 impl YouTubeRoute {
@@ -196,35 +263,75 @@ impl YouTubeRoute {
                 video_id: validate_video_id(parsed.path().trim_start_matches('/'))?,
             });
         }
-        match parsed.path() {
-            "/" => Ok(Self::Home),
-            "/results" => {
-                let query = parsed
-                    .query_pairs()
-                    .find(|(name, _)| name == "search_query")
-                    .map(|(_, value)| value.into_owned())
-                    .unwrap_or_default();
-                Ok(Self::Search {
-                    query: validate_search_query(&query)?,
-                })
+        let path = parsed.path();
+        if path == "/" || path.is_empty() {
+            return Ok(Self::Home);
+        }
+        if path == "/results" {
+            let query = parsed
+                .query_pairs()
+                .find(|(name, _)| name == "search_query")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            return Ok(Self::Search {
+                query: validate_search_query(&query)?,
+            });
+        }
+        if path == "/watch" {
+            let video_id = parsed
+                .query_pairs()
+                .find(|(name, _)| name == "v")
+                .map(|(_, value)| value.into_owned())
+                .ok_or_else(|| "YouTube watch URL has no video id".to_string())?;
+            return Ok(Self::Watch {
+                video_id: validate_video_id(&video_id)?,
+            });
+        }
+        if path == "/playlist" {
+            let playlist_id = parsed
+                .query_pairs()
+                .find(|(name, _)| name == "list")
+                .map(|(_, value)| value.into_owned())
+                .ok_or_else(|| "YouTube playlist URL has no list parameter".to_string())?;
+            let video_id = parsed
+                .query_pairs()
+                .find(|(name, _)| name == "v")
+                .and_then(|(_, value)| validate_video_id(&value).ok());
+            return Ok(Self::Playlist {
+                playlist_id,
+                video_id,
+            });
+        }
+        if path.starts_with("/shorts/") {
+            let video_id = path.split('/').nth(2).unwrap_or_default();
+            return Ok(Self::Shorts {
+                video_id: validate_video_id(video_id)?,
+            });
+        }
+        if path.starts_with("/embed/") {
+            let video_id = path.split('/').nth(2).unwrap_or_default();
+            return Ok(Self::Embed {
+                video_id: validate_video_id(video_id)?,
+            });
+        }
+        if path.starts_with("/@")
+            || path.starts_with("/channel/")
+            || path.starts_with("/c/")
+            || path.starts_with("/user/")
+        {
+            let channel_id = path.trim_start_matches('/').to_string();
+            return Ok(Self::Channel { channel_id });
+        }
+        Err("Unsupported YouTube route".to_string())
+    }
+
+    pub fn video_id(&self) -> Option<&str> {
+        match self {
+            Self::Watch { video_id } | Self::Shorts { video_id } | Self::Embed { video_id } => {
+                Some(video_id.as_str())
             }
-            "/watch" => {
-                let video_id = parsed
-                    .query_pairs()
-                    .find(|(name, _)| name == "v")
-                    .map(|(_, value)| value.into_owned())
-                    .ok_or_else(|| "YouTube watch URL has no video id".to_string())?;
-                Ok(Self::Watch {
-                    video_id: validate_video_id(&video_id)?,
-                })
-            }
-            path if path.starts_with("/shorts/") || path.starts_with("/embed/") => {
-                let video_id = path.split('/').nth(2).unwrap_or_default();
-                Ok(Self::Watch {
-                    video_id: validate_video_id(video_id)?,
-                })
-            }
-            _ => Err("Unsupported YouTube route".to_string()),
+            Self::Playlist { video_id, .. } => video_id.as_deref(),
+            _ => None,
         }
     }
 }
@@ -314,7 +421,20 @@ impl YouTubePlayerResponse {
             .and_then(Value::as_str)
             .unwrap_or("ERROR");
         if status != "OK" {
-            return Err(format!("YouTube player response is not playable: {status}"));
+            let reason = value
+                .pointer("/playabilityStatus/reason")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    value
+                        .pointer("/playabilityStatus/messages/0")
+                        .and_then(Value::as_str)
+                });
+            return match reason {
+                Some(msg) => Err(format!(
+                    "YouTube player response is not playable ({status}): {msg}"
+                )),
+                None => Err(format!("YouTube player response is not playable: {status}")),
+            };
         }
         let details = value
             .get("videoDetails")
@@ -740,6 +860,43 @@ impl LiveYouTubeController {
         self.seek_to(controls.current_time_seconds)
     }
 
+    pub fn handle_keyboard_action(&mut self, action: YouTubeKeyboardAction) -> Result<(), String> {
+        match action {
+            YouTubeKeyboardAction::TogglePlayPause => {
+                self.toggle_playback()?;
+            }
+            YouTubeKeyboardAction::SeekRelative(seconds) => {
+                self.seek_by(seconds as f64)?;
+            }
+            YouTubeKeyboardAction::SeekPercent(percent) => {
+                let target =
+                    (self.decoded_duration_us as f64 / 1_000_000.0) * (percent as f64 / 100.0);
+                self.seek_to(target)?;
+            }
+            YouTubeKeyboardAction::ToggleMute => {
+                self.toggle_mute();
+            }
+            YouTubeKeyboardAction::ToggleFullscreen => {}
+            YouTubeKeyboardAction::IncreaseVolume => {
+                let vol = (self.controls().volume + 0.05).min(1.0);
+                self.set_volume(vol)?;
+            }
+            YouTubeKeyboardAction::DecreaseVolume => {
+                let vol = (self.controls().volume - 0.05).max(0.0);
+                self.set_volume(vol)?;
+            }
+            YouTubeKeyboardAction::IncreaseRate => {
+                let rate = (self.controls().playback_rate + 0.25).min(2.0);
+                self.media.set_playback_rate(rate)?;
+            }
+            YouTubeKeyboardAction::DecreaseRate => {
+                let rate = (self.controls().playback_rate - 0.25).max(0.25);
+                self.media.set_playback_rate(rate)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn controls(&self) -> crate::html_media::MediaControlsState {
         self.media.controls_state()
     }
@@ -991,12 +1148,28 @@ fn parse_format(value: &Value, default_kind: StreamKind) -> Result<Option<YouTub
         .get("height")
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok());
-    let kind = if width.is_some() || height.is_some() {
-        if value.get("audioQuality").is_some() {
-            StreamKind::Muxed
-        } else {
-            StreamKind::Video
-        }
+    let has_audio_codec = parsed.codecs.iter().any(|c| {
+        matches!(
+            c,
+            MediaCodec::Aac | MediaCodec::Opus | MediaCodec::Vorbis | MediaCodec::Pcm
+        )
+    });
+    let has_video_codec = parsed.codecs.iter().any(|c| {
+        matches!(
+            c,
+            MediaCodec::Avc
+                | MediaCodec::Hevc
+                | MediaCodec::Vp8
+                | MediaCodec::Vp9
+                | MediaCodec::Av1
+        )
+    });
+    let is_muxed = (has_audio_codec && has_video_codec) || default_kind == StreamKind::Muxed;
+
+    let kind = if is_muxed {
+        StreamKind::Muxed
+    } else if width.is_some() || height.is_some() {
+        StreamKind::Video
     } else if value.get("audioQuality").is_some() || mime_type.starts_with("audio/") {
         StreamKind::Audio
     } else {
@@ -1082,9 +1255,10 @@ fn balanced_json_end(bytes: &[u8], start: usize) -> Option<usize> {
 
 fn collect_video_results(root: &Value) -> Result<Vec<YouTubeVideoResult>, String> {
     let mut results = Vec::new();
-    let mut stack = vec![root];
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root);
     let mut visited = 0usize;
-    while let Some(value) = stack.pop() {
+    while let Some(value) = queue.pop_front() {
         visited += 1;
         if visited > MAX_JSON_NODES {
             return Err("YouTube bootstrap JSON node budget exceeded".to_string());
@@ -1104,9 +1278,15 @@ fn collect_video_results(root: &Value) -> Result<Vec<YouTubeVideoResult>, String
                         }
                     }
                 }
-                stack.extend(map.values());
+                for v in map.values() {
+                    queue.push_back(v);
+                }
             }
-            Value::Array(values) => stack.extend(values),
+            Value::Array(values) => {
+                for v in values {
+                    queue.push_back(v);
+                }
+            }
             _ => {}
         }
     }

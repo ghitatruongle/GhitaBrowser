@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>YouTube Modern SPA Shell</title>
+  <style>
+    body { margin: 0; background: #0f0f0f; color: #fff; font-family: sans-serif; }
+    ytd-app { display: block; min-height: 100vh; }
+    #player-container { width: 800px; height: 450px; background: #000; }
+    .video-card { padding: 12px; border-radius: 8px; }
+    .video-card.active { border: 2px solid #f00; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "polymer": "/scripts/polymer.js",
+        "yt-player": "/scripts/yt-player.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <ytd-app id="app">
+    <div id="player-container">
+      <video id="player" playsinline controls></video>
+    </div>
+    <div id="feed">
+      <div class="video-card" id="card-1" data-video-id="v123" data-channel-name="GhitaTech">
+        <span class="title">Next-Gen Browser Engine</span>
+      </div>
+    </div>
+  </ytd-app>
+  <template id="comment-template">
+    <div class="comment-item">
+      <span class="author">User</span>
+      <span class="text">Amazing performance!</span>
+    </div>
+  </template>
+  <script>
+    // YouTube SPA script simulating router and UI state
+    document.title = "YouTube - Next-Gen Engine";
+    let card = document.getElementById("card-1");
+    if (card) {
+      card.classList.add("active");
+      card.dataset.viewCount = "1000000";
+    }
+    let player = document.getElementById("player");
+    if (player) {
+      player.src = "https://example.com/stream.mp4";
+    }
+  </script>
+</body>
+</html>

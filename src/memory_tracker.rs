@@ -29,6 +29,8 @@ pub struct TabMemoryEstimate {
     pub layout_bytes: usize,
     /// History stack memory (bytes)
     pub history_bytes: usize,
+    /// Persistent JavaScript runtime / realm memory (bytes)
+    pub runtime_bytes: usize,
     /// Total estimated memory for this tab (bytes)
     pub total_bytes: usize,
 }
@@ -98,12 +100,14 @@ impl MemoryTracker {
         // that retained memory must be counted, or the estimator reports a
         // sleeping 100 MB tab as ~200 bytes.
         let snapshot_bytes = tab.compressed_snapshot_bytes();
-        let total_bytes = dom_bytes + layout_bytes + history_bytes + snapshot_bytes;
+        let runtime_bytes = tab.runtime_heap_bytes();
+        let total_bytes = dom_bytes + layout_bytes + history_bytes + snapshot_bytes + runtime_bytes;
 
         TabMemoryEstimate {
             dom_bytes,
             layout_bytes,
             history_bytes,
+            runtime_bytes,
             total_bytes,
         }
     }

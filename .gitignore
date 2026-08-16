@@ -122,3 +122,7 @@ tarpaulin-report.html
 # ── Windows Resource Build Artifacts ───────────────────────
 *.res
 *.rc.bak
+
+# ── Completion Plan & Rules (AI working documents) ────────
+COMPLETION_PLAN/
+QUY_TAC

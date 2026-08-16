@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Web Component Todo SPA</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    todo-item { display: block; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <div id="todo-container">
+    <h2>My Tasks</h2>
+    <div id="list">
+      <div class="task done" id="task-1" data-task-id="t1">Task 1</div>
+      <div class="task" id="task-2" data-task-id="t2">Task 2</div>
+    </div>
+  </div>
+  <script>
+    let container = document.getElementById("todo-container");
+    let t1 = document.getElementById("task-1");
+    let t2 = document.getElementById("task-2");
+
+    if (t1) {
+      t1.classList.remove("done");
+      t1.classList.toggle("pending");
+      t1.dataset.priority = "high";
+    }
+
+    if (t2) {
+      t2.classList.add("highlight");
+      t2.style.backgroundColor = "rgb(255, 255, 0)";
+    }
+  </script>
+</body>
+</html>

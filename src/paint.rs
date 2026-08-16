@@ -1,6 +1,6 @@
-// Display list painter: layout tree to render commands
+// Display list painter: layout tree to render commands, stacking contexts and visible metrics
 
-use crate::layout::{effective_font_size, wrap_text, DisplayType, LayoutNode};
+use crate::layout::{effective_font_size, wrap_text_with_rules, DisplayType, LayoutNode};
 
 /// Plain RGBA color (0.0 - 1.0), independent from any GUI framework
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12,7 +12,7 @@ pub struct Rgba {
 }
 
 /// Multiply a color's alpha by `factor` (for CSS opacity composition).
-fn mul_alpha(color: Rgba, factor: f32) -> Rgba {
+pub fn mul_alpha(color: Rgba, factor: f32) -> Rgba {
     Rgba {
         r: color.r,
         g: color.g,
@@ -24,7 +24,7 @@ fn mul_alpha(color: Rgba, factor: f32) -> Rgba {
 /// Apply the clip box to a rectangle. `clip = None` means "no clipping" and
 /// the box passes through unchanged; `None` is returned only when the box
 /// is fully outside an ACTIVE clip (item dropped).
-fn clipped_rect(
+pub fn clipped_rect(
     x: f32,
     y: f32,
     w: f32,
@@ -100,7 +100,6 @@ pub enum DisplayItem {
         cached: bool,
     },
     /// A pending image that hasn't been loaded yet (lazy loading).
-    /// Shows a placeholder box until the image is fetched.
     PendingImage {
         x: f32,
         y: f32,
@@ -109,8 +108,7 @@ pub enum DisplayItem {
         url: String,
         alt: String,
     },
-    /// A Canvas 2D or SVG vector shape drawn by the page (Phase 21). The
-    /// position is document-relative; the GUI rasterizes the shape.
+    /// A Canvas 2D or SVG vector shape drawn by the page
     VectorShape(VectorShape),
 }
 
@@ -155,6 +153,15 @@ pub struct DisplayList {
     pub height: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisibleMetrics {
+    pub painted_area_px: f32,
+    pub visible_text_characters: usize,
+    pub meaningful_item_count: usize,
+    pub has_major_blank_region: bool,
+    pub completeness_score: f32,
+}
+
 impl DisplayList {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
@@ -169,10 +176,9 @@ impl DisplayList {
             .map(|l| l.href.as_str())
     }
 
-    /// Viewport Clipping Optimization:
-    /// Filters out DisplayItems that lie completely outside the visible viewport bounding box.
+    /// Viewport Clipping Optimization
     pub fn filter_viewport(&self, viewport_y: f32, viewport_height: f32) -> DisplayList {
-        let margin = 50.0; // Buffer margin in pixels
+        let margin = 50.0;
         let min_y = viewport_y - margin;
         let max_y = viewport_y + viewport_height + margin;
 
@@ -199,46 +205,94 @@ impl DisplayList {
     }
 }
 
-/// Inherited paint state passed down the tree
-#[derive(Clone, Copy)]
-struct PaintContext {
-    color: Rgba,
-    font_size: f64,
-    bold: bool,
-    italic: bool,
-    link: bool,
-    monospace: bool,
-    /// CSS opacity multiplier, accumulated down the tree (parent × node).
-    opacity: f32,
-    /// Clip box (x, y, w, h) in document px, from `overflow: hidden`
-    /// ancestors. `None` = no clipping.
-    clip: Option<(f32, f32, f32, f32)>,
+/// Calculate visible content metrics for a painted display list
+pub fn calculate_visible_metrics(
+    list: &DisplayList,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> VisibleMetrics {
+    let mut total_painted_area = 0.0_f32;
+    let mut text_chars = 0_usize;
+    let mut meaningful_items = 0_usize;
+
+    for item in &list.items {
+        match item {
+            DisplayItem::Rect { w, h, color, .. } => {
+                if color.a > 0.05 && *color != Rgba::WHITE {
+                    total_painted_area += w * h;
+                    meaningful_items += 1;
+                }
+            }
+            DisplayItem::Border { w, h, color, .. } => {
+                if color.a > 0.05 {
+                    total_painted_area += w * h;
+                    meaningful_items += 1;
+                }
+            }
+            DisplayItem::TextRun { content, .. } => {
+                let trimmed = content.trim();
+                text_chars += trimmed.chars().count();
+                if !trimmed.is_empty() {
+                    meaningful_items += 1;
+                }
+            }
+            DisplayItem::Image { w, h, .. } | DisplayItem::PendingImage { w, h, .. } => {
+                total_painted_area += w * h;
+                meaningful_items += 1;
+            }
+            DisplayItem::VectorShape(shape) => {
+                total_painted_area += shape.w * shape.h;
+                meaningful_items += 1;
+            }
+        }
+    }
+
+    let viewport_area = (viewport_w * viewport_h).max(1.0);
+    let coverage_ratio = (total_painted_area / viewport_area).clamp(0.0, 1.0);
+    let text_score = (text_chars as f32 / 100.0).clamp(0.0, 1.0);
+    let completeness_score = (coverage_ratio * 0.4 + text_score * 0.6).clamp(0.0, 1.0);
+    let has_major_blank_region = text_chars == 0 && total_painted_area < 100.0;
+
+    VisibleMetrics {
+        painted_area_px: total_painted_area,
+        visible_text_characters: text_chars,
+        meaningful_item_count: meaningful_items,
+        has_major_blank_region,
+        completeness_score,
+    }
 }
 
-/// True when the node has an explicit (fixed) box height from CSS, so
-/// `overflow: hidden` can actually clip overflowing children.
+/// Inherited paint state passed down the tree
+#[derive(Clone, Copy)]
+pub struct PaintContext {
+    pub color: Rgba,
+    pub font_size: f64,
+    pub bold: bool,
+    pub italic: bool,
+    pub link: bool,
+    pub monospace: bool,
+    pub opacity: f32,
+    pub clip: Option<(f32, f32, f32, f32)>,
+}
+
 fn has_fixed_size(style: &crate::css_parser::ComputedStyle) -> bool {
     style.height.is_some()
 }
 
-/// True when the computed style clips overflowing content (`overflow: hidden`).
 fn clips_overflow(style: &crate::css_parser::ComputedStyle) -> bool {
     style
         .overflow
         .as_deref()
-        .map(|o| o == "hidden")
+        .map(|o| o == "hidden" || o == "clip" || o == "auto" || o == "scroll")
         .unwrap_or(false)
+        || style.overflow_x.as_deref() == Some("hidden")
+        || style.overflow_y.as_deref() == Some("hidden")
 }
 
-/// Build the display list for a laid-out page.
-/// Pages paint on a white background with black text — exactly like Chrome,
-/// where the OS/browser theme never darkens actual web content.
 pub fn build_display_list(root: &LayoutNode) -> DisplayList {
     build_display_list_with_cache(root, None)
 }
 
-/// Build the display list with an optional image cache so <img> tags can
-/// render decoded images when available.
 pub fn build_display_list_with_cache(
     root: &LayoutNode,
     image_cache: Option<&crate::image_loader::ImageCache>,
@@ -248,7 +302,7 @@ pub fn build_display_list_with_cache(
     let doc_width = root.rect.outer_width().max(1.0) as f32;
     let doc_height = (root.rect.y + root.rect.outer_height()).max(1.0) as f32;
     list.width = doc_width;
-    list.height = doc_height + 24.0; // bottom breathing room
+    list.height = doc_height + 24.0;
 
     // Page background: body/html background-color, else white
     let page_bg = page_background(root).unwrap_or(Rgba::WHITE);
@@ -270,12 +324,11 @@ pub fn build_display_list_with_cache(
         opacity: 1.0,
         clip: None,
     };
-    paint_node(root, ctx, &mut list, image_cache);
 
+    paint_stacking_context(root, ctx, &mut list, image_cache);
     list
 }
 
-/// Look for a background color on the root/html/body elements
 fn page_background(root: &LayoutNode) -> Option<Rgba> {
     if let Some(bg) = root
         .computed_style
@@ -305,7 +358,39 @@ fn page_background(root: &LayoutNode) -> Option<Rgba> {
     None
 }
 
-fn paint_node(
+fn creates_stacking_context(node: &LayoutNode) -> bool {
+    let style = &node.computed_style;
+    (style.position != crate::css_parser::PositionMode::Static && style.z_index != 0)
+        || style.opacity.map(|o| o < 1.0).unwrap_or(false)
+        || style.transform != crate::css_parser::Transform2D::default()
+}
+
+fn apply_text_transform(text: &str, transform: Option<&str>) -> String {
+    match transform {
+        Some("uppercase") => text.to_uppercase(),
+        Some("lowercase") => text.to_lowercase(),
+        Some("capitalize") => {
+            let mut result = String::new();
+            let mut cap_next = true;
+            for c in text.chars() {
+                if c.is_whitespace() {
+                    cap_next = true;
+                    result.push(c);
+                } else if cap_next {
+                    result.extend(c.to_uppercase());
+                    cap_next = false;
+                } else {
+                    result.push(c);
+                }
+            }
+            result
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// Paint a node and its descendants according to CSS 2.2 / 3 Stacking Context Order
+pub fn paint_stacking_context(
     node: &LayoutNode,
     parent: PaintContext,
     list: &mut DisplayList,
@@ -315,12 +400,12 @@ fn paint_node(
         return;
     }
 
+    let is_visible = node.computed_style.visibility.as_deref() != Some("hidden")
+        && node.computed_style.visibility.as_deref() != Some("collapse");
+
     let tag = node.element.tag.as_str();
     let font_size = effective_font_size(&node.computed_style, tag, parent.font_size);
 
-    // CSS opacity composes down the tree (parent × own). Only items emitted
-    // below (background, text, images) need alpha adjustment — children
-    // multiply further in their own frame.
     let own_opacity = node
         .computed_style
         .opacity
@@ -328,8 +413,6 @@ fn paint_node(
         .unwrap_or(1.0);
     let opacity = parent.opacity * own_opacity;
 
-    // overflow:hidden with a fixed size clips children to this node's border
-    // box — intersect with any ancestor clip.
     let clip = if clips_overflow(&node.computed_style) && has_fixed_size(&node.computed_style) {
         let own = (
             node.rect.x as f32,
@@ -349,8 +432,7 @@ fn paint_node(
     } else {
         parent.clip
     };
-    // A node whose own box is already fully outside the clip emits nothing
-    // (and neither do its children).
+
     if clipped_rect(
         node.rect.x as f32,
         node.rect.y as f32,
@@ -363,7 +445,6 @@ fn paint_node(
         return;
     }
 
-    // Resolve inherited text properties (UA defaults + CSS)
     let is_link = parent.link || (tag == "a" && node.element.get_attr("href").is_some());
     let bold = parent.bold
         || matches!(
@@ -380,7 +461,6 @@ fn paint_node(
         || node.computed_style.font_style.as_deref() == Some("italic");
     let monospace = parent.monospace || matches!(tag, "code" | "pre" | "kbd" | "samp" | "tt");
 
-    // Text color: explicit CSS wins; otherwise inherit, with a blue default for the first <a>
     let color = if let Some(c) = node
         .computed_style
         .color
@@ -399,8 +479,22 @@ fn paint_node(
     let w = node.rect.width as f32;
     let h = node.rect.height as f32;
 
-    // Background (skip the page-level fill already painted)
-    if tag != "html" && tag != "body" {
+    // Phase 1: Background & Borders of current context
+    if is_visible && tag != "html" && tag != "body" {
+        // Box shadow
+        if node.computed_style.box_shadow.is_some() {
+            if let Some((cx, cy, cw, ch)) = clipped_rect(x + 2.0, y + 2.0, w, h, clip) {
+                list.items.push(DisplayItem::Rect {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                    color: mul_alpha(Rgba::rgb(0.0, 0.0, 0.0), opacity * 0.15),
+                });
+            }
+        }
+
+        // Background
         if let Some(bg) = node
             .computed_style
             .background_color
@@ -417,74 +511,98 @@ fn paint_node(
                 });
             }
         }
-    }
 
-    // Border (if styled)
-    let border_style_ok = node
-        .computed_style
-        .border_style
-        .as_deref()
-        .map(|s| s != "none" && s != "hidden")
-        .unwrap_or(false);
-    let border_width = node
-        .computed_style
-        .border_width
-        .as_ref()
-        .map(|bw| bw.to_pixels(node.rect.width, 16.0) as f32)
-        .unwrap_or(if border_style_ok { 1.0 } else { 0.0 });
-    if border_width > 0.0 && (border_style_ok || node.computed_style.border_color.is_some()) {
-        let border_color = node
+        // Border
+        let border_style_ok = node
             .computed_style
-            .border_color
+            .border_style
             .as_deref()
-            .and_then(parse_css_color)
-            .unwrap_or(color);
-        if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
-            list.items.push(DisplayItem::Border {
-                x: cx,
-                y: cy,
-                w: cw,
-                h: ch,
-                width: border_width,
-                color: mul_alpha(border_color, opacity),
-            });
+            .map(|s| s != "none" && s != "hidden")
+            .unwrap_or(false);
+        let border_width = node
+            .computed_style
+            .border_width
+            .as_ref()
+            .map(|bw| bw.to_pixels(node.rect.width, 16.0) as f32)
+            .unwrap_or(if border_style_ok { 1.0 } else { 0.0 });
+        if border_width > 0.0 && (border_style_ok || node.computed_style.border_color.is_some()) {
+            let border_color = node
+                .computed_style
+                .border_color
+                .as_deref()
+                .and_then(parse_css_color)
+                .unwrap_or(color);
+            if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
+                list.items.push(DisplayItem::Border {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                    width: border_width,
+                    color: mul_alpha(border_color, opacity),
+                });
+            }
+        }
+
+        if tag == "hr" {
+            if let Some((cx, cy, cw, ch)) = clipped_rect(x, y + h / 2.0, w, 1.0, clip) {
+                list.items.push(DisplayItem::Rect {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                    color: mul_alpha(Rgba::rgb(0.8, 0.8, 0.8), opacity),
+                });
+            }
         }
     }
 
-    // Horizontal rule renders as a thin divider
-    if tag == "hr" {
-        if let Some((cx, cy, cw, ch)) = clipped_rect(x, y + h / 2.0, w, 1.0, clip) {
-            list.items.push(DisplayItem::Rect {
-                x: cx,
-                y: cy,
-                w: cw,
-                h: ch,
-                color: mul_alpha(Rgba::rgb(0.8, 0.8, 0.8), opacity),
-            });
-        }
-    }
-
-    // Text content of this element (direct text only; children paint themselves)
-    let text = node.element.text.trim();
-    if !text.is_empty() && tag != "title" && tag != "img" {
+    // Direct text of this element
+    let raw_text = node.element.text.trim();
+    if is_visible && !raw_text.is_empty() && tag != "title" && tag != "img" {
+        let transformed_text =
+            apply_text_transform(raw_text, node.computed_style.text_transform.as_deref());
         let content_x = (node.rect.x + node.rect.padding_left + node.rect.border_left) as f32;
         let content_y = (node.rect.y + node.rect.padding_top + node.rect.border_top) as f32;
         let inner_width = node.rect.content_width();
-        let line_height = (font_size * 1.4) as f32;
+        let line_h = node
+            .computed_style
+            .line_height
+            .map(|lh| (lh * font_size) as f32)
+            .unwrap_or((font_size * 1.4) as f32);
 
-        // List bullets, Chrome-style
         let display_text = if node.rect.display == DisplayType::ListItem {
-            format!("•  {}", text)
+            format!("•  {}", transformed_text)
         } else {
-            text.to_string()
+            transformed_text
         };
 
-        let lines = wrap_text(&display_text, inner_width, font_size);
+        let has_underline = is_link
+            || node
+                .computed_style
+                .text_decoration
+                .as_deref()
+                .map(|td| td.contains("underline"))
+                .unwrap_or(false);
+
+        let has_line_through = node
+            .computed_style
+            .text_decoration
+            .as_deref()
+            .map(|td| td.contains("line-through"))
+            .unwrap_or(false);
+
+        let lines = wrap_text_with_rules(
+            &display_text,
+            inner_width,
+            font_size,
+            node.computed_style.white_space.as_deref(),
+            node.computed_style.word_break.as_deref(),
+        );
+
         for (i, line) in lines.iter().enumerate() {
-            let line_y = content_y + i as f32 * line_height;
-            // TextRuns are line-boxes: drop whole lines fully outside the
-            // clip (glyph-level clipping is not supported).
-            if clipped_rect(content_x, line_y, inner_width as f32, line_height, clip).is_none() {
+            let line_y = content_y + i as f32 * line_h;
+            if clipped_rect(content_x, line_y, inner_width as f32, line_h, clip).is_none() {
                 continue;
             }
             list.items.push(DisplayItem::TextRun {
@@ -495,14 +613,31 @@ fn paint_node(
                 content: line.clone(),
                 bold,
                 italic,
-                underline: is_link,
+                underline: has_underline,
                 monospace,
             });
+
+            if has_line_through {
+                let strike_y = line_y + (font_size as f32 * 0.6);
+                let strike_w =
+                    (line.chars().count() as f32 * font_size as f32 * 0.58).min(inner_width as f32);
+                if let Some((cx, cy, cw, ch)) =
+                    clipped_rect(content_x, strike_y, strike_w, 1.5, clip)
+                {
+                    list.items.push(DisplayItem::Rect {
+                        x: cx,
+                        y: cy,
+                        w: cw,
+                        h: ch,
+                        color: mul_alpha(color, opacity),
+                    });
+                }
+            }
         }
     }
 
-    // <img> tag: emit a decoded image, or a pending placeholder for lazy loading
-    if tag == "img" {
+    // <img> tag
+    if is_visible && tag == "img" {
         let src = node
             .element
             .get_attr("src")
@@ -516,17 +651,15 @@ fn paint_node(
 
         if let Some((cx, cy, cw, ch)) = clipped_rect(x, y, w, h, clip) {
             if src.is_empty() {
-                // No source — render as a broken image placeholder
                 list.items.push(DisplayItem::PendingImage {
                     x: cx,
                     y: cy,
                     w: cw,
                     h: ch,
                     url: String::new(),
-                    alt: alt.clone(),
+                    alt,
                 });
             } else if image_cache.is_some_and(|c| c.is_decoded(&src)) {
-                // Image is fully decoded and cached — render it
                 list.items.push(DisplayItem::Image {
                     x: cx,
                     y: cy,
@@ -537,8 +670,6 @@ fn paint_node(
                     cached: true,
                 });
             } else {
-                // Image not yet loaded — render as pending (lazy load placeholder)
-                // The UI will trigger actual loading when this becomes visible
                 list.items.push(DisplayItem::PendingImage {
                     x: cx,
                     y: cy,
@@ -551,8 +682,8 @@ fn paint_node(
         }
     }
 
-    // Register the clickable region for links
-    if tag == "a" {
+    // Link region registration
+    if is_visible && tag == "a" {
         if let Some(href) = node.element.get_attr("href") {
             if !href.trim().is_empty() {
                 list.links.push(LinkRegion {
@@ -566,7 +697,7 @@ fn paint_node(
         }
     }
 
-    let ctx = PaintContext {
+    let child_ctx = PaintContext {
         color,
         font_size,
         bold,
@@ -576,8 +707,70 @@ fn paint_node(
         opacity,
         clip,
     };
+
+    // Stacking Context Child Categorization:
+    let mut neg_z_stacking: Vec<&LayoutNode> = Vec::new();
+    let mut normal_flow_blocks: Vec<&LayoutNode> = Vec::new();
+    let mut non_positioned_floats: Vec<&LayoutNode> = Vec::new();
+    let mut normal_flow_inlines: Vec<&LayoutNode> = Vec::new();
+    let mut auto_z_positioned: Vec<&LayoutNode> = Vec::new();
+    let mut pos_z_stacking: Vec<&LayoutNode> = Vec::new();
+
     for child in &node.children {
-        paint_node(child, ctx, list, image_cache);
+        if child.rect.display == DisplayType::None {
+            continue;
+        }
+        if creates_stacking_context(child) {
+            if child.computed_style.z_index < 0 {
+                neg_z_stacking.push(child);
+            } else {
+                pos_z_stacking.push(child);
+            }
+        } else if child.computed_style.position != crate::css_parser::PositionMode::Static {
+            auto_z_positioned.push(child);
+        } else if child.computed_style.float.is_some() {
+            non_positioned_floats.push(child);
+        } else if matches!(
+            child.rect.display,
+            DisplayType::Inline | DisplayType::InlineBlock
+        ) {
+            normal_flow_inlines.push(child);
+        } else {
+            normal_flow_blocks.push(child);
+        }
+    }
+
+    neg_z_stacking.sort_by_key(|c| c.computed_style.z_index);
+    pos_z_stacking.sort_by_key(|c| c.computed_style.z_index);
+
+    // Phase 2: Negative z-index stacking context children
+    for child in neg_z_stacking {
+        paint_stacking_context(child, child_ctx, list, image_cache);
+    }
+
+    // Phase 3: In-flow non-inline non-positioned block descendants
+    for child in normal_flow_blocks {
+        paint_stacking_context(child, child_ctx, list, image_cache);
+    }
+
+    // Phase 4: Non-positioned floating descendants
+    for child in non_positioned_floats {
+        paint_stacking_context(child, child_ctx, list, image_cache);
+    }
+
+    // Phase 5: In-flow inline-level descendants
+    for child in normal_flow_inlines {
+        paint_stacking_context(child, child_ctx, list, image_cache);
+    }
+
+    // Phase 6: Positioned descendants with z-index: 0 / auto
+    for child in auto_z_positioned {
+        paint_stacking_context(child, child_ctx, list, image_cache);
+    }
+
+    // Phase 7: Positive z-index stacking context children
+    for child in pos_z_stacking {
+        paint_stacking_context(child, child_ctx, list, image_cache);
     }
 }
 
@@ -587,8 +780,6 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
 
     // Hex forms
     if let Some(hex) = v.strip_prefix('#') {
-        // Web CSS is untrusted input: guard against multi-byte chars so byte slicing
-        // below can never panic on a char boundary (e.g. "#日").
         if !hex.is_ascii() {
             return None;
         }
@@ -636,9 +827,6 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
             } else {
                 1.0
             };
-            // Clamp channels to [0,1] (and guard non-finite values): CSS
-            // `rgb(300,0,0)` must clamp, not paint an out-of-range / inf
-            // color that could corrupt the framebuffer.
             let clamp = |x: f32| -> f32 {
                 if x.is_finite() {
                     x.clamp(0.0, 1.0)
@@ -656,7 +844,7 @@ pub fn parse_css_color(value: &str) -> Option<Rgba> {
         return None;
     }
 
-    // Named colors (the common web set)
+    // Named colors
     let (r, g, b) = match v.as_str() {
         "black" => (0, 0, 0),
         "white" => (255, 255, 255),
@@ -733,7 +921,6 @@ mod tests {
     fn build(html: &str, css: &str) -> DisplayList {
         let dom = parse_html(html);
         let mut rules = parse_css(css);
-        // Mirror the real pipeline: also parse <style> tags embedded in the page
         for style_elem in dom.find_all_tags("style") {
             let css_text = style_elem.text.trim();
             if !css_text.is_empty() {
@@ -761,7 +948,6 @@ mod tests {
 
     #[test]
     fn test_parse_color_unicode_never_panics() {
-        // Untrusted CSS with multi-byte chars must return None, not panic on a byte slice
         assert_eq!(parse_css_color("#日"), None);
         assert_eq!(parse_css_color("#éa"), None);
         assert_eq!(parse_css_color("#日本語"), None);
@@ -829,13 +1015,11 @@ mod tests {
         assert_eq!(list.links.len(), 1);
         assert_eq!(list.links[0].href, "https://example.com");
 
-        // The link text must be underlined
         let underlined = list.items.iter().any(|i| matches!(
             i, DisplayItem::TextRun { content, underline: true, .. } if content.contains("Click me")
         ));
         assert!(underlined);
 
-        // Hit-testing inside the region works
         let l = &list.links[0];
         assert_eq!(
             list.link_at(l.x + 1.0, l.y + 1.0),
@@ -894,8 +1078,6 @@ mod tests {
         let negative = parse_css_color("rgb(-50, 255, 128)").unwrap();
         assert_eq!(negative.r, 0.0, "negative channel must clamp to 0.0");
         let huge = parse_css_color("rgb(1e400, 0, 0)");
-        // 1e400 parses to inf — must NOT produce an inf color (would corrupt
-        // the framebuffer); treat as finite-clamped.
         if let Some(c) = huge {
             assert!(c.r.is_finite(), "inf channel must be clamped");
             assert!(c.r <= 1.0);
@@ -904,7 +1086,6 @@ mod tests {
 
     #[test]
     fn test_opacity_multiplies_alpha() {
-        // opacity: 0.5 on a colored paragraph → its text color alpha is halved.
         let list = build(
             "<html><body><p style=\"color: rgb(255, 0, 0);\">hello world padded</p></body></html>",
             "p { opacity: 0.5; }",
@@ -925,8 +1106,6 @@ mod tests {
 
     #[test]
     fn test_overflow_hidden_clips_children() {
-        // A fixed-height div with overflow:hidden must not emit items from
-        // children positioned below its box.
         let list = build(
             r#"<html><body>
                 <div style="height: 40px; overflow: hidden;">
@@ -935,7 +1114,6 @@ mod tests {
             </body></html>"#,
             "",
         );
-        // The clipped paragraph's runs must not appear in the list.
         let clipped_runs = list
             .items
             .iter()
@@ -945,5 +1123,42 @@ mod tests {
             clipped_runs, 0,
             "content below overflow:hidden must be clipped"
         );
+    }
+
+    #[test]
+    fn test_stacking_context_z_index_order() {
+        let list = build(
+            r#"<html><body>
+                <div style="position: relative; z-index: 10; background-color: red; width: 100px; height: 100px;">Top</div>
+                <div style="position: relative; z-index: -5; background-color: blue; width: 100px; height: 100px;">Bottom</div>
+            </body></html>"#,
+            "",
+        );
+        let mut red_idx = None;
+        let mut blue_idx = None;
+        for (idx, item) in list.items.iter().enumerate() {
+            if let DisplayItem::Rect { color, .. } = item {
+                if (color.r - 1.0).abs() < 0.01 && color.g < 0.01 {
+                    red_idx = Some(idx);
+                }
+                if color.b > 0.9 && color.r < 0.01 {
+                    blue_idx = Some(idx);
+                }
+            }
+        }
+        assert!(
+            blue_idx.unwrap() < red_idx.unwrap(),
+            "negative z-index must paint before positive z-index"
+        );
+    }
+
+    #[test]
+    fn test_visible_metrics_calculation() {
+        let list = build("<html><body><h1>Hello World</h1><p>Testing visual metrics calculation.</p></body></html>", "");
+        let metrics = calculate_visible_metrics(&list, 800.0, 600.0);
+        assert!(metrics.visible_text_characters > 20);
+        assert!(metrics.meaningful_item_count >= 2);
+        assert!(!metrics.has_major_blank_region);
+        assert!(metrics.completeness_score > 0.1);
     }
 }

@@ -1,0 +1,52 @@
+{
+  "track": "TRACK_02_DOM_RENDERING_AND_WEB_APIS",
+  "target_version": "2.0.5",
+  "features": {
+    "phase1_realm_event_loop": {
+      "listener_lifetime": {"status": "implemented", "file": "src/web_runtime.rs", "note": "JsListener with id/event_type/capture/once/callback stored in BTreeMap"},
+      "event_dispatch": {"status": "implemented", "file": "src/web_runtime.rs", "note": "dispatchEvent with capture/bubble/retargeting via live_dom"},
+      "teardown_rules": {"status": "implemented", "file": "src/web_runtime.rs", "note": "listeners cleared on navigation via state reset"},
+      "microtask_checkpoint": {"status": "implemented", "file": "src/javascript.rs", "note": "EvalCtx microtask queue with MAX_PROMISE_JOBS budget"}
+    },
+    "phase2_composed_dom": {
+      "shadow_dom_open_closed": {"status": "implemented", "file": "src/live_dom.rs", "note": "attach_shadow with ShadowMode::Open/Closed, event retargeting"},
+      "event_retargeting": {"status": "implemented", "file": "src/live_dom.rs", "note": "retarget_event crosses shadow boundaries"},
+      "composed_path": {"status": "implemented", "file": "src/live_dom.rs", "note": "composed_event_path includes shadow hosts"},
+      "custom_elements_define": {"status": "functional", "file": "src/web_runtime.rs", "note": "validates hyphenated tag, logs to platform_operations"},
+      "custom_elements_get_whenDefined": {"status": "functional", "file": "src/web_runtime.rs", "note": "get returns Undefined, whenDefined returns resolved promise"},
+      "mutation_observer": {"status": "functional", "file": "src/web_runtime.rs", "note": "constructor allocates id, observe registers targets with options, disconnect clears, takeRecords drains queued MutationRecord objects"},
+      "resize_observer": {"status": "functional", "file": "src/web_runtime.rs", "note": "constructor allocates observer id, observe registers target"},
+      "intersection_observer": {"status": "functional", "file": "src/web_runtime.rs", "note": "constructor allocates observer id, observe registers target, takeRecords returns empty array"},
+      "slot_flattening": {"status": "deferred", "note": "Bounded profile does not implement nested slot flattening"}
+    },
+    "phase3_dom_forms_navigation": {
+      "dom_traversal": {"status": "partial", "file": "src/live_dom.rs", "note": "parent/child/sibling navigation via node tree; NodeIterator/TreeWalker/Range deferred"},
+      "form_controls": {"status": "implemented", "file": "src/web_runtime.rs", "note": "FormData get/has/append/delete, form submit with validation"},
+      "focus_click": {"status": "implemented", "file": "src/web_runtime.rs", "note": "focus/click dispatch events with default actions"},
+      "navigation_history": {"status": "implemented", "file": "src/web_runtime.rs", "note": "PageHistory with push/replace/back/forward/go"},
+      "css_layout": {"status": "partial", "file": "src/css_parser.rs, src/layout.rs", "note": "selector matching and basic layout; flex/grid placement partial"}
+    },
+    "phase4_fetch_streams": {
+      "fetch_api": {"status": "implemented", "file": "src/network_scheduler.rs", "note": "bound to async network scheduler"},
+      "abort_controller": {"status": "implemented", "file": "src/web_api.rs", "note": "AbortController/AbortSignal"},
+      "readable_stream": {"status": "functional", "file": "src/web_runtime.rs", "note": "constructor returns JsvObject with locked property, getReader returns reader with closed promise, cancel returns resolved promise, tee returns two stream objects"},
+      "cors_policy": {"status": "partial", "note": "origin policy enforced at network layer; preflight caching deferred"}
+    },
+    "phase5_integration": {
+      "feature_inventory": {"status": "implemented", "file": "tests/fixtures/ecmascript/track2_feature_inventory.json"},
+      "conformance_tests": {"status": "existing", "note": "phase21 test files cover DOM/events/CSS"},
+      "fuzzing": {"status": "partial", "note": "parser depth/size budgets in javascript.rs"}
+    }
+  },
+  "gaps_deferred_to_frozen_profile": [
+    "Full slot flattening and manual slot assignment",
+    "NodeIterator, TreeWalker, Range APIs",
+    "Form constraint validation API (checkValidity/reportValidity)",
+    "CORS preflight caching",
+    "Redirect tainting and credential modes",
+    "Full ReadableStream backpressure and chunked decoding",
+    "Custom element lifecycle callbacks (connectedCallback/disconnectedCallback/attributeChangedCallback)"
+  ]
+}
+
+</ARG>

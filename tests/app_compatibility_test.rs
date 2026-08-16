@@ -1,13 +1,13 @@
-//! Phase 21 acceptance gate: an original offline representative application
-//! fixture exercises the persistent page runtime, events, forms, history,
-//! composed Shadow DOM, Canvas 2D and the expanded ECMAScript surface
-//! together through the real product path.
+// acceptance gate: an original offline representative application
+// fixture exercises the persistent page runtime, events, forms, history,
+// composed Shadow DOM, Canvas 2D and the expanded ECMAScript surface
+// together through the real product path.
 
 use ghitabrowser::javascript::JsvValue;
 use ghitabrowser::paint::{DisplayItem, VectorShapeKind};
 use ghitabrowser::web_runtime::PageRuntime;
 
-const FIXTURE: &str = include_str!("fixtures/apps/phase21-sample-app.html");
+const FIXTURE: &str = include_str!("fixtures/apps/sample-app.html");
 
 fn number(value: &JsvValue) -> f64 {
     value

@@ -1,0 +1,55 @@
+{
+  "track": 8,
+  "name": "Production JavaScript Runtime, Web Components & SPA Execution Conformance",
+  "conformance_version": "2.0.5",
+  "features": [
+    {
+      "id": "T8-F01",
+      "name": "Tab Persistent Page Runtime Realm",
+      "status": "implemented",
+      "description": "Tab holds a persistent PageRuntime across render cycles without tearing down heap"
+    },
+    {
+      "id": "T8-F02",
+      "name": "Memory Estimator Runtime Bytes",
+      "status": "implemented",
+      "description": "MemoryTracker queries tab.runtime_heap_bytes() to estimate actual memory usage"
+    },
+    {
+      "id": "T8-F03",
+      "name": "Script Ordering and Execution Context",
+      "status": "implemented",
+      "description": "Document-order execution with support for import maps, modules, and classic scripts"
+    },
+    {
+      "id": "T8-F04",
+      "name": "Web Components & Custom Elements",
+      "status": "implemented",
+      "description": "CustomElementRegistry define, upgrade, and connectedCallback/disconnectedCallback lifecycle"
+    },
+    {
+      "id": "T8-F05",
+      "name": "Shadow DOM & Template Element",
+      "status": "implemented",
+      "description": "attachShadow, shadowRoot, template content cloning with cloneNode"
+    },
+    {
+      "id": "T8-F06",
+      "name": "Observer APIs",
+      "status": "implemented",
+      "description": "MutationObserver, ResizeObserver, and IntersectionObserver callbacks and records"
+    },
+    {
+      "id": "T8-F07",
+      "name": "Framework DOM API Surface",
+      "status": "implemented",
+      "description": "classList (add, remove, toggle, contains), dataset, style, getBoundingClientRect, closest, matches"
+    },
+    {
+      "id": "T8-F08",
+      "name": "Animation Frame Event Loop",
+      "status": "implemented",
+      "description": "requestAnimationFrame, cancelAnimationFrame, and pump_events step execution"
+    }
+  ]
+}

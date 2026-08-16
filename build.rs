@@ -24,7 +24,6 @@ fn main() {
         if let Err(error) = res.compile() {
             panic!("failed to compile Windows resources: {error}");
         }
-
         // GNU ld can discard winres' static archive because a resource object
         // has no referenced code symbol. Link the generated object explicitly
         // so icon and version metadata survive dead-code elimination/LTO.

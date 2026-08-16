@@ -1,0 +1,62 @@
+{
+  "contents": {
+    "twoColumnSearchResultsRenderer": {
+      "primaryContents": {
+        "sectionListRenderer": {
+          "contents": [
+            {
+              "itemSectionRenderer": {
+                "contents": [
+                  {
+                    "videoRenderer": {
+                      "videoId": "vid001",
+                      "title": {
+                        "runs": [
+                          { "text": "Rust Web Browser Architecture in 2026" }
+                        ]
+                      },
+                      "lengthText": {
+                        "simpleText": "14:20"
+                      },
+                      "thumbnail": {
+                        "thumbnails": [
+                          {
+                            "url": "https://i.ytimg.com/vi/vid001/hqdefault.jpg",
+                            "width": 480,
+                            "height": 360
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "videoRenderer": {
+                      "videoId": "vid002",
+                      "title": {
+                        "runs": [
+                          { "text": "Next-Gen CSS & Layout Engines Explained" }
+                        ]
+                      },
+                      "lengthText": {
+                        "simpleText": "28:45"
+                      },
+                      "thumbnail": {
+                        "thumbnails": [
+                          {
+                            "url": "https://i.ytimg.com/vi/vid002/hqdefault.jpg",
+                            "width": 480,
+                            "height": 360
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

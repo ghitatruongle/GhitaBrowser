@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "track": "Real-Site Acceptance, Diagnostics, and Corrective Release Gates",
+  "generated_at_unix": 1770960000,
+  "fixtures": [
+    {
+      "path": "tests/fixtures/css/wikipedia_sample.css",
+      "sha256": "62e4207535b87ee1e4441c7789b3e0c376118b8c13d66f5fb9933f34e9a7d8f3",
+      "description": "Sanitized Wikipedia desktop stylesheet with CSS custom properties, infobox, and media queries",
+      "category": "css",
+      "required_viewport_width": 1200,
+      "max_allowed_overlap_score": 0
+    },
+    {
+      "path": "tests/fixtures/layout/wikipedia_layout_sample.html",
+      "sha256": "b42ae15c9900bcb7116eded37f6140aa270660ac897296ef5bbca4da9019f7dc",
+      "description": "Representative Wikipedia article structure with title, infobox, TOC, lead, body, and references",
+      "category": "layout",
+      "required_viewport_width": 1200,
+      "max_allowed_overlap_score": 0
+    },
+    {
+      "path": "tests/fixtures/css/feature_inventory.json",
+      "sha256": "4b2399fc14f03d89b948b0047ed40c8667c68aa0cde43c3877cfdb5ad487a8c7",
+      "description": "CSS syntax, cascade, layers, and value parsing inventory",
+      "category": "css",
+      "required_viewport_width": null,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/layout/track7_layout_matrix.json",
+      "sha256": "3305c0e1530cb325cd6bdf840f72eae2e012cff1acb5b40619ad8daddcbb9963",
+      "description": "Track 7 Formatting contexts, flexbox, grid, tables, floats, and positioning matrix",
+      "category": "layout",
+      "required_viewport_width": null,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/spa/youtube_spa_sample.html",
+      "sha256": "855e9fe09875da08dc92f0a7446f936324c5e622ee4a22fde4e015ea5209dc83",
+      "description": "YouTube SPA hydration sample with web components, player placeholder, and comment section",
+      "category": "spa",
+      "required_viewport_width": 1200,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/spa/web_component_todo_app.html",
+      "sha256": "4a33d543e131a95ee68404d1f754994307610689c5112847f095ae95142d5ce8",
+      "description": "Vanilla Web Component application with custom elements, shadow DOM, and dynamic list mutations",
+      "category": "spa",
+      "required_viewport_width": 800,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/spa/track8_spa_feature_matrix.json",
+      "sha256": "71f42f432f74bef7ac86a3b8e48d63d99654cb02a9aa895bba80b7947d44a4b9",
+      "description": "Track 8 SPA runtime feature matrix and event loop capability anchors",
+      "category": "spa",
+      "required_viewport_width": null,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/youtube/youtube_route_matrix.json",
+      "sha256": "66fe4651bcc7a03529678c459bc1d79434df842c5defcc6a045ed173335611f9",
+      "description": "YouTube URL classification matrix for Home, Search, Watch, Playlist, Channel, Shorts, Embed",
+      "category": "youtube",
+      "required_viewport_width": null,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/youtube/youtube_search_results.json",
+      "sha256": "c4c7a8b8bcd566968c6a2f375a0e1ab6a48f12a6f5c96221d16850ca3a7ccb82",
+      "description": "YouTube search results bootstrap payload with video renderers",
+      "category": "youtube",
+      "required_viewport_width": null,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/youtube/youtube_watch_clear.json",
+      "sha256": "b06d3b0fe012c65b2c3cdcd62d9695cd18c0704eaa6264d19147701c2afddcfc",
+      "description": "YouTube watch response with valid direct clear MP4 and adaptive AAC formats",
+      "category": "youtube",
+      "required_viewport_width": null,
+      "max_allowed_overlap_score": null
+    },
+    {
+      "path": "tests/fixtures/youtube/youtube_watch_restricted.json",
+      "sha256": "dc45245f99c112aff5f57e1b20279494a5ef87a06cc28bdbf020e0ef0e3a8641",
+      "description": "YouTube restricted, login-required, age-check, and cipher DRM responses",
+      "category": "youtube",
+      "required_viewport_width": null,
+      "max_allowed_overlap_score": null
+    }
+  ]
+}

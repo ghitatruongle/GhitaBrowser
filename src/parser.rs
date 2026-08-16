@@ -7,7 +7,7 @@ use std::collections::HashMap;
 // Layout, paint and drop still contain bounded recursive walks. Keeping the
 // parsed tree below 128 levels prevents hostile markup from exhausting the
 // default worker-thread stack while preserving deeply nested real documents.
-pub const MAX_DOM_DEPTH: usize = 128;
+pub const MAX_DOM_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Element {
@@ -289,12 +289,9 @@ fn should_auto_close_parent(parent_tag: &str, child_tag: &str) -> bool {
         ) | ("li", "li")
             | ("dt" | "dd", "dt" | "dd")
             | ("option", "option")
-            | ("tr", "tr" | "th" | "td")
-            | ("th" | "td", "th" | "td")
-            | (
-                "thead" | "tbody" | "tfoot",
-                "thead" | "tbody" | "tfoot" | "tr"
-            )
+            | ("tr", "tr")
+            | ("th" | "td", "th" | "td" | "tr")
+            | ("thead" | "tbody" | "tfoot", "thead" | "tbody" | "tfoot")
     )
 }
 

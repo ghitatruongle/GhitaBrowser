@@ -3,6 +3,16 @@
 All notable changes to GhitaBrowser are documented here. The project follows
 Semantic Versioning.
 
+## [2.0.6] - 2026-08-15
+
+### Added
+- Extended Web APIs in `web_runtime.rs`: `ResizeObserver`, `IntersectionObserver`, `requestAnimationFrame`/`cancelAnimationFrame`, `crypto.getRandomValues`, `crypto.subtle`, `matchMedia`, `CSS.supports`.
+- Enhanced ECMAScript support in `javascript.rs`: `Promise.allSettled`, `Promise.any`, logical assignment operators (`&&=`, `||=`, `??=`), optimized evaluation scope allocation.
+- Kinetic smooth scrolling physics with velocity damping in `ui.rs`.
+- Vietnamese IME input normalization and improved Omnibox text editing resilience.
+- Layout Box Model accuracy improvements in `layout.rs`: enhanced Flexbox gap/wrap calculations, margin collapsing, multi-line typography wrapping.
+- Resilient YouTube playback fallback in `youtube.rs` with multi-client profile discovery and adaptive format selection.
+
 ## [2.0.0] - 2026-08-09
 
 ### Added

@@ -28,7 +28,17 @@ impl TextRenderer {
         let space = "  ".repeat(indent);
 
         match node.rect.display {
-            DisplayType::Block | DisplayType::ListItem | DisplayType::Flex | DisplayType::Grid => {
+            DisplayType::Block
+            | DisplayType::ListItem
+            | DisplayType::Flex
+            | DisplayType::Grid
+            | DisplayType::Table
+            | DisplayType::TableRowGroup
+            | DisplayType::TableHeaderGroup
+            | DisplayType::TableFooterGroup
+            | DisplayType::TableRow
+            | DisplayType::TableCaption
+            | DisplayType::FlowRoot => {
                 let tag_display = if !node.element.tag.is_empty() && node.element.tag != "root" {
                     format!("<{}>", node.element.tag)
                 } else {
@@ -45,7 +55,7 @@ impl TextRenderer {
                     self.render_node(child, indent + 1, output);
                 }
             }
-            DisplayType::Inline | DisplayType::InlineBlock => {
+            DisplayType::Inline | DisplayType::InlineBlock | DisplayType::TableCell => {
                 if !node.element.text.is_empty() {
                     output.push_str(&format!("{}{}", space, node.element.text));
                     if indent == 0 || !node.children.is_empty() {

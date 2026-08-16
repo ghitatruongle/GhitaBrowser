@@ -1,0 +1,51 @@
+{
+  "playabilityStatus": {
+    "status": "OK",
+    "playableInEmbed": true
+  },
+  "videoDetails": {
+    "videoId": "ghitaVideo1",
+    "title": "Ghita Browser Performance Benchmark",
+    "lengthSeconds": "120",
+    "channelId": "UC1234567890",
+    "isOwnerViewing": false,
+    "shortDescription": "Full clear playback demo",
+    "isCrawlable": true,
+    "viewCount": "42000"
+  },
+  "streamingData": {
+    "expiresInSeconds": "21600",
+    "formats": [
+      {
+        "itag": 18,
+        "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+        "bitrate": 500000,
+        "width": 640,
+        "height": 360,
+        "contentLength": "7500000",
+        "quality": "medium",
+        "url": "https://rr1---sn-abc.googlevideo.com/videoplayback?id=18"
+      }
+    ],
+    "adaptiveFormats": [
+      {
+        "itag": 133,
+        "mimeType": "video/mp4; codecs=\"avc1.4d400c\"",
+        "bitrate": 250000,
+        "width": 256,
+        "height": 144,
+        "contentLength": "3750000",
+        "quality": "tiny",
+        "url": "https://rr1---sn-abc.googlevideo.com/videoplayback?id=133"
+      },
+      {
+        "itag": 140,
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "bitrate": 128000,
+        "contentLength": "1920000",
+        "audioQuality": "AUDIO_QUALITY_MEDIUM",
+        "url": "https://rr1---sn-abc.googlevideo.com/videoplayback?id=140"
+      }
+    ]
+  }
+}

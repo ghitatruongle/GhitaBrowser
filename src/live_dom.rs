@@ -299,6 +299,10 @@ impl LiveDocument {
         self.invalidation
     }
 
+    pub fn viewport_width(&self) -> u32 {
+        self.viewport_width
+    }
+
     pub fn render_state(&self) -> &LiveRenderState {
         &self.render
     }
@@ -381,6 +385,25 @@ impl LiveDocument {
         layout.as_ref().and_then(|layout| visit(layout, node))
     }
 
+    /// Retrieve the computed layout rect of a node if present in the current layout tree.
+    pub fn node_rect(&self, node: NodeId) -> Option<crate::layout::RectModel> {
+        fn visit(layout: &LayoutNode, node: NodeId) -> Option<crate::layout::RectModel> {
+            if layout.element.node_id == Some(node) {
+                return Some(layout.rect);
+            }
+            for child in &layout.children {
+                if let Some(found) = visit(child, node) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        self.render
+            .layout
+            .as_ref()
+            .and_then(|layout| visit(layout, node))
+    }
+
     /// Record a Canvas 2D shape drawn through the host bridge.
     pub fn add_canvas_shape(
         &mut self,
@@ -457,6 +480,7 @@ impl LiveDocument {
     }
 
     /// Import a parsed element as a detached live subtree. The imported root
+    /// Import a parsed element as a detached live subtree. The imported root
     /// receives a fresh identity unless the supplied preferred id is unused.
     /// This is the bridge used by inert template fragments.
     pub fn import_subtree(&mut self, element: &Element) -> Result<NodeId, String> {
@@ -465,6 +489,31 @@ impl LiveDocument {
         let node = self.import_element(&detached, None)?;
         self.mark_mutated();
         Ok(node)
+    }
+
+    /// Recursively clone a node and optionally its children.
+    pub fn clone_node(&mut self, node: NodeId, deep: bool) -> Result<NodeId, String> {
+        let entry = self.require_node(node)?.clone();
+        let cloned_id = match entry.kind {
+            LiveNodeKind::Element {
+                tag,
+                attrs,
+                is_void,
+            } => self.allocate(LiveNodeKind::Element {
+                tag,
+                attrs,
+                is_void,
+            })?,
+            LiveNodeKind::Text(text) => self.allocate(LiveNodeKind::Text(text))?,
+        };
+        if deep {
+            for child in entry.children {
+                let child_clone = self.clone_node(child, true)?;
+                self.append_child(cloned_id, child_clone)?;
+            }
+        }
+        self.mark_mutated();
+        Ok(cloned_id)
     }
 
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), String> {

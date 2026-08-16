@@ -1,18 +1,21 @@
 // GhitaBrowser core module re-exports
-// GhitaBrowser
-//! A lightweight, document-focused browser engine built in safe Rust
-/// Single source of truth for the app version.
-/// Used by the UI (status bar, about), the user-agent strings and storage state.
+// A lightweight, document-focused browser engine built in safe Rust
+// Single source of truth for the app version.
+// Used by the UI (status bar, about), the user-agent strings and storage state.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod acceptance;
 pub mod accessibility;
 pub mod adblock;
 pub mod app_platform;
+pub mod application_profiles;
 pub mod audio_output;
+pub mod auth_session;
+pub mod background_worker;
 pub mod bookmarks;
 pub mod cache_api;
 pub mod child_process;
+pub mod compatibility_diagnostics;
 pub mod content_control;
 pub mod crash_recovery;
 pub mod css_parser;
@@ -58,6 +61,8 @@ pub mod pip;
 pub mod process_architecture;
 pub mod process_coordinator;
 pub mod promise_runtime;
+pub mod protected_media;
+pub mod push;
 pub mod reader_mode;
 pub mod realtime;
 pub mod release_smoke;
@@ -86,6 +91,8 @@ pub mod wasm_interp;
 pub mod web_api;
 pub mod web_capture;
 pub mod web_runtime;
+pub mod webrtc;
+pub mod webtransport;
 pub mod windows_integration;
 pub mod worker;
 pub mod youtube;
@@ -221,15 +228,15 @@ pub struct Browser {
     /// Optional native multi-process control plane. It is enabled by the
     /// desktop app when the packaged child executable is available.
     pub process_coordinator: Option<process_coordinator::BrowserProcessCoordinator>,
-    /// Extension Manager for Phase 26 independent extensions
+    /// Extension Manager for independent extensions
     pub extension_manager: extensions::ExtensionManager,
-    /// App Manager for Phase 26 installed web apps
+    /// App Manager for installed web apps
     pub app_manager: installed_app::InstalledAppManager,
-    /// Safe Rust Updater Manager for Phase 27
+    /// Safe Rust Updater Manager
     pub updater: updater::UpdateManager,
-    /// Windows Integration Manager for Phase 27
+    /// Windows Integration Manager
     pub win_integration: windows_integration::WindowsIntegration,
-    /// Acceptance Release Manager for Phase 28
+    /// Acceptance Release Manager
     pub acceptance: acceptance::AcceptanceReleaseManager,
 }
 
@@ -1262,10 +1269,10 @@ mod tests {
         assert_eq!(browser.storage.settings.memory_pressure_threshold_mb, 500);
     }
 
-    /// Integration test: verify the full image rendering pipeline.
-    /// 1. HTML with <img> → layout → display list has PendingImage
-    /// 2. Load image into cache → rebuild → display list has Image { cached: true }
-    /// 3. Image handle map contains the URL
+    // Integration test: verify the full image rendering pipeline.
+    // HTML with <img> → layout → display list has PendingImage
+    // Load image into cache → rebuild → display list has Image { cached: true }
+    // Image handle map contains the URL
     #[test]
     fn test_image_rendering_pipeline() {
         let html = r#"<html><body>
@@ -1274,12 +1281,12 @@ mod tests {
             <p>Some text below the image</p>
         </body></html>"#;
 
-        // 1. Parse and build layout
+        // Parse and build layout
         let dom = parser::parse_html(html);
         let css_rules: Vec<css_parser::CssRule> = Vec::new();
         let layout_tree = layout::create_layout_tree(&dom, &css_rules, 800).unwrap();
 
-        // 2. Build display list — image not loaded yet → PendingImage
+        // Build display list — image not loaded yet → PendingImage
         let image_cache = crate::image_loader::ImageCache::new();
         let display_list =
             crate::paint::build_display_list_with_cache(&layout_tree, Some(&image_cache));
@@ -1293,27 +1300,22 @@ mod tests {
             "Display list should contain PendingImage for the <img> tag"
         );
 
-        // 3. Verify no cached image yet
+        // Verify no cached image yet
         let has_cached = display_list
             .items
             .iter()
             .any(|item| matches!(item, crate::paint::DisplayItem::Image { cached: true, .. }));
         assert!(!has_cached, "No image should be cached yet");
 
-        // 4. Simulate the decoded-cache state via the public cache API below.
-        // We need to insert directly into the cache's decoded map.
-        // Since load_image fetches via network, we simulate by creating
-        // an ImageData and putting it in. Let's verify the cache API:
+        // Simulate the decoded-cache state via the public cache API
         let mut cache = crate::image_loader::ImageCache::new();
         cache.add(
             "https://example.com/photo.jpg".to_string(),
             crate::image_loader::Image::new("https://example.com/photo.jpg", 200, 150)
                 .with_alt("Photo"),
         );
-
         // Verify is_decoded is false before loading
         assert!(!cache.is_decoded("https://example.com/photo.jpg"));
-
         // Verify we can get metadata
         let img = cache.get("https://example.com/photo.jpg").unwrap();
         assert_eq!(img.width, 200);
@@ -1323,8 +1325,7 @@ mod tests {
             !img.loaded,
             "Image should not be marked loaded until decoded"
         );
-
-        // 5. Rebuild display list with same cache — still PendingImage (not decoded)
+        // Rebuild display list with same cache — still PendingImage (not decoded)
         let display_list2 = crate::paint::build_display_list_with_cache(&layout_tree, Some(&cache));
         let has_cached2 = display_list2
             .items

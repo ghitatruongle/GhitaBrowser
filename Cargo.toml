@@ -1,6 +1,6 @@
 [package]
 name = "ghitabrowser"
-version = "2.0.0"
+version = "2.0.6"
 edition = "2021"
 authors = ["GhitaBrowser"]
 description = "A lightweight document-focused browser written in safe Rust"
@@ -67,7 +67,7 @@ url = "2.5"
 # so DOM snapshots nested deeper than ~40 levels round-trip (each DOM level
 # costs several JSON containers). The deserializer-side depth is bounded
 # separately in tab.rs before decode, so unbounded depth cannot be abused.
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0", features = ["unbounded_depth"] }
 
 # Date/time for cookies
@@ -131,6 +131,7 @@ rstest = "0.18"
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = true
 
 [[bench]]
 name = "engine_bench"

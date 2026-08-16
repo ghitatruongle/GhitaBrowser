@@ -1,0 +1,52 @@
+{
+  "test_cases": [
+    {
+      "url": "https://www.youtube.com/",
+      "expected_route": "Home",
+      "expected_video_id": null
+    },
+    {
+      "url": "https://m.youtube.com/",
+      "expected_route": "Home",
+      "expected_video_id": null
+    },
+    {
+      "url": "https://www.youtube.com/results?search_query=rust+async",
+      "expected_route": "Search",
+      "expected_query": "rust async",
+      "expected_video_id": null
+    },
+    {
+      "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "expected_route": "Watch",
+      "expected_video_id": "dQw4w9WgXcQ"
+    },
+    {
+      "url": "https://youtu.be/dQw4w9WgXcQ",
+      "expected_route": "Watch",
+      "expected_video_id": "dQw4w9WgXcQ"
+    },
+    {
+      "url": "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+      "expected_route": "Shorts",
+      "expected_video_id": "dQw4w9WgXcQ"
+    },
+    {
+      "url": "https://www.youtube.com/embed/dQw4w9WgXcQ",
+      "expected_route": "Embed",
+      "expected_video_id": "dQw4w9WgXcQ"
+    },
+    {
+      "url": "https://www.youtube.com/playlist?list=PL1234567890&v=dQw4w9WgXcQ",
+      "expected_route": "Playlist",
+      "expected_playlist_id": "PL1234567890",
+      "expected_video_id": "dQw4w9WgXcQ"
+    },
+    {
+      "url": "https://www.youtube.com/@GhitaBrowserOfficial",
+      "expected_route": "Channel",
+      "expected_channel_id": "@GhitaBrowserOfficial",
+      "expected_video_id": null
+    }
+  ]
+}

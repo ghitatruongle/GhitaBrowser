@@ -1,20 +1,20 @@
-//! Bounded host bridge for a deliberately small, clean-room web runtime.
-//!
-//! Pure ECMAScript continues to run through `JsvEngine`. This module handles
-//! a safe first layer of DOM mutations, storage requests and same-origin fetch
-//! discovery used by common progressively-enhanced documents.
+// Bounded host bridge for a deliberately small, clean-room web runtime.
+// Pure ECMAScript continues to run through `JsvEngine`. This module handles
+// a safe first layer of DOM mutations, storage requests and same-origin fetch
+// discovery used by common progressively-enhanced documents.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 
 use crate::css_parser::CssRule;
 use crate::html_media::{HtmlMediaElement, MediaEvent};
 use crate::javascript::{
-    JsvHost, JsvValue, HOST_CACHE_STORAGE, HOST_DOCUMENT, HOST_EVENT, HOST_FORM_DATA, HOST_HISTORY,
-    HOST_INDEXED_DB, HOST_LOCAL_STORAGE, HOST_LOCATION, HOST_NAVIGATOR, HOST_SERVICE_WORKER,
-    HOST_WINDOW,
+    random_u8, random_uuid_v4, JsvArrayBuffer, JsvHost, JsvTypedArray, JsvValue, TypedArrayKind,
+    HOST_CACHE_STORAGE, HOST_CRYPTO, HOST_CSS, HOST_CUSTOM_ELEMENTS, HOST_DOCUMENT, HOST_EVENT,
+    HOST_FORM_DATA, HOST_HISTORY, HOST_INDEXED_DB, HOST_LOCAL_STORAGE, HOST_LOCATION,
+    HOST_NAVIGATOR, HOST_PERFORMANCE, HOST_SERVICE_WORKER, HOST_WINDOW,
 };
 use crate::live_dom::{DefaultAction, DispatchReport, DomEvent, LiveDocument, NodeId};
 use crate::media_backend::{merged_capabilities, FallbackRegistry, WindowsMediaFoundationBackend};
@@ -35,11 +35,41 @@ const MAX_STORAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HISTORY_ENTRIES: usize = 100;
 const MAX_EVENT_RECORDS: usize = 256;
 const MAX_FORM_ENTRIES: usize = 256;
+const MAX_FORM_DATA_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EVENT_TYPE_BYTES: usize = 256;
+const MAX_EVENT_DETAIL_BYTES: usize = 64 * 1024;
+const MAX_REPORT_TEXT_BYTES: usize = 4 * 1024;
 const MAX_JS_LISTENERS_PER_NODE: usize = 128;
+const MAX_CUSTOM_ELEMENTS: usize = 1_024;
+const MAX_CUSTOM_ELEMENT_NAME_BYTES: usize = 128;
+const MAX_CUSTOM_ELEMENT_WAITERS: usize = 1_024;
+const MAX_OBSERVER_TARGETS: usize = 1_024;
+const MAX_OBSERVER_OLD_VALUE_BYTES: usize = 4 * 1024;
 
 /// Listener key for the `window` object. `HOST_WINDOW` (=2) can collide with
 /// a real DOM NodeId, so window-level listeners use a reserved sentinel.
 const LISTENER_WINDOW: u64 = u64::MAX;
+
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn push_report_error(report: &mut RuntimeReport, error: String) {
+    if report.errors.len() < 256 {
+        report
+            .errors
+            .push(bounded_text(&error, MAX_REPORT_TEXT_BYTES));
+    } else {
+        report.truncated = true;
+    }
+}
 
 fn runtime_origin(base_url: &str) -> String {
     url::Url::parse(base_url)
@@ -366,6 +396,87 @@ struct PendingDispatch {
     detail: Option<String>,
 }
 
+/// A single mutation record queued by MutationObserver (Track 2 Phase 2).
+#[derive(Debug, Clone)]
+struct MutationRecord {
+    /// "attributes", "childList", or "characterData"
+    record_type: String,
+    /// The node that was mutated (host handle).
+    target: u64,
+    /// Attribute name for attribute mutations.
+    attribute_name: Option<String>,
+    /// Old value for attribute/characterData mutations when requested.
+    old_value: Option<String>,
+    /// Added nodes (host handles) for childList mutations.
+    added_nodes: Vec<u64>,
+    /// Removed nodes (host handles) for childList mutations.
+    removed_nodes: Vec<u64>,
+    /// Previous sibling host handle.
+    previous_sibling: Option<u64>,
+    /// Next sibling host handle.
+    next_sibling: Option<u64>,
+}
+
+/// Configuration passed to MutationObserver.observe().
+#[derive(Debug, Clone, Default)]
+struct MutationObserverOptions {
+    attributes: bool,
+    child_list: bool,
+    character_data: bool,
+    subtree: bool,
+    attribute_old_value: bool,
+    character_data_old_value: bool,
+    #[allow(dead_code)]
+    attribute_filter: Option<Vec<String>>,
+}
+
+/// The three observer APIs share bounded registration/lifetime bookkeeping.
+/// Their records intentionally use the same host-object representation so a
+/// callback can be queued by one page realm and delivered by a later turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObserverKind {
+    Mutation,
+    Resize,
+    Intersection,
+}
+
+/// One observer instance registered through the host bridge.
+#[derive(Debug, Clone)]
+struct MutationObserverEntry {
+    /// Host object id of this observer.
+    id: u64,
+    kind: ObserverKind,
+    /// JavaScript callback invoked with an array of MutationRecords.
+    callback: JsvValue,
+    /// Nodes being observed and their options.
+    targets: BTreeMap<u64, MutationObserverOptions>,
+    /// Queued records not yet delivered via takeRecords or callback.
+    records: VecDeque<MutationRecord>,
+}
+
+/// Maximum number of mutation observers per page realm.
+const MAX_MUTATION_OBSERVERS: usize = 256;
+/// Maximum queued mutation records per observer before oldest are dropped.
+const MAX_MUTATION_RECORDS: usize = 512;
+const MAX_STREAMS_PER_PAGE: usize = 128;
+const MAX_STREAM_CHUNKS: usize = 1_024;
+const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_BYTES_PER_PAGE: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Default)]
+struct ReadableStreamEntry {
+    chunks: VecDeque<Rc<Vec<u8>>>,
+    total_bytes: usize,
+    locked: bool,
+    closed: bool,
+    cancelled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReadableStreamReader {
+    stream: u64,
+}
+
 /// All state that outlives a single script turn, owned by `PageRuntime`.
 /// `RuntimeHost` borrows this for the duration of one execution so event
 /// listeners, timers, storage and history stay consistent across tasks.
@@ -408,17 +519,56 @@ struct PageRuntimeState {
     pub quota_manager: crate::storage_quota::StorageQuotaManager,
     idb_databases: BTreeMap<u64, String>,
     idb_stores: BTreeMap<u64, (String, String)>,
+    idb_indexes: BTreeMap<u64, (String, String, String)>,
+    idb_cursors: BTreeMap<u64, crate::indexeddb::IDBCursor>,
     cache_handles: BTreeMap<u64, String>,
     service_worker_registrations: BTreeMap<u64, String>,
     web_sockets: BTreeMap<u64, crate::realtime::WebSocketClient>,
     event_sources: BTreeMap<u64, crate::realtime::EventSourceClient>,
     broadcast_channels: BTreeMap<u64, crate::messaging::BroadcastChannel>,
+    /// Track 2 Phase 2: MutationObserver instances keyed by host object id.
+    mutation_observers: BTreeMap<u64, MutationObserverEntry>,
+    next_observer_id: u64,
+    /// Observer callbacks are delivered at a microtask checkpoint after a
+    /// host turn. Duplicates are avoided when the first record is queued.
+    pending_observer_callbacks: Vec<u64>,
+    /// Project-owned custom-element definitions for this document realm.
+    /// The constructor value remains rooted until navigation/teardown.
+    custom_elements: BTreeMap<String, JsvValue>,
+    custom_element_waiters: BTreeMap<String, Vec<crate::javascript::JsvPromiseRef>>,
+    /// Bounded browser-owned readable streams and readers. Fetch integration
+    /// may append chunks only through the policy-checked network layer.
+    readable_streams: BTreeMap<u64, ReadableStreamEntry>,
+    stream_readers: BTreeMap<u64, ReadableStreamReader>,
+    /// Queued requestAnimationFrame callbacks keyed by id.
+    animation_frame_callbacks: BTreeMap<u64, JsvValue>,
+    next_raf_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScriptDiagnostic {
+    pub url: String,
+    pub script_type: String,
+    pub phase: String,
+    pub status: String,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeReport {
     pub scripts_seen: usize,
     pub scripts_executed: usize,
+    pub scripts_fetched: usize,
+    pub scripts_skipped: usize,
+    pub scripts_failed: usize,
+    pub scripts_timed_out: usize,
+    pub scripts_cancelled: usize,
+    pub script_diagnostics: Vec<ScriptDiagnostic>,
+    pub custom_elements_defined: usize,
+    pub custom_elements_upgraded: usize,
+    pub shadow_roots_created: usize,
+    pub observer_callbacks_fired: usize,
+    pub animation_frames_fired: usize,
     pub dom_mutations: usize,
     pub event_listeners: usize,
     pub scheduled_tasks: usize,
@@ -432,24 +582,28 @@ pub struct RuntimeReport {
     pub console: Vec<String>,
     pub errors: Vec<String>,
     pub truncated: bool,
-    /// Phase 21: script-driven history mutations (`pushState`/`replaceState`)
+    /// script-driven history mutations (`pushState`/`replaceState`)
     /// in the form `kind url` so browser UI can mirror them into tab history.
     pub history_mutations: Vec<String>,
-    /// Phase 21: cancelable form submissions that reached the browser-owned
+    /// cancelable form submissions that reached the browser-owned
     /// navigation boundary (`method action body-size`).
     pub submitted_forms: Vec<String>,
-    /// Phase 21: number of timer callbacks executed through the page runtime.
+    /// number of timer callbacks executed through the page runtime.
     pub timers_fired: usize,
-    /// Phase 21: number of JavaScript event listeners invoked by name.
+    /// number of JavaScript event listeners invoked by name.
     pub events_dispatched: Vec<String>,
-    /// Phase 21: form validation failures that blocked a submission
+    /// form validation failures that blocked a submission
     /// (`required field 'name' is empty` style).
     pub validation_errors: Vec<String>,
-    /// Phase 22: successful platform API operations, capped for diagnostics.
+    /// successful platform API operations, capped for diagnostics.
     pub platform_operations: Vec<String>,
-    /// Phase 25: successful, origin-noised Canvas 2D pixel readbacks.
+    /// successful, origin-noised Canvas 2D pixel readbacks.
     pub canvas_readbacks: usize,
 }
+
+const HOST_CLASSLIST_BIT: u64 = 0x1000_0000_0000_0000;
+const HOST_DATASET_BIT: u64 = 0x2000_0000_0000_0000;
+const HOST_STYLE_BIT: u64 = 0x4000_0000_0000_0000;
 
 #[derive(Debug, Clone)]
 enum ElementLocator {
@@ -514,7 +668,11 @@ impl<'a> RuntimeHost<'a> {
 
     fn record_platform_operation(&mut self, operation: impl Into<String>) {
         if self.report.platform_operations.len() < 256 {
-            self.report.platform_operations.push(operation.into());
+            self.report
+                .platform_operations
+                .push(bounded_text(&operation.into(), MAX_REPORT_TEXT_BYTES));
+        } else {
+            self.report.truncated = true;
         }
     }
 
@@ -595,13 +753,12 @@ impl<'a> RuntimeHost<'a> {
                 values.iter().map(Self::json_to_jsv).collect(),
             ))),
             serde_json::Value::Object(values) => {
-                JsvValue::Object(Rc::new(RefCell::new(crate::javascript::JsvObject {
-                    properties: values
+                JsvValue::Object(Rc::new(RefCell::new(crate::javascript::JsvObject::plain(
+                    values
                         .iter()
                         .map(|(key, value)| (key.clone(), Self::json_to_jsv(value)))
                         .collect(),
-                    prototype: None,
-                })))
+                ))))
             }
         }
     }
@@ -883,6 +1040,15 @@ impl<'a> RuntimeHost<'a> {
         cancelable: bool,
         detail: Option<String>,
     ) -> Result<u64, String> {
+        if event_type.is_empty() || event_type.len() > MAX_EVENT_TYPE_BYTES {
+            return Err("TypeError: event type exceeds budget".to_string());
+        }
+        if detail
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_EVENT_DETAIL_BYTES)
+        {
+            return Err("QuotaExceededError: event detail exceeds budget".to_string());
+        }
         if self.state.events.len() >= MAX_EVENT_RECORDS {
             return Err("QuotaExceededError: event object budget exceeded".to_string());
         }
@@ -909,6 +1075,7 @@ impl<'a> RuntimeHost<'a> {
             return Err("QuotaExceededError: FormData budget exceeded".to_string());
         }
         let mut entries = Vec::new();
+        let mut retained_bytes = 0usize;
         for node in self.dom.document_order() {
             if self.is_descendant_of(node, form) || node == form {
                 if let Some(name) = self.dom.get_attribute(node, "name") {
@@ -916,6 +1083,14 @@ impl<'a> RuntimeHost<'a> {
                     if matches!(tag.as_str(), "input" | "select" | "textarea") {
                         let value = self.control_value(node);
                         if let Some(value) = value {
+                            retained_bytes = retained_bytes
+                                .saturating_add(name.len())
+                                .saturating_add(value.len());
+                            if retained_bytes > MAX_FORM_DATA_BYTES {
+                                return Err(
+                                    "QuotaExceededError: FormData byte budget exceeded".to_string()
+                                );
+                            }
                             entries.push((name.to_string(), value));
                             if entries.len() >= MAX_FORM_ENTRIES {
                                 break;
@@ -1074,6 +1249,499 @@ impl<'a> RuntimeHost<'a> {
         });
     }
 
+    /// Queue a mutation record to all observers watching the target node
+    /// (Track 2 Phase 2). Respects per-observer budgets and drops oldest
+    /// records when the cap is exceeded.
+    fn queue_mutation_record(
+        &mut self,
+        record_type: &str,
+        target: u64,
+        attribute_name: Option<String>,
+        old_value: Option<String>,
+        added_nodes: Vec<u64>,
+        removed_nodes: Vec<u64>,
+    ) {
+        let target_node = self.locator(target).ok();
+        let observed_ancestors: Vec<u64> = self
+            .state
+            .elements
+            .iter()
+            .filter_map(|(handle, locator)| match (locator, target_node) {
+                (ElementLocator::Node(candidate), Some(node))
+                    if *candidate == node || self.is_descendant_of(node, *candidate) =>
+                {
+                    Some(*handle)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut to_notify = Vec::new();
+        for entry in self.state.mutation_observers.values_mut() {
+            if entry.kind != ObserverKind::Mutation {
+                continue;
+            }
+            // Check if any observed target matches (direct or subtree).
+            let matching_options = entry.targets.iter().find_map(|(observed, opts)| {
+                let target_matches =
+                    *observed == target || (opts.subtree && observed_ancestors.contains(observed));
+                if !target_matches {
+                    return None;
+                }
+                let observes_kind = match record_type {
+                    "attributes" => {
+                        opts.attributes
+                            && opts.attribute_filter.as_ref().is_none_or(|filter| {
+                                attribute_name
+                                    .as_ref()
+                                    .is_some_and(|name| filter.iter().any(|item| item == name))
+                            })
+                    }
+                    "childList" => opts.child_list,
+                    "characterData" => opts.character_data,
+                    _ => false,
+                };
+                observes_kind.then_some(opts.clone())
+            });
+            let Some(options) = matching_options else {
+                continue;
+            };
+            let had_records = !entry.records.is_empty();
+            let record = MutationRecord {
+                record_type: record_type.to_string(),
+                target,
+                attribute_name: attribute_name.clone(),
+                old_value: match record_type {
+                    "attributes" if options.attribute_old_value => old_value
+                        .as_deref()
+                        .map(|value| bounded_text(value, MAX_OBSERVER_OLD_VALUE_BYTES)),
+                    "characterData" if options.character_data_old_value => old_value
+                        .as_deref()
+                        .map(|value| bounded_text(value, MAX_OBSERVER_OLD_VALUE_BYTES)),
+                    _ => None,
+                },
+                added_nodes: added_nodes.clone(),
+                removed_nodes: removed_nodes.clone(),
+                previous_sibling: None,
+                next_sibling: None,
+            };
+            if entry.records.len() >= MAX_MUTATION_RECORDS {
+                entry.records.pop_front();
+            }
+            entry.records.push_back(record);
+            if !had_records {
+                to_notify.push(entry.id);
+            }
+        }
+        for observer_id in to_notify {
+            if self.state.pending_observer_callbacks.len() >= MAX_PENDING_TASKS {
+                self.report.truncated = true;
+                break;
+            }
+            self.state.pending_observer_callbacks.push(observer_id);
+        }
+    }
+
+    fn observer_records_value(records: VecDeque<MutationRecord>) -> JsvValue {
+        let values = records
+            .into_iter()
+            .map(|record| {
+                let mut properties = HashMap::new();
+                properties.insert("type".to_string(), JsvValue::String(record.record_type));
+                properties.insert("target".to_string(), JsvValue::HostObject(record.target));
+                properties.insert(
+                    "attributeName".to_string(),
+                    record
+                        .attribute_name
+                        .map(JsvValue::String)
+                        .unwrap_or(JsvValue::Null),
+                );
+                properties.insert(
+                    "oldValue".to_string(),
+                    record
+                        .old_value
+                        .map(JsvValue::String)
+                        .unwrap_or(JsvValue::Null),
+                );
+                properties.insert(
+                    "addedNodes".to_string(),
+                    JsvValue::Array(Rc::new(RefCell::new(
+                        record
+                            .added_nodes
+                            .into_iter()
+                            .map(JsvValue::HostObject)
+                            .collect(),
+                    ))),
+                );
+                properties.insert(
+                    "removedNodes".to_string(),
+                    JsvValue::Array(Rc::new(RefCell::new(
+                        record
+                            .removed_nodes
+                            .into_iter()
+                            .map(JsvValue::HostObject)
+                            .collect(),
+                    ))),
+                );
+                properties.insert(
+                    "previousSibling".to_string(),
+                    record
+                        .previous_sibling
+                        .map(JsvValue::HostObject)
+                        .unwrap_or(JsvValue::Null),
+                );
+                properties.insert(
+                    "nextSibling".to_string(),
+                    record
+                        .next_sibling
+                        .map(JsvValue::HostObject)
+                        .unwrap_or(JsvValue::Null),
+                );
+                JsvValue::Object(Rc::new(RefCell::new(crate::javascript::JsvObject::plain(
+                    properties,
+                ))))
+            })
+            .collect();
+        JsvValue::Array(Rc::new(RefCell::new(values)))
+    }
+
+    fn observer_options(value: Option<&JsvValue>) -> MutationObserverOptions {
+        let mut options = MutationObserverOptions::default();
+        let Some(JsvValue::Object(object)) = value else {
+            return options;
+        };
+        let properties = &object.borrow().properties;
+        options.attributes = properties
+            .get("attributes")
+            .and_then(JsvValue::as_boolean)
+            .unwrap_or(false);
+        options.child_list = properties
+            .get("childList")
+            .and_then(JsvValue::as_boolean)
+            .unwrap_or(false);
+        options.character_data = properties
+            .get("characterData")
+            .and_then(JsvValue::as_boolean)
+            .unwrap_or(false);
+        options.subtree = properties
+            .get("subtree")
+            .and_then(JsvValue::as_boolean)
+            .unwrap_or(false);
+        options.attribute_old_value = properties
+            .get("attributeOldValue")
+            .and_then(JsvValue::as_boolean)
+            .unwrap_or(false);
+        options.character_data_old_value = properties
+            .get("characterDataOldValue")
+            .and_then(JsvValue::as_boolean)
+            .unwrap_or(false);
+        options.attribute_filter =
+            properties
+                .get("attributeFilter")
+                .and_then(|value| match value {
+                    JsvValue::Array(values) => Some(
+                        values
+                            .borrow()
+                            .iter()
+                            .filter_map(|item| item.as_string().map(str::to_string))
+                            .take(64)
+                            .collect(),
+                    ),
+                    _ => None,
+                });
+        options
+    }
+
+    fn call_observer(
+        &mut self,
+        observer_id: u64,
+        method: &str,
+        arguments: Vec<JsvValue>,
+    ) -> Result<JsvValue, String> {
+        let kind = self
+            .state
+            .mutation_observers
+            .get(&observer_id)
+            .map(|entry| entry.kind)
+            .ok_or_else(|| "InvalidStateError: observer is detached".to_string())?;
+        match method {
+            "observe" => {
+                let target = arguments
+                    .first()
+                    .and_then(|value| match value {
+                        JsvValue::HostObject(handle)
+                            if self.state.elements.contains_key(handle) =>
+                        {
+                            Some(*handle)
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| "TypeError: observer.observe requires a DOM node".to_string())?;
+                let options = Self::observer_options(arguments.get(1));
+                if kind == ObserverKind::Mutation
+                    && !(options.attributes || options.child_list || options.character_data)
+                {
+                    return Err(
+                        "TypeError: MutationObserver requires attributes, childList, or characterData"
+                            .to_string(),
+                    );
+                }
+                let entry = self
+                    .state
+                    .mutation_observers
+                    .get(&observer_id)
+                    .expect("observer existence checked");
+                if entry.targets.len() >= MAX_OBSERVER_TARGETS
+                    && !entry.targets.contains_key(&target)
+                {
+                    return Err("QuotaExceededError: observer target budget exceeded".to_string());
+                }
+                self.state
+                    .mutation_observers
+                    .get_mut(&observer_id)
+                    .expect("observer existence checked")
+                    .targets
+                    .insert(target, options);
+                Ok(JsvValue::Undefined)
+            }
+            "unobserve" => {
+                let target = arguments
+                    .first()
+                    .and_then(|value| match value {
+                        JsvValue::HostObject(handle) => Some(*handle),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        "TypeError: observer.unobserve requires a DOM node".to_string()
+                    })?;
+                self.state
+                    .mutation_observers
+                    .get_mut(&observer_id)
+                    .expect("observer existence checked")
+                    .targets
+                    .remove(&target);
+                Ok(JsvValue::Undefined)
+            }
+            "disconnect" => {
+                let entry = self
+                    .state
+                    .mutation_observers
+                    .get_mut(&observer_id)
+                    .expect("observer existence checked");
+                entry.targets.clear();
+                entry.records.clear();
+                Ok(JsvValue::Undefined)
+            }
+            "takeRecords" => {
+                let records = std::mem::take(
+                    &mut self
+                        .state
+                        .mutation_observers
+                        .get_mut(&observer_id)
+                        .expect("observer existence checked")
+                        .records,
+                );
+                Ok(Self::observer_records_value(records))
+            }
+            _ => Err(format!(
+                "TypeError: {:?}Observer.{method} is not implemented",
+                kind
+            )),
+        }
+    }
+
+    fn resolved_promise(value: JsvValue) -> JsvValue {
+        JsvValue::Promise(Rc::new(RefCell::new(
+            crate::javascript::JsvPromiseState::Fulfilled(value),
+        )))
+    }
+
+    fn stream_chunk_from_value(value: &JsvValue) -> Result<Vec<u8>, String> {
+        match value {
+            JsvValue::String(value) => {
+                if value.len() > MAX_STREAM_BYTES {
+                    return Err("QuotaExceededError: stream chunk is too large".to_string());
+                }
+                Ok(value.as_bytes().to_vec())
+            }
+            JsvValue::Array(values) => {
+                let values = values.borrow();
+                if values.len() > MAX_STREAM_BYTES {
+                    return Err("QuotaExceededError: stream chunk is too large".to_string());
+                }
+                values
+                    .iter()
+                    .map(|value| {
+                        let number = value
+                            .as_number()
+                            .filter(|number| number.is_finite() && (0.0..=255.0).contains(number))
+                            .ok_or_else(|| {
+                                "TypeError: stream byte chunks contain only 0..255 values"
+                                    .to_string()
+                            })?;
+                        Ok(number as u8)
+                    })
+                    .collect()
+            }
+            _ => Err("TypeError: stream chunk must be a string or byte array".to_string()),
+        }
+    }
+
+    fn stream_chunk_value(bytes: Vec<u8>) -> JsvValue {
+        let length = bytes.len();
+        let buffer = Rc::new(RefCell::new(JsvArrayBuffer {
+            bytes,
+            detached: false,
+        }));
+        JsvValue::TypedArray(Rc::new(RefCell::new(JsvTypedArray {
+            kind: TypedArrayKind::Uint8,
+            buffer,
+            byte_offset: 0,
+            length,
+        })))
+    }
+
+    fn stream_read_result(value: Option<Vec<u8>>) -> JsvValue {
+        let done = value.is_none();
+        let mut properties = HashMap::new();
+        properties.insert(
+            "value".to_string(),
+            value
+                .map(Self::stream_chunk_value)
+                .unwrap_or(JsvValue::Undefined),
+        );
+        properties.insert("done".to_string(), JsvValue::Boolean(done));
+        Self::resolved_promise(JsvValue::Object(Rc::new(RefCell::new(
+            crate::javascript::JsvObject::plain(properties),
+        ))))
+    }
+
+    fn retained_stream_bytes(&self) -> usize {
+        self.state
+            .readable_streams
+            .values()
+            .map(|stream| stream.total_bytes)
+            .sum()
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn call_stream(
+        &mut self,
+        object: u64,
+        method: &str,
+        arguments: Vec<JsvValue>,
+    ) -> Result<JsvValue, String> {
+        if self.state.readable_streams.contains_key(&object) {
+            match method {
+                "getReader" => {
+                    if self
+                        .state
+                        .readable_streams
+                        .get(&object)
+                        .expect("stream existence checked")
+                        .locked
+                    {
+                        return Err("TypeError: ReadableStream is already locked".to_string());
+                    }
+                    let reader = self.allocate_platform_handle()?;
+                    self.state
+                        .readable_streams
+                        .get_mut(&object)
+                        .expect("stream existence checked")
+                        .locked = true;
+                    self.state
+                        .stream_readers
+                        .insert(reader, ReadableStreamReader { stream: object });
+                    Ok(JsvValue::HostObject(reader))
+                }
+                "cancel" => {
+                    let stream = self
+                        .state
+                        .readable_streams
+                        .get_mut(&object)
+                        .expect("stream existence checked");
+                    stream.cancelled = true;
+                    stream.closed = true;
+                    stream.chunks.clear();
+                    stream.total_bytes = 0;
+                    self.record_platform_operation("ReadableStream.cancel");
+                    Ok(Self::resolved_promise(JsvValue::Undefined))
+                }
+                "tee" => {
+                    let source = self
+                        .state
+                        .readable_streams
+                        .get(&object)
+                        .cloned()
+                        .expect("stream existence checked");
+                    if source.locked {
+                        return Err("TypeError: cannot tee a locked stream".to_string());
+                    }
+                    if self.state.readable_streams.len().saturating_add(2) > MAX_STREAMS_PER_PAGE {
+                        return Err(
+                            "QuotaExceededError: readable stream budget exceeded".to_string()
+                        );
+                    }
+                    if self
+                        .retained_stream_bytes()
+                        .saturating_add(source.total_bytes.saturating_mul(2))
+                        > MAX_STREAM_BYTES_PER_PAGE
+                    {
+                        return Err(
+                            "QuotaExceededError: page stream byte budget exceeded".to_string()
+                        );
+                    }
+                    let first = self.allocate_platform_handle()?;
+                    let second = self.allocate_platform_handle()?;
+                    self.state.readable_streams.insert(first, source.clone());
+                    self.state.readable_streams.insert(second, source);
+                    Ok(JsvValue::Array(Rc::new(RefCell::new(vec![
+                        JsvValue::HostObject(first),
+                        JsvValue::HostObject(second),
+                    ]))))
+                }
+                _ => Err(format!(
+                    "TypeError: ReadableStream.{method} is not implemented"
+                )),
+            }
+        } else {
+            let reader = self
+                .state
+                .stream_readers
+                .get(&object)
+                .cloned()
+                .ok_or_else(|| "InvalidStateError: reader is detached".to_string())?;
+            match method {
+                "read" => {
+                    let stream = self
+                        .state
+                        .readable_streams
+                        .get_mut(&reader.stream)
+                        .ok_or_else(|| "InvalidStateError: stream is detached".to_string())?;
+                    let next = if stream.cancelled {
+                        None
+                    } else {
+                        stream.chunks.pop_front().map(|chunk| {
+                            stream.total_bytes = stream.total_bytes.saturating_sub(chunk.len());
+                            Rc::try_unwrap(chunk).unwrap_or_else(|shared| shared.as_ref().clone())
+                        })
+                    };
+                    Ok(Self::stream_read_result(next))
+                }
+                "releaseLock" => {
+                    self.state.stream_readers.remove(&object);
+                    if let Some(stream) = self.state.readable_streams.get_mut(&reader.stream) {
+                        stream.locked = false;
+                    }
+                    Ok(JsvValue::Undefined)
+                }
+                "cancel" => self.call_stream(reader.stream, "cancel", arguments),
+                _ => Err(format!(
+                    "TypeError: ReadableStreamDefaultReader.{method} is not implemented"
+                )),
+            }
+        }
+    }
+
     /// Resolve a candidate URL against the current document URL. Only
     /// same-origin candidates resolve; cross-origin navigation is recorded
     /// but never performed by the page runtime.
@@ -1091,9 +1759,10 @@ impl<'a> RuntimeHost<'a> {
 
     fn record_history_mutation(&mut self, kind: &str, url: &str) {
         if self.report.history_mutations.len() < 128 {
-            self.report
-                .history_mutations
-                .push(format!("{} {}", kind, url));
+            self.report.history_mutations.push(bounded_text(
+                &format!("{} {}", kind, url),
+                MAX_REPORT_TEXT_BYTES,
+            ));
         }
     }
 
@@ -1128,6 +1797,7 @@ impl<'a> RuntimeHost<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn event_property(&mut self, property: &str) -> Result<JsvValue, String> {
         let event = self
             .state
@@ -1159,6 +1829,7 @@ impl<'a> RuntimeHost<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn event_boolean_property(&self, property: &str) -> Result<bool, String> {
         let event = self
             .state
@@ -1204,6 +1875,44 @@ fn object_property_value(object: &crate::javascript::JsvObjectRef, name: &str) -
 impl JsvHost for RuntimeHost<'_> {
     fn get_property(&mut self, object: u64, property: &str) -> Result<JsvValue, String> {
         self.charge()?;
+        if let Some(stream) = self.state.readable_streams.get(&object) {
+            return match property {
+                "locked" => Ok(JsvValue::Boolean(stream.locked)),
+                "getReader" | "cancel" | "tee" => {
+                    Ok(JsvValue::HostFunction(object, property.to_string()))
+                }
+                _ => Err(format!(
+                    "TypeError: ReadableStream.{property} is not implemented"
+                )),
+            };
+        }
+        if self.state.stream_readers.contains_key(&object) {
+            return match property {
+                "closed" => Ok(Self::resolved_promise(JsvValue::Undefined)),
+                "read" | "releaseLock" | "cancel" => {
+                    Ok(JsvValue::HostFunction(object, property.to_string()))
+                }
+                _ => Err(format!(
+                    "TypeError: ReadableStreamDefaultReader.{property} is not implemented"
+                )),
+            };
+        }
+        if let Some(observer) = self.state.mutation_observers.get(&object) {
+            return match (observer.kind, property) {
+                (ObserverKind::Mutation, "observe" | "disconnect" | "takeRecords")
+                | (ObserverKind::Resize, "observe" | "unobserve" | "disconnect" | "takeRecords")
+                | (
+                    ObserverKind::Intersection,
+                    "observe" | "unobserve" | "disconnect" | "takeRecords",
+                ) => Ok(JsvValue::HostFunction(object, property.to_string())),
+                (ObserverKind::Mutation, "kind") => Ok(JsvValue::String("MutationObserver".into())),
+                (ObserverKind::Resize, "kind") => Ok(JsvValue::String("ResizeObserver".into())),
+                (ObserverKind::Intersection, "kind") => {
+                    Ok(JsvValue::String("IntersectionObserver".into()))
+                }
+                _ => Err(format!("TypeError: observer.{property} is not implemented")),
+            };
+        }
         if let Some(media) = self.state.media_elements.get(&object) {
             let controls = media.controls_state();
             return match property {
@@ -1370,11 +2079,54 @@ impl JsvHost for RuntimeHost<'_> {
                     .map(JsvValue::String)
                     .unwrap_or(JsvValue::Null)),
                 "autoIncrement" => Ok(JsvValue::Boolean(store.auto_increment)),
-                "put" | "add" | "get" | "delete" | "clear" | "count" => {
+                "put" | "add" | "get" | "delete" | "clear" | "count" | "createIndex"
+                | "deleteIndex" | "index" | "openCursor" => {
                     Ok(JsvValue::HostFunction(object, property.to_string()))
                 }
                 _ => Err(format!(
                     "TypeError: IDBObjectStore.{property} is not implemented"
+                )),
+            };
+        }
+        if let Some((database_name, store_name, index_name)) = self.state.idb_indexes.get(&object) {
+            let index = self
+                .state
+                .indexeddb
+                .databases
+                .get(database_name)
+                .and_then(|database| database.object_stores.get(store_name))
+                .and_then(|store| store.indexes.get(index_name))
+                .ok_or_else(|| "InvalidStateError: IndexedDB index is detached".to_string())?;
+            return match property {
+                "name" => Ok(JsvValue::String(index.name.clone())),
+                "keyPath" => Ok(JsvValue::String(index.key_path.clone())),
+                "unique" => Ok(JsvValue::Boolean(index.unique)),
+                "multiEntry" => Ok(JsvValue::Boolean(index.multi_entry)),
+                "get" | "getAll" | "count" | "openCursor" => {
+                    Ok(JsvValue::HostFunction(object, property.to_string()))
+                }
+                _ => Err(format!("TypeError: IDBIndex.{property} is not implemented")),
+            };
+        }
+        if let Some(cursor) = self.state.idb_cursors.get(&object) {
+            return match property {
+                "key" => Ok(cursor
+                    .current()
+                    .map(|record| match &record.key {
+                        crate::indexeddb::IDBKey::Number(value) => JsvValue::Number(*value),
+                        crate::indexeddb::IDBKey::String(value) => JsvValue::String(value.clone()),
+                        _ => JsvValue::Undefined,
+                    })
+                    .unwrap_or(JsvValue::Undefined)),
+                "value" => Ok(cursor
+                    .current()
+                    .and_then(|record| serde_json::from_str(&record.value).ok())
+                    .as_ref()
+                    .map(Self::json_to_jsv)
+                    .unwrap_or(JsvValue::Undefined)),
+                "continue" | "advance" => Ok(JsvValue::HostFunction(object, property.to_string())),
+                _ => Err(format!(
+                    "TypeError: IDBCursor.{property} is not implemented"
                 )),
             };
         }
@@ -1453,9 +2205,109 @@ impl JsvHost for RuntimeHost<'_> {
                 )),
             };
         }
+        if let Some(state) = self.state.canvas_contexts.get(&object) {
+            return match property {
+                "fillStyle" => Ok(JsvValue::String(state.fill.clone())),
+                "strokeStyle" => Ok(JsvValue::String(state.stroke.clone())),
+                "font" => Ok(JsvValue::String(state.font.clone())),
+                "canvas" => self.element_for(state.canvas),
+                "fillRect"
+                | "strokeRect"
+                | "clearRect"
+                | "beginPath"
+                | "closePath"
+                | "moveTo"
+                | "lineTo"
+                | "arc"
+                | "fill"
+                | "stroke"
+                | "fillText"
+                | "strokeText"
+                | "measureText"
+                | "save"
+                | "restore"
+                | "scale"
+                | "rotate"
+                | "translate"
+                | "transform"
+                | "setTransform"
+                | "resetTransform"
+                | "getImageData"
+                | "putImageData"
+                | "drawImage"
+                | "createImageData"
+                | "createLinearGradient"
+                | "createRadialGradient"
+                | "createPattern"
+                | "rect" => Ok(JsvValue::HostFunction(object, property.to_string())),
+                _ => Err(format!(
+                    "TypeError: CanvasRenderingContext2D.{property} is not implemented"
+                )),
+            };
+        }
+        if object & HOST_CLASSLIST_BIT != 0 {
+            let el = object & !HOST_CLASSLIST_BIT;
+            let node = self.locator(el)?;
+            return match property {
+                "add" | "remove" | "toggle" | "contains" => {
+                    Ok(JsvValue::HostFunction(object, property.to_string()))
+                }
+                "value" => Ok(JsvValue::String(
+                    self.dom
+                        .get_attribute(node, "class")
+                        .unwrap_or("")
+                        .to_string(),
+                )),
+                "length" => {
+                    let cur = self.dom.get_attribute(node, "class").unwrap_or("");
+                    let count = cur.split_whitespace().count();
+                    Ok(JsvValue::Number(count as f64))
+                }
+                _ => Ok(JsvValue::Undefined),
+            };
+        }
+        if object & HOST_DATASET_BIT != 0 {
+            let el = object & !HOST_DATASET_BIT;
+            let node = self.locator(el)?;
+            let mut attr = String::from("data-");
+            for ch in property.chars() {
+                if ch.is_ascii_uppercase() {
+                    attr.push('-');
+                    attr.push(ch.to_ascii_lowercase());
+                } else {
+                    attr.push(ch);
+                }
+            }
+            return Ok(self
+                .dom
+                .get_attribute(node, &attr)
+                .map_or(JsvValue::Undefined, |v| JsvValue::String(v.to_string())));
+        }
+        if object & HOST_STYLE_BIT != 0 {
+            let el = object & !HOST_STYLE_BIT;
+            let node = self.locator(el)?;
+            let style_str = self.dom.get_attribute(node, "style").unwrap_or("");
+            for decl in style_str.split(';') {
+                let mut parts = decl.splitn(2, ':');
+                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                    let k = k.trim();
+                    let v = v.trim();
+                    let camel = k.replace('-', "");
+                    if k.eq_ignore_ascii_case(property) || camel.eq_ignore_ascii_case(property) {
+                        return Ok(JsvValue::String(v.to_string()));
+                    }
+                }
+            }
+            return Ok(JsvValue::String(String::new()));
+        }
         match object {
             HOST_DOCUMENT => match property {
-                "getElementById" | "querySelector" | "createElement" | "createTextNode" => {
+                "getElementById"
+                | "querySelector"
+                | "querySelectorAll"
+                | "createElement"
+                | "createTextNode"
+                | "createDocumentFragment" => {
                     Ok(JsvValue::HostFunction(object, property.to_string()))
                 }
                 "activeElement" => self
@@ -1463,6 +2315,37 @@ impl JsvHost for RuntimeHost<'_> {
                     .focused()
                     .map_or(Ok(JsvValue::Null), |node| self.element_for(node)),
                 "URL" => Ok(JsvValue::String(self.state.current_url.clone())),
+                "title" => Ok(JsvValue::String(
+                    self.dom
+                        .query_selector("title")
+                        .and_then(|t| self.dom.text_content(t).ok())
+                        .unwrap_or_default(),
+                )),
+                "cookie" => {
+                    let cookies = self.state.storage.get("__ghita_cookies__").unwrap_or("");
+                    Ok(JsvValue::String(cookies.to_string()))
+                }
+                "body" => {
+                    let body_id = self
+                        .dom
+                        .query_selector("body")
+                        .unwrap_or_else(|| self.dom.root());
+                    self.element_for(body_id)
+                }
+                "head" => {
+                    let head_id = self
+                        .dom
+                        .query_selector("head")
+                        .unwrap_or_else(|| self.dom.root());
+                    self.element_for(head_id)
+                }
+                "documentElement" => {
+                    let root_id = self
+                        .dom
+                        .query_selector("html")
+                        .unwrap_or_else(|| self.dom.root());
+                    self.element_for(root_id)
+                }
                 _ => Err(format!(
                     "TypeError: document.{} is not implemented",
                     property
@@ -1478,19 +2361,54 @@ impl JsvHost for RuntimeHost<'_> {
                 "location" => Ok(JsvValue::HostObject(HOST_LOCATION)),
                 "fetch" => Ok(JsvValue::HostFunction(object, property.to_string())),
                 "MediaSource" => Ok(JsvValue::HostFunction(object, property.to_string())),
-                "Event" | "CustomEvent" | "FormData" | "WebSocket" | "EventSource"
-                | "BroadcastChannel" | "structuredClone" => {
-                    Ok(JsvValue::HostFunction(object, property.to_string()))
-                }
+                "Event"
+                | "CustomEvent"
+                | "FormData"
+                | "WebSocket"
+                | "EventSource"
+                | "BroadcastChannel"
+                | "structuredClone"
+                | "MutationObserver"
+                | "ResizeObserver"
+                | "IntersectionObserver"
+                | "ReadableStream" => Ok(JsvValue::HostFunction(object, property.to_string())),
+                "customElements" => Ok(JsvValue::HostObject(HOST_CUSTOM_ELEMENTS)),
                 "setTimeout" | "setInterval" | "clearTimeout" | "clearInterval" => {
                     Ok(JsvValue::HostFunction(object, property.to_string()))
                 }
                 "addEventListener" | "removeEventListener" | "dispatchEvent" => {
                     Ok(JsvValue::HostFunction(object, property.to_string()))
                 }
-                "innerWidth" | "innerHeight" => Ok(JsvValue::Number(0.0)),
+                "requestAnimationFrame"
+                | "cancelAnimationFrame"
+                | "matchMedia"
+                | "getComputedStyle" => Ok(JsvValue::HostFunction(object, property.to_string())),
+                "innerWidth" => Ok(JsvValue::Number(self.dom.viewport_width() as f64)),
+                "innerHeight" => Ok(JsvValue::Number(600.0)),
+                "devicePixelRatio" => Ok(JsvValue::Number(1.0)),
                 "name" => Ok(JsvValue::String(String::new())),
+                "crypto" => Ok(JsvValue::HostObject(HOST_CRYPTO)),
+                "performance" => Ok(JsvValue::HostObject(HOST_PERFORMANCE)),
+                "CSS" => Ok(JsvValue::HostObject(HOST_CSS)),
+                "scroll" | "scrollTo" | "scrollBy" | "alert" | "confirm" | "prompt" | "atob"
+                | "btoa" => Ok(JsvValue::HostFunction(object, property.to_string())),
                 _ => Err(format!("TypeError: window.{} is not implemented", property)),
+            },
+            HOST_CRYPTO => match property {
+                "getRandomValues" | "randomUUID" => {
+                    Ok(JsvValue::HostFunction(object, property.to_string()))
+                }
+                "subtle" => Ok(JsvValue::HostObject(HOST_CRYPTO)),
+                _ => Ok(JsvValue::Undefined),
+            },
+            HOST_PERFORMANCE => match property {
+                "now" => Ok(JsvValue::HostFunction(object, property.to_string())),
+                "timeOrigin" => Ok(JsvValue::Number(0.0)),
+                _ => Ok(JsvValue::Undefined),
+            },
+            HOST_CSS => match property {
+                "supports" | "escape" => Ok(JsvValue::HostFunction(object, property.to_string())),
+                _ => Ok(JsvValue::Undefined),
             },
             HOST_LOCAL_STORAGE => match property {
                 "getItem" | "setItem" | "removeItem" | "key" | "clear" => {
@@ -1518,9 +2436,19 @@ impl JsvHost for RuntimeHost<'_> {
             },
             HOST_NAVIGATOR => match property {
                 "serviceWorker" => Ok(JsvValue::HostObject(HOST_SERVICE_WORKER)),
-                _ => Err(format!(
-                    "TypeError: navigator.{property} is not implemented"
+                "userAgent" => Ok(JsvValue::String(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 GhitaBrowser/2.0.6".to_string(),
                 )),
+                "language" => Ok(JsvValue::String("en-US".to_string())),
+                "languages" => Ok(JsvValue::Array(Rc::new(RefCell::new(vec![
+                    JsvValue::String("en-US".to_string()),
+                    JsvValue::String("en".to_string()),
+                ])))),
+                "platform" => Ok(JsvValue::String("Win32".to_string())),
+                "onLine" => Ok(JsvValue::Boolean(true)),
+                "cookieEnabled" => Ok(JsvValue::Boolean(true)),
+                "hardwareConcurrency" => Ok(JsvValue::Number(4.0)),
+                _ => Ok(JsvValue::Undefined),
             },
             HOST_SERVICE_WORKER => match property {
                 "register" | "getRegistration" => {
@@ -1534,7 +2462,15 @@ impl JsvHost for RuntimeHost<'_> {
                     .map(JsvValue::String)
                     .unwrap_or(JsvValue::Null)),
                 _ => Err(format!(
-                    "TypeError: navigator.serviceWorker.{property} is not implemented"
+                    "TypeError: ServiceWorkerContainer.{property} is not implemented"
+                )),
+            },
+            HOST_CUSTOM_ELEMENTS => match property {
+                "define" | "get" | "whenDefined" => {
+                    Ok(JsvValue::HostFunction(object, property.to_string()))
+                }
+                _ => Err(format!(
+                    "TypeError: CustomElementRegistry.{property} is not implemented"
                 )),
             },
             HOST_HISTORY => match property {
@@ -1555,8 +2491,10 @@ impl JsvHost for RuntimeHost<'_> {
                 )),
             },
             HOST_LOCATION => match property {
-                "href" | "pathname" | "search" | "hash" | "host" | "origin" | "protocol"
-                | "hostname" | "port" => self.location_part(property).map(JsvValue::String),
+                "href" | "origin" | "protocol" | "host" | "hostname" | "port" | "pathname"
+                | "search" | "hash" => Ok(JsvValue::String(
+                    self.location_part(property).unwrap_or_default(),
+                )),
                 "assign" | "replace" | "reload" => {
                     Ok(JsvValue::HostFunction(object, property.to_string()))
                 }
@@ -1566,80 +2504,97 @@ impl JsvHost for RuntimeHost<'_> {
                 )),
             },
             HOST_EVENT => match property {
-                "type" | "detail" | "target" | "currentTarget" | "eventPhase" => {
-                    self.event_property(property)
+                "type" => Ok(self
+                    .state
+                    .active_event
+                    .as_ref()
+                    .map(|e| JsvValue::String(e.event_type.clone()))
+                    .unwrap_or(JsvValue::Null)),
+                "target" => {
+                    if let Some(e) = self.state.active_event.as_ref() {
+                        let current = e.current_target.unwrap_or(e.target);
+                        self.element_for(self.dom.effective_target(e.target, current))
+                    } else {
+                        Ok(JsvValue::Null)
+                    }
                 }
-                "bubbles" | "cancelable" | "defaultPrevented" => {
-                    self.event_boolean_property(property).map(JsvValue::Boolean)
+                "currentTarget" => {
+                    if let Some(current) = self
+                        .state
+                        .active_event
+                        .as_ref()
+                        .and_then(|e| e.current_target)
+                    {
+                        self.element_for(current)
+                    } else {
+                        Ok(JsvValue::Null)
+                    }
                 }
-                "preventDefault"
-                | "stopPropagation"
-                | "stopImmediatePropagation"
-                | "composedPath" => Ok(JsvValue::HostFunction(object, property.to_string())),
+                "bubbles" => Ok(JsvValue::Boolean(
+                    self.state
+                        .active_event
+                        .as_ref()
+                        .map(|e| e.bubbles)
+                        .unwrap_or(false),
+                )),
+                "cancelable" => Ok(JsvValue::Boolean(
+                    self.state
+                        .active_event
+                        .as_ref()
+                        .map(|e| e.cancelable)
+                        .unwrap_or(false),
+                )),
+                "defaultPrevented" => Ok(JsvValue::Boolean(
+                    self.state
+                        .active_event
+                        .as_ref()
+                        .map(|e| e.default_prevented)
+                        .unwrap_or(false),
+                )),
+                "detail" => Ok(self
+                    .state
+                    .active_event
+                    .as_ref()
+                    .and_then(|e| e.detail.clone())
+                    .map(JsvValue::String)
+                    .unwrap_or(JsvValue::Null)),
+                "clientX" | "pageX" => Ok(self
+                    .state
+                    .active_event
+                    .as_ref()
+                    .and_then(|e| e.pointer_x)
+                    .map(|x| JsvValue::Number(x as f64))
+                    .unwrap_or(JsvValue::Number(0.0))),
+                "clientY" | "pageY" => Ok(self
+                    .state
+                    .active_event
+                    .as_ref()
+                    .and_then(|e| e.pointer_y)
+                    .map(|y| JsvValue::Number(y as f64))
+                    .unwrap_or(JsvValue::Number(0.0))),
+                "stopPropagation" | "stopImmediatePropagation" | "preventDefault" => {
+                    Ok(JsvValue::HostFunction(object, property.to_string()))
+                }
                 _ => Err(format!("TypeError: event.{} is not implemented", property)),
             },
-            _ if self.state.canvas_contexts.contains_key(&object) => {
-                let state = self
-                    .state
-                    .canvas_contexts
-                    .get(&object)
-                    .expect("canvas context existence checked");
-                match property {
-                    "fillStyle" => Ok(JsvValue::String(state.fill.clone())),
-                    "strokeStyle" => Ok(JsvValue::String(state.stroke.clone())),
-                    "font" => Ok(JsvValue::String(state.font.clone())),
-                    "canvas" => self.element_for(state.canvas),
-                    "fillRect" | "strokeRect" | "clearRect" | "fillText" | "getImageData" => {
-                        Ok(JsvValue::HostFunction(object, property.to_string()))
-                    }
-                    _ => Err(format!(
-                        "TypeError: CanvasRenderingContext2D.{} is not implemented",
-                        property
-                    )),
-                }
-            }
-            HOST_FORM_DATA => {
-                let entries = self
-                    .state
-                    .form_data
-                    .get(&object)
-                    .cloned()
-                    .ok_or_else(|| "InvalidStateError: FormData is detached".to_string())?;
-                match property {
-                    "get" | "append" | "delete" | "has" => {
-                        Ok(JsvValue::HostFunction(object, property.to_string()))
-                    }
-                    "entries" => {
-                        let values = entries
-                            .iter()
-                            .map(|(name, value)| {
-                                JsvValue::Array(Rc::new(RefCell::new(vec![
-                                    JsvValue::String(name.clone()),
-                                    JsvValue::String(value.clone()),
-                                ])))
-                            })
-                            .collect();
-                        Ok(JsvValue::Array(Rc::new(RefCell::new(values))))
-                    }
-                    _ => Err(format!(
-                        "TypeError: FormData.{} is not implemented",
-                        property
-                    )),
-                }
-            }
             element => match property {
-                "textContent" | "innerText" => Ok(JsvValue::String(self.element_text(element)?)),
                 "id" | "className" => Ok(JsvValue::String(
                     self.dom
                         .get_attribute(
                             self.locator(element)?,
-                            match property {
-                                "id" => "id",
-                                _ => "class",
+                            if property == "className" {
+                                "class"
+                            } else {
+                                property
                             },
                         )
                         .unwrap_or("")
                         .to_string(),
+                )),
+                "textContent" | "innerText" => Ok(JsvValue::String(
+                    self.dom
+                        .text_content(self.locator(element)?)
+                        .unwrap_or_default(),
                 )),
                 "value" => {
                     let node = self.locator(element)?;
@@ -1707,6 +2662,50 @@ impl JsvHost for RuntimeHost<'_> {
                     }
                 }
                 "innerHTML" => Ok(JsvValue::String(self.element_text(element)?)),
+                "classList" => Ok(JsvValue::HostObject(element | HOST_CLASSLIST_BIT)),
+                "dataset" => Ok(JsvValue::HostObject(element | HOST_DATASET_BIT)),
+                "style" => Ok(JsvValue::HostObject(element | HOST_STYLE_BIT)),
+                "offsetWidth" | "clientWidth" => {
+                    let node = self.locator(element)?;
+                    let w = self
+                        .dom
+                        .node_rect(node)
+                        .map(|r| r.outer_width())
+                        .unwrap_or(100.0);
+                    Ok(JsvValue::Number(w))
+                }
+                "offsetHeight" | "clientHeight" => {
+                    let node = self.locator(element)?;
+                    let h = self
+                        .dom
+                        .node_rect(node)
+                        .map(|r| r.outer_height())
+                        .unwrap_or(30.0);
+                    Ok(JsvValue::Number(h))
+                }
+                "scrollWidth" => {
+                    let node = self.locator(element)?;
+                    let w = self
+                        .dom
+                        .node_rect(node)
+                        .map(|r| r.outer_width())
+                        .unwrap_or(100.0);
+                    Ok(JsvValue::Number(w))
+                }
+                "scrollHeight" => {
+                    let node = self.locator(element)?;
+                    let h = self
+                        .dom
+                        .node_rect(node)
+                        .map(|r| r.outer_height())
+                        .unwrap_or(30.0);
+                    Ok(JsvValue::Number(h))
+                }
+                "scrollTop" | "scrollLeft" => Ok(JsvValue::Number(0.0)),
+                "content" => {
+                    let node = self.locator(element)?;
+                    self.element_for(node)
+                }
                 "getContext" => {
                     let node = self.locator(element)?;
                     if self.element_tag(node).as_deref() == Some("canvas")
@@ -1723,6 +2722,12 @@ impl JsvHost for RuntimeHost<'_> {
                 | "appendChild"
                 | "removeChild"
                 | "querySelector"
+                | "querySelectorAll"
+                | "closest"
+                | "contains"
+                | "matches"
+                | "getBoundingClientRect"
+                | "cloneNode"
                 | "focus"
                 | "click"
                 | "addEventListener"
@@ -1745,6 +2750,87 @@ impl JsvHost for RuntimeHost<'_> {
         value: JsvValue,
     ) -> Result<JsvValue, String> {
         self.charge()?;
+        if object & HOST_DATASET_BIT != 0 {
+            let el = object & !HOST_DATASET_BIT;
+            let node = self.locator(el)?;
+            let mut attr = String::from("data-");
+            for ch in property.chars() {
+                if ch.is_ascii_uppercase() {
+                    attr.push('-');
+                    attr.push(ch.to_ascii_lowercase());
+                } else {
+                    attr.push(ch);
+                }
+            }
+            let val_str = value.to_display_string();
+            self.dom.set_attribute(node, &attr, &val_str)?;
+            self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+            return Ok(value);
+        }
+        if object & HOST_STYLE_BIT != 0 {
+            let el = object & !HOST_STYLE_BIT;
+            let node = self.locator(el)?;
+            let mut attr_k = String::new();
+            for ch in property.chars() {
+                if ch.is_ascii_uppercase() {
+                    attr_k.push('-');
+                    attr_k.push(ch.to_ascii_lowercase());
+                } else {
+                    attr_k.push(ch);
+                }
+            }
+            let val_str = value.to_display_string();
+            let cur_style = self
+                .dom
+                .get_attribute(node, "style")
+                .unwrap_or("")
+                .to_string();
+            let mut decls: Vec<String> = cur_style
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.starts_with(&format!("{}:", attr_k)))
+                .map(String::from)
+                .collect();
+            if !val_str.is_empty() {
+                decls.push(format!("{}: {}", attr_k, val_str));
+            }
+            let new_style = decls.join("; ");
+            self.dom.set_attribute(node, "style", &new_style)?;
+            self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+            return Ok(value);
+        }
+        if object == HOST_DOCUMENT {
+            match property {
+                "title" => {
+                    let title_text = value.to_display_string();
+                    if let Some(t) = self.dom.query_selector("title") {
+                        self.dom.set_text_content(t, &title_text)?;
+                    } else if let Some(head) = self.dom.query_selector("head") {
+                        let t = self.dom.create_element("title")?;
+                        self.dom.set_text_content(t, &title_text)?;
+                        self.dom.append_child(head, t)?;
+                    }
+                    return Ok(value);
+                }
+                "cookie" => {
+                    let cookie_str = value.to_display_string();
+                    let existing = self
+                        .state
+                        .storage
+                        .get("__ghita_cookies__")
+                        .unwrap_or("")
+                        .to_string();
+                    let updated = if existing.is_empty() {
+                        cookie_str.clone()
+                    } else {
+                        format!("{}; {}", existing, cookie_str)
+                    };
+                    self.state.storage.set("__ghita_cookies__", &updated)?;
+                    return Ok(value);
+                }
+                _ => {}
+            }
+        }
         if self.state.media_elements.contains_key(&object) {
             let result = match property {
                 "srcObject" => {
@@ -1944,8 +3030,11 @@ impl JsvHost for RuntimeHost<'_> {
                 | HOST_CACHE_STORAGE
                 | HOST_NAVIGATOR
                 | HOST_SERVICE_WORKER
+                | HOST_CUSTOM_ELEMENTS
         ) || self.state.idb_databases.contains_key(&object)
             || self.state.idb_stores.contains_key(&object)
+            || self.state.idb_indexes.contains_key(&object)
+            || self.state.idb_cursors.contains_key(&object)
             || self.state.cache_handles.contains_key(&object)
             || self
                 .state
@@ -2014,6 +3103,14 @@ impl JsvHost for RuntimeHost<'_> {
         arguments: Vec<JsvValue>,
     ) -> Result<JsvValue, String> {
         self.charge()?;
+        if self.state.mutation_observers.contains_key(&object) {
+            return self.call_observer(object, method, arguments);
+        }
+        if self.state.readable_streams.contains_key(&object)
+            || self.state.stream_readers.contains_key(&object)
+        {
+            return self.call_stream(object, method, arguments);
+        }
         // Phase 22 platform capabilities are dispatched before legacy media
         // and DOM objects, keeping opaque handle namespaces isolated.
         if object == HOST_WINDOW && method == "structuredClone" {
@@ -2170,10 +3267,9 @@ impl JsvHost for RuntimeHost<'_> {
                             "lastEventId".to_string(),
                             JsvValue::String(event.last_event_id),
                         );
-                        JsvValue::Object(Rc::new(RefCell::new(crate::javascript::JsvObject {
-                            properties,
-                            prototype: None,
-                        })))
+                        JsvValue::Object(Rc::new(RefCell::new(
+                            crate::javascript::JsvObject::plain(properties),
+                        )))
                     })
                     .unwrap_or(JsvValue::Null)),
                 "close" => {
@@ -2298,6 +3394,9 @@ impl JsvHost for RuntimeHost<'_> {
                         self.state.idb_stores.retain(|_, (database, store)| {
                             database != &database_name || store != &name
                         });
+                        self.state.idb_indexes.retain(|_, (database, store, _)| {
+                            database != &database_name || store != &name
+                        });
                     }
                     self.update_platform_quota();
                     Ok(JsvValue::Boolean(removed))
@@ -2307,6 +3406,9 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .idb_stores
                         .retain(|_, (database, _)| database != &database_name);
+                    self.state
+                        .idb_indexes
+                        .retain(|_, (database, _, _)| database != &database_name);
                     Ok(JsvValue::Undefined)
                 }
                 _ => Err(format!(
@@ -2406,8 +3508,188 @@ impl JsvHost for RuntimeHost<'_> {
                         .map(|store| store.count() as f64)
                         .unwrap_or_default(),
                 )),
+                "createIndex" => {
+                    let name = arguments
+                        .first()
+                        .and_then(JsvValue::as_string)
+                        .ok_or_else(|| "TypeError: createIndex requires a name".to_string())?;
+                    let key_path = arguments
+                        .get(1)
+                        .and_then(JsvValue::as_string)
+                        .ok_or_else(|| "TypeError: createIndex requires a key path".to_string())?;
+                    let config = crate::indexeddb::IDBIndexConfig {
+                        name: name.to_string(),
+                        key_path: key_path.to_string(),
+                        unique: Self::option_bool(arguments.get(2), "unique"),
+                        multi_entry: Self::option_bool(arguments.get(2), "multiEntry"),
+                    };
+                    self.state
+                        .indexeddb
+                        .databases
+                        .get_mut(&database_name)
+                        .and_then(|database| database.object_stores.get_mut(&store_name))
+                        .ok_or_else(|| "InvalidStateError: object store is detached".to_string())?
+                        .create_index(config)?;
+                    self.state.indexeddb.persist()?;
+                    let handle = self.allocate_platform_handle()?;
+                    self.state.idb_indexes.insert(
+                        handle,
+                        (database_name.clone(), store_name.clone(), name.to_string()),
+                    );
+                    self.record_platform_operation(format!(
+                        "indexedDB.createIndex {database_name}/{store_name}/{name}"
+                    ));
+                    Ok(JsvValue::HostObject(handle))
+                }
+                "deleteIndex" => {
+                    let name = arguments
+                        .first()
+                        .and_then(JsvValue::as_string)
+                        .ok_or_else(|| "TypeError: deleteIndex requires a name".to_string())?;
+                    let removed = self
+                        .state
+                        .indexeddb
+                        .databases
+                        .get_mut(&database_name)
+                        .and_then(|database| database.object_stores.get_mut(&store_name))
+                        .is_some_and(|store| store.delete_index(name));
+                    if removed {
+                        self.state.indexeddb.persist()?;
+                        self.state
+                            .idb_indexes
+                            .retain(|_, (database, store, index)| {
+                                database != &database_name || store != &store_name || index != name
+                            });
+                    }
+                    Ok(JsvValue::Boolean(removed))
+                }
+                "index" => {
+                    let name = arguments
+                        .first()
+                        .and_then(JsvValue::as_string)
+                        .ok_or_else(|| "TypeError: index requires a name".to_string())?;
+                    let exists = self
+                        .state
+                        .indexeddb
+                        .databases
+                        .get(&database_name)
+                        .and_then(|database| database.object_stores.get(&store_name))
+                        .is_some_and(|store| store.indexes.contains_key(name));
+                    if !exists {
+                        return Err("NotFoundError: index does not exist".to_string());
+                    }
+                    let handle = self.allocate_platform_handle()?;
+                    self.state.idb_indexes.insert(
+                        handle,
+                        (database_name.clone(), store_name.clone(), name.to_string()),
+                    );
+                    Ok(JsvValue::HostObject(handle))
+                }
+                "openCursor" => {
+                    let range = arguments
+                        .first()
+                        .map(Self::idb_key)
+                        .transpose()?
+                        .map(crate::indexeddb::IDBKeyRange::only);
+                    let cursor = self
+                        .state
+                        .indexeddb
+                        .databases
+                        .get(&database_name)
+                        .and_then(|database| database.object_stores.get(&store_name))
+                        .ok_or_else(|| "InvalidStateError: object store is detached".to_string())?
+                        .open_cursor(range.as_ref(), crate::indexeddb::IDBCursorDirection::Next);
+                    let handle = self.allocate_platform_handle()?;
+                    self.state.idb_cursors.insert(handle, cursor);
+                    Ok(JsvValue::HostObject(handle))
+                }
                 _ => Err(format!(
                     "SecurityError: IDBObjectStore method '{method}' is unavailable"
+                )),
+            };
+        }
+        if let Some((database_name, store_name, index_name)) =
+            self.state.idb_indexes.get(&object).cloned()
+        {
+            return match method {
+                "get" | "getAll" | "count" | "openCursor" => {
+                    let key = arguments.first().map(Self::idb_key).transpose()?;
+                    let range = key.clone().map(crate::indexeddb::IDBKeyRange::only);
+                    let store = self
+                        .state
+                        .indexeddb
+                        .databases
+                        .get(&database_name)
+                        .and_then(|database| database.object_stores.get(&store_name))
+                        .ok_or_else(|| {
+                            "InvalidStateError: IndexedDB index is detached".to_string()
+                        })?;
+                    match method {
+                        "get" => Ok(key
+                            .as_ref()
+                            .and_then(|key| store.get_by_index(&index_name, key))
+                            .and_then(|record| serde_json::from_str(&record.value).ok())
+                            .as_ref()
+                            .map(Self::json_to_jsv)
+                            .unwrap_or(JsvValue::Undefined)),
+                        "getAll" => {
+                            let values = store
+                                .get_all_by_index(&index_name, range.as_ref(), 1_000)?
+                                .into_iter()
+                                .filter_map(|record| serde_json::from_str(&record.value).ok())
+                                .map(|value| Self::json_to_jsv(&value))
+                                .collect();
+                            Ok(JsvValue::Array(Rc::new(RefCell::new(values))))
+                        }
+                        "count" => Ok(JsvValue::Number(
+                            store
+                                .get_all_by_index(&index_name, range.as_ref(), 10_000)?
+                                .len() as f64,
+                        )),
+                        "openCursor" => {
+                            let records =
+                                store.get_all_by_index(&index_name, range.as_ref(), 10_000)?;
+                            let cursor = crate::indexeddb::IDBCursor::from_records(records);
+                            let handle = self.allocate_platform_handle()?;
+                            self.state.idb_cursors.insert(handle, cursor);
+                            Ok(JsvValue::HostObject(handle))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => Err(format!(
+                    "SecurityError: IDBIndex method '{method}' is unavailable"
+                )),
+            };
+        }
+        if self.state.idb_cursors.contains_key(&object) {
+            return match method {
+                "continue" => {
+                    self.state
+                        .idb_cursors
+                        .get_mut(&object)
+                        .expect("cursor existence checked")
+                        .advance(1);
+                    Ok(JsvValue::HostObject(object))
+                }
+                "advance" => {
+                    let count = arguments
+                        .first()
+                        .and_then(JsvValue::as_number)
+                        .filter(|count| count.is_finite() && *count >= 1.0)
+                        .map(|count| count as usize)
+                        .ok_or_else(|| {
+                            "TypeError: cursor.advance requires a positive count".to_string()
+                        })?;
+                    self.state
+                        .idb_cursors
+                        .get_mut(&object)
+                        .expect("cursor existence checked")
+                        .advance(count);
+                    Ok(JsvValue::HostObject(object))
+                }
+                _ => Err(format!(
+                    "SecurityError: IDBCursor method '{method}' is unavailable"
                 )),
             };
         }
@@ -2848,6 +4130,83 @@ impl JsvHost for RuntimeHost<'_> {
                 )),
             };
         }
+        if object & HOST_CLASSLIST_BIT != 0 {
+            let el = object & !HOST_CLASSLIST_BIT;
+            let node = self.locator(el)?;
+            match method {
+                "add" => {
+                    let cur = self
+                        .dom
+                        .get_attribute(node, "class")
+                        .unwrap_or("")
+                        .to_string();
+                    let mut list: Vec<String> = cur.split_whitespace().map(String::from).collect();
+                    for arg in arguments {
+                        let cls = arg.to_display_string();
+                        if !list.contains(&cls) {
+                            list.push(cls);
+                        }
+                    }
+                    let new_cls = list.join(" ");
+                    self.dom.set_attribute(node, "class", &new_cls)?;
+                    self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                    return Ok(JsvValue::Undefined);
+                }
+                "remove" => {
+                    let cur = self
+                        .dom
+                        .get_attribute(node, "class")
+                        .unwrap_or("")
+                        .to_string();
+                    let mut list: Vec<String> = cur.split_whitespace().map(String::from).collect();
+                    for arg in arguments {
+                        let cls = arg.to_display_string();
+                        list.retain(|c| c != &cls);
+                    }
+                    let new_cls = list.join(" ");
+                    self.dom.set_attribute(node, "class", &new_cls)?;
+                    self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                    return Ok(JsvValue::Undefined);
+                }
+                "toggle" => {
+                    let cls = arguments
+                        .first()
+                        .map(|a| a.to_display_string())
+                        .unwrap_or_default();
+                    let cur = self
+                        .dom
+                        .get_attribute(node, "class")
+                        .unwrap_or("")
+                        .to_string();
+                    let mut list: Vec<String> = cur.split_whitespace().map(String::from).collect();
+                    let has = list.contains(&cls);
+                    if has {
+                        list.retain(|c| c != &cls);
+                    } else {
+                        list.push(cls);
+                    }
+                    let new_cls = list.join(" ");
+                    self.dom.set_attribute(node, "class", &new_cls)?;
+                    self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                    return Ok(JsvValue::Boolean(!has));
+                }
+                "contains" => {
+                    let cls = arguments
+                        .first()
+                        .map(|a| a.to_display_string())
+                        .unwrap_or_default();
+                    let cur = self.dom.get_attribute(node, "class").unwrap_or("");
+                    let has = cur.split_whitespace().any(|c| c == cls);
+                    return Ok(JsvValue::Boolean(has));
+                }
+                _ => {
+                    return Err(format!(
+                        "TypeError: classList.{} is not implemented",
+                        method
+                    ))
+                }
+            }
+        }
         match (object, method) {
             (HOST_DOCUMENT, "getElementById") => {
                 let id = arguments
@@ -2866,6 +4225,24 @@ impl JsvHost for RuntimeHost<'_> {
                 self.dom
                     .query_selector(&selector)
                     .map_or(Ok(JsvValue::Null), |node| self.element_for(node))
+            }
+            (HOST_DOCUMENT, "querySelectorAll") => {
+                let selector = arguments
+                    .first()
+                    .ok_or_else(|| "TypeError: querySelectorAll requires a selector".to_string())?;
+                let selector_str = Self::argument_string(selector, "Selector")?;
+                let nodes = self.dom.query_selector_all(&selector_str);
+                let mut elements = Vec::new();
+                for node in nodes {
+                    elements.push(self.element_for(node)?);
+                }
+                Ok(JsvValue::Array(std::rc::Rc::new(std::cell::RefCell::new(
+                    elements,
+                ))))
+            }
+            (HOST_DOCUMENT, "createDocumentFragment") => {
+                let node = self.dom.create_element("div")?;
+                self.element_for(node)
             }
             (HOST_DOCUMENT, "createElement") => {
                 let tag = arguments
@@ -2906,7 +4283,15 @@ impl JsvHost for RuntimeHost<'_> {
                 let value = Self::argument_string(&arguments[1], "Storage value")?;
                 self.state.storage.set(&key, &value)?;
                 if self.report.storage_writes.len() < 128 {
-                    self.report.storage_writes.push((key, value));
+                    self.report.storage_writes.push((
+                        bounded_text(&key, MAX_REPORT_TEXT_BYTES),
+                        bounded_text(&value, MAX_REPORT_TEXT_BYTES),
+                    ));
+                    if key.len() > MAX_REPORT_TEXT_BYTES || value.len() > MAX_REPORT_TEXT_BYTES {
+                        self.report.truncated = true;
+                    }
+                } else {
+                    self.report.truncated = true;
                 }
                 Ok(JsvValue::Undefined)
             }
@@ -2963,6 +4348,166 @@ impl JsvHost for RuntimeHost<'_> {
                     self.clear_timer(id as u64);
                 }
                 Ok(JsvValue::Undefined)
+            }
+            (HOST_WINDOW, "requestAnimationFrame") => {
+                let callback = arguments.first().cloned().ok_or_else(|| {
+                    "TypeError: requestAnimationFrame requires a callback".to_string()
+                })?;
+                let id = self.state.next_raf_id;
+                self.state.next_raf_id = self.state.next_raf_id.wrapping_add(1);
+                self.state.animation_frame_callbacks.insert(id, callback);
+                Ok(JsvValue::Number(id as f64))
+            }
+            (HOST_WINDOW, "cancelAnimationFrame") => {
+                if let Some(id) = arguments.first().and_then(|v| match v {
+                    JsvValue::Number(n) => Some(*n as u64),
+                    _ => None,
+                }) {
+                    self.state.animation_frame_callbacks.remove(&id);
+                }
+                Ok(JsvValue::Undefined)
+            }
+            (HOST_WINDOW, "matchMedia") => {
+                let query = arguments
+                    .first()
+                    .map(|a| a.to_display_string())
+                    .unwrap_or_default();
+                let matches = if query.contains("max-width") {
+                    self.dom.viewport_width() <= 768
+                } else if query.contains("min-width") {
+                    self.dom.viewport_width() >= 768
+                } else {
+                    true
+                };
+                let mut map = std::collections::HashMap::new();
+                map.insert("matches".to_string(), JsvValue::Boolean(matches));
+                map.insert("media".to_string(), JsvValue::String(query));
+                Ok(JsvValue::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::javascript::JsvObject::plain(map),
+                ))))
+            }
+            (HOST_WINDOW, "getComputedStyle") => {
+                let mut map = std::collections::HashMap::new();
+                map.insert("display".to_string(), JsvValue::String("block".to_string()));
+                map.insert(
+                    "visibility".to_string(),
+                    JsvValue::String("visible".to_string()),
+                );
+                map.insert("opacity".to_string(), JsvValue::String("1".to_string()));
+                map.insert(
+                    "color".to_string(),
+                    JsvValue::String("rgb(0, 0, 0)".to_string()),
+                );
+                map.insert(
+                    "backgroundColor".to_string(),
+                    JsvValue::String("rgba(0, 0, 0, 0)".to_string()),
+                );
+                Ok(JsvValue::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::javascript::JsvObject::plain(map),
+                ))))
+            }
+            (HOST_WINDOW, "scroll") | (HOST_WINDOW, "scrollTo") | (HOST_WINDOW, "scrollBy") => {
+                Ok(JsvValue::Undefined)
+            }
+            (HOST_WINDOW, "alert") => {
+                let msg = arguments
+                    .first()
+                    .map(|a| a.to_display_string())
+                    .unwrap_or_default();
+                self.record_platform_operation(format!("window.alert: {msg}"));
+                Ok(JsvValue::Undefined)
+            }
+            (HOST_WINDOW, "confirm") => {
+                Ok(JsvValue::Boolean(true))
+            }
+            (HOST_WINDOW, "prompt") => {
+                let default_val = arguments.get(1).map(|a| a.to_display_string()).unwrap_or_default();
+                Ok(JsvValue::String(default_val))
+            }
+            (HOST_WINDOW, "atob") => {
+                let input = arguments
+                    .first()
+                    .map(|a| a.to_display_string())
+                    .unwrap_or_default();
+                let decoded = String::from_utf8(
+                    input
+                        .bytes()
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap_or(input);
+                Ok(JsvValue::String(decoded))
+            }
+            (HOST_WINDOW, "btoa") => {
+                let input = arguments
+                    .first()
+                    .map(|a| a.to_display_string())
+                    .unwrap_or_default();
+                Ok(JsvValue::String(input))
+            }
+            (HOST_CRYPTO, "getRandomValues") => {
+                let arg = arguments
+                    .first()
+                    .ok_or_else(|| "TypeError: getRandomValues requires an array".to_string())?;
+                match arg {
+                    JsvValue::Array(arr) => {
+                        let mut borrowed = arr.borrow_mut();
+                        for item in borrowed.iter_mut() {
+                            *item = JsvValue::Number(f64::from(random_u8()));
+                        }
+                    }
+                    JsvValue::TypedArray(arr) => {
+                        let borrowed = arr.borrow();
+                        for byte in borrowed.buffer.borrow_mut().bytes.iter_mut() {
+                            *byte = random_u8();
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(arg.clone())
+            }
+            (HOST_CRYPTO, "randomUUID") => {
+                Ok(JsvValue::String(random_uuid_v4()))
+            }
+            (HOST_PERFORMANCE, "now") => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
+                Ok(JsvValue::Number(now))
+            }
+            (HOST_CSS, "supports") => {
+                let prop = arguments
+                    .first()
+                    .map(|a| a.to_display_string())
+                    .unwrap_or_default();
+                let supported = matches!(
+                    prop.to_ascii_lowercase().as_str(),
+                    "display"
+                        | "color"
+                        | "flex"
+                        | "grid"
+                        | "margin"
+                        | "padding"
+                        | "width"
+                        | "height"
+                        | "position"
+                        | "opacity"
+                        | "border"
+                        | "background"
+                        | "font-size"
+                        | "font-family"
+                        | "transform"
+                        | "z-index"
+                        | "box-sizing"
+                );
+                Ok(JsvValue::Boolean(supported || arguments.len() == 1))
+            }
+            (HOST_CSS, "escape") => {
+                let val = arguments
+                    .first()
+                    .map(|a| a.to_display_string())
+                    .unwrap_or_default();
+                Ok(JsvValue::String(val))
             }
             (HOST_WINDOW, "Event") | (HOST_WINDOW, "CustomEvent") => {
                 let event_type = arguments
@@ -3171,7 +4716,13 @@ impl JsvHost for RuntimeHost<'_> {
                     &Self::argument_string(target, "Fetch URL")?,
                 ) {
                     if !self.report.fetch_requests.contains(&url) {
-                        self.report.fetch_requests.push(url);
+                        if self.report.fetch_requests.len() < 256 {
+                            self.report
+                                .fetch_requests
+                                .push(bounded_text(&url, MAX_REPORT_TEXT_BYTES));
+                        } else {
+                            self.report.truncated = true;
+                        }
                     }
                 }
                 Ok(JsvValue::Undefined)
@@ -3182,9 +4733,23 @@ impl JsvHost for RuntimeHost<'_> {
                 }
                 let name = Self::argument_string(&arguments[0], "Attribute name")?;
                 let value = Self::argument_string(&arguments[1], "Attribute value")?;
+                // Track 2 Phase 2: capture old value before mutation.
+                let old_val = self
+                    .dom
+                    .get_attribute(self.locator(element)?, &name)
+                    .map(|s| s.to_string());
                 self.dom
                     .set_attribute(self.locator(element)?, &name, &value)?;
                 self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                // Track 2 Phase 2: notify mutation observers of attribute change.
+                self.queue_mutation_record(
+                    "attributes",
+                    element,
+                    Some(name),
+                    old_val,
+                    Vec::new(),
+                    Vec::new(),
+                );
                 Ok(JsvValue::Undefined)
             }
             (element, "getAttribute") => {
@@ -3203,11 +4768,23 @@ impl JsvHost for RuntimeHost<'_> {
                 let name = arguments
                     .first()
                     .ok_or_else(|| "TypeError: removeAttribute requires a name".to_string())?;
-                self.dom.remove_attribute(
-                    self.locator(element)?,
-                    &Self::argument_string(name, "Attribute name")?,
-                )?;
+                let attr_name = Self::argument_string(name, "Attribute name")?;
+                let old_val = self
+                    .dom
+                    .get_attribute(self.locator(element)?, &attr_name)
+                    .map(|s| s.to_string());
+                self.dom
+                    .remove_attribute(self.locator(element)?, &attr_name)?;
                 self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                // Track 2 Phase 2: notify mutation observers.
+                self.queue_mutation_record(
+                    "attributes",
+                    element,
+                    Some(attr_name),
+                    old_val,
+                    Vec::new(),
+                    Vec::new(),
+                );
                 Ok(JsvValue::Undefined)
             }
             (element, "appendChild") => {
@@ -3220,6 +4797,20 @@ impl JsvHost for RuntimeHost<'_> {
                 self.dom
                     .append_child(self.locator(element)?, self.locator(*child)?)?;
                 self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                // Track 2 Phase 2: notify mutation observers of childList change.
+                self.queue_mutation_record(
+                    "childList",
+                    element,
+                    None,
+                    None,
+                    vec![*child],
+                    Vec::new(),
+                );
+                // Track 2 Phase 2: if the appended child is a custom element
+                // whose tag was registered, queue a connectedCallback dispatch.
+                // In the bounded profile this is best-effort through the
+                // existing event dispatch machinery.
+                self.queue_pending_dispatch(*child, "connected", None);
                 Ok(JsvValue::HostObject(*child))
             }
             (element, "removeChild") => {
@@ -3232,6 +4823,17 @@ impl JsvHost for RuntimeHost<'_> {
                 self.dom
                     .remove_child(self.locator(element)?, self.locator(*child)?)?;
                 self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                // Track 2 Phase 2: notify mutation observers of childList change.
+                self.queue_mutation_record(
+                    "childList",
+                    element,
+                    None,
+                    None,
+                    Vec::new(),
+                    vec![*child],
+                );
+                // Track 2 Phase 2: queue disconnectedCallback for custom elements.
+                self.queue_pending_dispatch(*child, "disconnected", None);
                 Ok(JsvValue::HostObject(*child))
             }
             (_element, "querySelector") => {
@@ -3241,6 +4843,90 @@ impl JsvHost for RuntimeHost<'_> {
                 self.dom
                     .query_selector(&Self::argument_string(selector, "Selector")?)
                     .map_or(Ok(JsvValue::Null), |node| self.element_for(node))
+            }
+            (element, "querySelectorAll") => {
+                let selector = arguments
+                    .first()
+                    .ok_or_else(|| "TypeError: querySelectorAll requires a selector".to_string())?;
+                let selector_str = Self::argument_string(selector, "Selector")?;
+                let node = self.locator(element)?;
+                let nodes = self.dom.query_selector_all(&selector_str);
+                let mut elements = Vec::new();
+                for candidate in nodes {
+                    if self.is_descendant_of(candidate, node) {
+                        elements.push(self.element_for(candidate)?);
+                    }
+                }
+                Ok(JsvValue::Array(std::rc::Rc::new(std::cell::RefCell::new(
+                    elements,
+                ))))
+            }
+            (element, "getBoundingClientRect") => {
+                let node = self.locator(element)?;
+                let rect = self.dom.node_rect(node);
+                let (x, y, w, h) = match rect {
+                    Some(r) => (r.x, r.y, r.outer_width(), r.outer_height()),
+                    None => (0.0, 0.0, 100.0, 30.0),
+                };
+                let mut map = std::collections::HashMap::new();
+                map.insert("x".to_string(), JsvValue::Number(x));
+                map.insert("y".to_string(), JsvValue::Number(y));
+                map.insert("top".to_string(), JsvValue::Number(y));
+                map.insert("left".to_string(), JsvValue::Number(x));
+                map.insert("right".to_string(), JsvValue::Number(x + w));
+                map.insert("bottom".to_string(), JsvValue::Number(y + h));
+                map.insert("width".to_string(), JsvValue::Number(w));
+                map.insert("height".to_string(), JsvValue::Number(h));
+                Ok(JsvValue::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                    crate::javascript::JsvObject::plain(map),
+                ))))
+            }
+            (element, "cloneNode") => {
+                let deep = arguments.first().map(|a| a.is_truthy()).unwrap_or(false);
+                let node = self.locator(element)?;
+                let cloned_id = self.dom.clone_node(node, deep)?;
+                self.report.dom_mutations = self.report.dom_mutations.saturating_add(1);
+                self.element_for(cloned_id)
+            }
+            (element, "closest") => {
+                let selector = arguments
+                    .first()
+                    .ok_or_else(|| "TypeError: closest requires a selector".to_string())?;
+                let selector_str = Self::argument_string(selector, "Selector")?;
+                let mut cur = Some(self.locator(element)?);
+                while let Some(curr_node) = cur {
+                    if let Some(target) = self.dom.query_selector(&selector_str) {
+                        if target == curr_node {
+                            return self.element_for(curr_node);
+                        }
+                    }
+                    cur = self.dom.node(curr_node).and_then(|n| n.parent);
+                }
+                Ok(JsvValue::Null)
+            }
+            (element, "contains") => {
+                let target_obj = arguments.first();
+                if let Some(JsvValue::HostObject(target_handle)) = target_obj {
+                    if let Ok(target_node) = self.locator(*target_handle) {
+                        let node = self.locator(element)?;
+                        return Ok(JsvValue::Boolean(
+                            node == target_node || self.is_descendant_of(target_node, node),
+                        ));
+                    }
+                }
+                Ok(JsvValue::Boolean(false))
+            }
+            (element, "matches") => {
+                let selector = arguments
+                    .first()
+                    .ok_or_else(|| "TypeError: matches requires a selector".to_string())?;
+                let selector_str = Self::argument_string(selector, "Selector")?;
+                let node = self.locator(element)?;
+                if let Some(target) = self.dom.query_selector(&selector_str) {
+                    Ok(JsvValue::Boolean(target == node))
+                } else {
+                    Ok(JsvValue::Boolean(false))
+                }
             }
             (element, "focus") => {
                 let node = self.locator(element)?;
@@ -3498,10 +5184,7 @@ impl JsvHost for RuntimeHost<'_> {
                         properties
                             .insert("height".to_string(), JsvValue::Number(f64::from(height)));
                         Ok(JsvValue::Object(Rc::new(RefCell::new(
-                            crate::javascript::JsvObject {
-                                properties,
-                                prototype: None,
-                            },
+                            crate::javascript::JsvObject::plain(properties),
                         ))))
                     }
                     _ => Err(format!(
@@ -3534,6 +5217,231 @@ impl JsvHost for RuntimeHost<'_> {
                 self.queue_pending_dispatch(form, "submit", None);
                 Ok(JsvValue::Undefined)
             }
+            // ---- Track 2 Phase 2: Custom Elements registry ----
+            (HOST_CUSTOM_ELEMENTS, "define") => {
+                // Register a custom element definition. Validates that the tag
+                // name contains a hyphen per the Custom Elements spec, then logs
+                // the registration as a platform operation.
+                let tag = arguments
+                    .first()
+                    .and_then(|v| match v {
+                        JsvValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        "TypeError: customElements.define requires a tag name".to_string()
+                    })?;
+                if !tag.contains('-') {
+                    return Err(
+                        "SyntaxError: custom element tag name must contain a hyphen".to_string()
+                    );
+                }
+                if tag.len() > MAX_CUSTOM_ELEMENT_NAME_BYTES {
+                    return Err("SyntaxError: custom element tag name exceeds budget".to_string());
+                }
+                let constructor = arguments.get(1).cloned().ok_or_else(|| {
+                    "TypeError: customElements.define requires a constructor".to_string()
+                })?;
+                if !crate::javascript::is_callable_public(&constructor) {
+                    return Err(
+                        "TypeError: custom element constructor must be callable".to_string()
+                    );
+                }
+                if self.state.custom_elements.contains_key(&tag) {
+                    return Err("NotSupportedError: custom element is already defined".to_string());
+                }
+                if self.state.custom_elements.len() >= MAX_CUSTOM_ELEMENTS {
+                    return Err("QuotaExceededError: custom element registry is full".to_string());
+                }
+                self.state.custom_elements.insert(tag.clone(), constructor);
+                if let Some(waiters) = self.state.custom_element_waiters.remove(&tag) {
+                    for promise in waiters {
+                        *promise.borrow_mut() =
+                            crate::javascript::JsvPromiseState::Fulfilled(JsvValue::Undefined);
+                    }
+                }
+                self.record_platform_operation(format!("customElements.define({tag})"));
+                Ok(JsvValue::Undefined)
+            }
+            (HOST_CUSTOM_ELEMENTS, "get") => {
+                let tag = arguments
+                    .first()
+                    .and_then(JsvValue::as_string)
+                    .ok_or_else(|| {
+                        "TypeError: customElements.get requires a tag name".to_string()
+                    })?;
+                if tag.len() > MAX_CUSTOM_ELEMENT_NAME_BYTES {
+                    return Ok(JsvValue::Undefined);
+                }
+                Ok(self
+                    .state
+                    .custom_elements
+                    .get(tag)
+                    .cloned()
+                    .unwrap_or(JsvValue::Undefined))
+            }
+            (HOST_CUSTOM_ELEMENTS, "whenDefined") => {
+                let tag = arguments
+                    .first()
+                    .and_then(JsvValue::as_string)
+                    .ok_or_else(|| {
+                        "TypeError: customElements.whenDefined requires a tag name".to_string()
+                    })?;
+                if !tag.contains('-') || tag.len() > MAX_CUSTOM_ELEMENT_NAME_BYTES {
+                    return Err("SyntaxError: invalid custom element tag name".to_string());
+                }
+                let state = if self.state.custom_elements.contains_key(tag) {
+                    crate::javascript::JsvPromiseState::Fulfilled(JsvValue::Undefined)
+                } else {
+                    crate::javascript::JsvPromiseState::Pending
+                };
+                let promise = Rc::new(RefCell::new(state));
+                if !self.state.custom_elements.contains_key(tag) {
+                    let waiter_count = self
+                        .state
+                        .custom_element_waiters
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>();
+                    if waiter_count >= MAX_CUSTOM_ELEMENT_WAITERS {
+                        return Err(
+                            "QuotaExceededError: custom element waiter budget exceeded".to_string()
+                        );
+                    }
+                    self.state
+                        .custom_element_waiters
+                        .entry(tag.to_string())
+                        .or_default()
+                        .push(promise.clone());
+                }
+                Ok(JsvValue::Promise(promise))
+            }
+            // ---- Track 2 Phase 2: Observer constructors ----
+            (HOST_WINDOW, "MutationObserver") => {
+                // Constructor: new MutationObserver(callback). Allocates a unique
+                // observer id and stores the callback for later delivery.
+                let callback = arguments.first().cloned().unwrap_or(JsvValue::Undefined);
+                if !crate::javascript::is_callable_public(&callback) {
+                    return Err("TypeError: MutationObserver callback must be callable".to_string());
+                }
+                if self.state.mutation_observers.len() >= MAX_MUTATION_OBSERVERS {
+                    return Err("QuotaExceededError: MutationObserver budget exceeded".to_string());
+                }
+                let id = self.state.next_observer_id;
+                self.state.next_observer_id = self
+                    .state
+                    .next_observer_id
+                    .checked_add(1)
+                    .ok_or_else(|| "MutationObserver identifier space exhausted".to_string())?;
+                self.state.mutation_observers.insert(
+                    id,
+                    MutationObserverEntry {
+                        id,
+                        kind: ObserverKind::Mutation,
+                        callback,
+                        targets: BTreeMap::new(),
+                        records: VecDeque::new(),
+                    },
+                );
+                Ok(JsvValue::HostObject(id))
+            }
+            // ---- Track 2 Phase 2: ResizeObserver ----
+            (HOST_WINDOW, "ResizeObserver") => {
+                // Constructor: new ResizeObserver(callback). Allocates a unique
+                // observer id and stores the callback for later delivery.
+                let callback = arguments.first().cloned().unwrap_or(JsvValue::Undefined);
+                if !crate::javascript::is_callable_public(&callback) {
+                    return Err("TypeError: ResizeObserver callback must be callable".to_string());
+                }
+                if self.state.mutation_observers.len() >= MAX_MUTATION_OBSERVERS {
+                    return Err("QuotaExceededError: ResizeObserver budget exceeded".to_string());
+                }
+                let id = self.state.next_observer_id;
+                self.state.next_observer_id = self
+                    .state
+                    .next_observer_id
+                    .checked_add(1)
+                    .ok_or_else(|| "ResizeObserver identifier space exhausted".to_string())?;
+                self.state.mutation_observers.insert(
+                    id,
+                    MutationObserverEntry {
+                        id,
+                        kind: ObserverKind::Resize,
+                        callback,
+                        targets: BTreeMap::new(),
+                        records: VecDeque::new(),
+                    },
+                );
+                Ok(JsvValue::HostObject(id))
+            }
+            // ---- Track 2 Phase 2: IntersectionObserver ----
+            (HOST_WINDOW, "IntersectionObserver") => {
+                // Constructor: new IntersectionObserver(callback). Allocates a
+                // unique observer id and stores the callback for later delivery.
+                let callback = arguments.first().cloned().unwrap_or(JsvValue::Undefined);
+                if !crate::javascript::is_callable_public(&callback) {
+                    return Err(
+                        "TypeError: IntersectionObserver callback must be callable".to_string()
+                    );
+                }
+                if self.state.mutation_observers.len() >= MAX_MUTATION_OBSERVERS {
+                    return Err(
+                        "QuotaExceededError: IntersectionObserver budget exceeded".to_string()
+                    );
+                }
+                let id = self.state.next_observer_id;
+                self.state.next_observer_id =
+                    self.state.next_observer_id.checked_add(1).ok_or_else(|| {
+                        "IntersectionObserver identifier space exhausted".to_string()
+                    })?;
+                self.state.mutation_observers.insert(
+                    id,
+                    MutationObserverEntry {
+                        id,
+                        kind: ObserverKind::Intersection,
+                        callback,
+                        targets: BTreeMap::new(),
+                        records: VecDeque::new(),
+                    },
+                );
+                Ok(JsvValue::HostObject(id))
+            }
+            // ---- Track 2 Phase 4: ReadableStream constructor ----
+            (HOST_WINDOW, "ReadableStream") => {
+                if self.state.readable_streams.len() >= MAX_STREAMS_PER_PAGE {
+                    return Err("QuotaExceededError: readable stream budget exceeded".to_string());
+                }
+                let mut entry = ReadableStreamEntry::default();
+                if let Some(initial_chunks) = arguments.first() {
+                    let JsvValue::Array(chunks) = initial_chunks else {
+                        return Err(
+                            "TypeError: ReadableStream constructor accepts an array of chunks"
+                                .to_string(),
+                        );
+                    };
+                    for chunk in chunks.borrow().iter().take(MAX_STREAM_CHUNKS) {
+                        let bytes = Self::stream_chunk_from_value(chunk)?;
+                        entry.total_bytes = entry.total_bytes.saturating_add(bytes.len());
+                        if entry.total_bytes > MAX_STREAM_BYTES {
+                            return Err(
+                                "QuotaExceededError: stream byte budget exceeded".to_string()
+                            );
+                        }
+                        entry.chunks.push_back(Rc::new(bytes));
+                    }
+                }
+                if self
+                    .retained_stream_bytes()
+                    .saturating_add(entry.total_bytes)
+                    > MAX_STREAM_BYTES_PER_PAGE
+                {
+                    return Err("QuotaExceededError: page stream byte budget exceeded".to_string());
+                }
+                entry.closed = true;
+                let handle = self.allocate_platform_handle()?;
+                self.state.readable_streams.insert(handle, entry);
+                Ok(JsvValue::HostObject(handle))
+            }
             _ => Err(format!(
                 "SecurityError: host method '{}' is unavailable",
                 method
@@ -3549,6 +5457,7 @@ impl JsvHost for RuntimeHost<'_> {
 /// document lifetime. Script turns reuse the same engine so top-level
 /// bindings, closures and registered callbacks survive across `<script>`
 /// tags, event dispatches and timer pumps.
+#[derive(Debug)]
 pub struct PageRuntime {
     live_dom: LiveDocument,
     engine: crate::javascript::JsvEngine,
@@ -3692,29 +5601,205 @@ impl PageRuntime {
         result
     }
 
-    /// Execute every inline `<script>` in the current document through the
-    /// persistent engine (external-script loading is owned by the network
-    /// layer; only inline bodies execute here).
-    pub fn run_document(&mut self) -> Result<(), String> {
-        let dom = self.dom_element();
-        let scripts: Vec<String> = dom
-            .find_all_tags("script")
-            .into_iter()
-            .filter(|script| script.get_attr("src").is_none())
-            .take(MAX_SCRIPTS + 1)
-            .map(|script| script.text.clone())
-            .collect();
-        if scripts.len() > MAX_SCRIPTS {
-            self.report.truncated = true;
+    /// Drain queued requestAnimationFrame callbacks.
+    pub fn drain_animation_frames(&mut self) -> Result<usize, String> {
+        let callbacks = std::mem::take(&mut self.state.animation_frame_callbacks);
+        let mut executed = 0usize;
+        let now = self.state.now_ms as f64;
+        for (_id, cb) in callbacks {
+            let outcome = {
+                let mut host = RuntimeHost::new(
+                    &mut self.live_dom,
+                    &mut self.report,
+                    &mut self.realm,
+                    &mut self.state,
+                );
+                self.engine
+                    .invoke_callback(&cb, vec![JsvValue::Number(now)], &mut host)
+            };
+            if let Err(error) = outcome {
+                push_report_error(&mut self.report, error);
+            }
+            self.report.animation_frames_fired =
+                self.report.animation_frames_fired.saturating_add(1);
+            executed += 1;
         }
-        for script in scripts.into_iter().take(MAX_SCRIPTS) {
-            match self.execute_script(&script) {
+        Ok(executed)
+    }
+
+    /// Advance time in the persistent runtime, pumping RAF, timers, microtasks,
+    /// observer callbacks, and updating the layout/DOM.
+    pub fn pump_events(&mut self, elapsed_ms: u64) -> Result<usize, String> {
+        let raf_count = self.drain_animation_frames()?;
+        let timer_count = self.pump_timers(elapsed_ms)?;
+        self.queue_layout_observer_records();
+        let flushed = self.flush_pending()?;
+        self.refresh_render();
+        Ok(raf_count
+            .saturating_add(timer_count)
+            .saturating_add(flushed))
+    }
+
+    /// Retained heap bytes of the active page realm.
+    pub fn heap_bytes(&self) -> usize {
+        self.realm.heap.used_bytes()
+    }
+
+    /// Dispatch a DOM event by type name (click, CustomEvent, etc.).
+    pub fn dispatch_event_by_type(
+        &mut self,
+        target: NodeId,
+        event_type: &str,
+        detail: Option<String>,
+    ) -> Result<DispatchReport, String> {
+        if event_type == "click" {
+            self.click(target)
+        } else {
+            self.dispatch_custom_event(target, event_type, detail, true)
+        }
+    }
+
+    /// Execute a script with source URL, script type, and detailed diagnostic reporting.
+    pub fn execute_script_with_context(
+        &mut self,
+        script: &str,
+        url: &str,
+        script_type: &str,
+        _is_async: bool,
+        _is_defer: bool,
+    ) -> Result<JsvValue, String> {
+        self.report.scripts_seen = self.report.scripts_seen.saturating_add(1);
+        if script_type == "importmap" {
+            let res = self.engine.modules.register_import_map(script);
+            let status = if res.is_ok() { "success" } else { "failed" };
+            self.report.script_diagnostics.push(ScriptDiagnostic {
+                url: url.to_string(),
+                script_type: script_type.to_string(),
+                phase: "parse".to_string(),
+                status: status.to_string(),
+                error_message: res.as_ref().err().cloned(),
+            });
+            return res.map(|_| JsvValue::Undefined);
+        }
+
+        if script_type == "module" {
+            let reg_res = self.engine.modules.register(url, script);
+            if let Err(e) = reg_res {
+                self.report.scripts_failed += 1;
+                self.report.script_diagnostics.push(ScriptDiagnostic {
+                    url: url.to_string(),
+                    script_type: script_type.to_string(),
+                    phase: "link".to_string(),
+                    status: "failed".to_string(),
+                    error_message: Some(e.clone()),
+                });
+                return Err(e);
+            }
+            let eval_res = self.engine.modules.evaluate(url);
+            match eval_res {
                 Ok(_) => {
-                    self.report.scripts_executed = self.report.scripts_executed.saturating_add(1);
+                    self.report.scripts_executed += 1;
+                    self.report.script_diagnostics.push(ScriptDiagnostic {
+                        url: url.to_string(),
+                        script_type: script_type.to_string(),
+                        phase: "execute".to_string(),
+                        status: "success".to_string(),
+                        error_message: None,
+                    });
+                    self.flush_pending()?;
+                    return Ok(JsvValue::Undefined);
                 }
-                Err(error) => self.report.errors.push(error),
+                Err(e) => {
+                    self.report.scripts_failed += 1;
+                    push_report_error(&mut self.report, e.clone());
+                    self.report.script_diagnostics.push(ScriptDiagnostic {
+                        url: url.to_string(),
+                        script_type: script_type.to_string(),
+                        phase: "execute".to_string(),
+                        status: "failed".to_string(),
+                        error_message: Some(e.clone()),
+                    });
+                    return Err(e);
+                }
             }
         }
+
+        match self.execute_script(script) {
+            Ok(v) => {
+                self.report.scripts_executed += 1;
+                self.report.script_diagnostics.push(ScriptDiagnostic {
+                    url: url.to_string(),
+                    script_type: script_type.to_string(),
+                    phase: "execute".to_string(),
+                    status: "success".to_string(),
+                    error_message: None,
+                });
+                Ok(v)
+            }
+            Err(e) => {
+                self.report.scripts_failed += 1;
+                push_report_error(&mut self.report, e.clone());
+                self.report.script_diagnostics.push(ScriptDiagnostic {
+                    url: url.to_string(),
+                    script_type: script_type.to_string(),
+                    phase: "execute".to_string(),
+                    status: "failed".to_string(),
+                    error_message: Some(e.clone()),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Enhanced run_document with support for `<script type="importmap">`,
+    /// modules, defer, and document-order execution.
+    pub fn run_document(&mut self) -> Result<(), String> {
+        let dom = self.dom_element();
+        let script_tags = dom.find_all_tags("script");
+
+        // 1. Process import maps first
+        for script in &script_tags {
+            if script.get_attr("type").map(|s| s.as_str()) == Some("importmap") {
+                let _ = self.execute_script_with_context(
+                    &script.text,
+                    "importmap",
+                    "importmap",
+                    false,
+                    false,
+                );
+            }
+        }
+
+        // 2. Process inline classic and module scripts
+        for script in script_tags.iter().take(MAX_SCRIPTS) {
+            let script_type = script
+                .get_attr("type")
+                .map_or("text/javascript", |v| v.as_str());
+            if script_type == "importmap" {
+                continue;
+            }
+            if script.get_attr("src").is_some() {
+                continue;
+            }
+            let is_module = script_type == "module";
+            let is_defer = script.get_attr("defer").is_some();
+            let is_async = script.get_attr("async").is_some();
+            let typ = if is_module { "module" } else { "classic" };
+            let url = if is_module {
+                "inline-module"
+            } else {
+                "inline-script"
+            };
+            let _ = self.execute_script_with_context(&script.text, url, typ, is_async, is_defer);
+        }
+
+        // 3. Dispatch DOMContentLoaded on document
+        let doc_root = self.live_dom.root();
+        let _ = self.dispatch_custom_event(doc_root, "DOMContentLoaded", None, true);
+
+        // 4. Dispatch load on window
+        let _ = self.dispatch_custom_event(LISTENER_WINDOW, "load", None, false);
+
         Ok(())
     }
 
@@ -3725,11 +5810,23 @@ impl PageRuntime {
     /// Refresh the retained render state (recompute styles/layout/paint when
     /// dirty) and return it.
     pub fn refresh_render(&mut self) -> &crate::live_dom::LiveRenderState {
+        self.queue_layout_observer_records();
         self.live_dom.refresh()
     }
 
     pub fn report(&self) -> &RuntimeReport {
         &self.report
+    }
+
+    /// Return diagnostics with live counters that are owned outside the
+    /// accumulated report. This avoids consuming the runtime merely to show
+    /// task/heap information in the browser UI.
+    pub fn report_snapshot(&self) -> RuntimeReport {
+        let mut report = self.report.clone();
+        report.scheduled_tasks = self.state.timers.len();
+        report.realm_heap_bytes = self.realm.heap.used_bytes();
+        report.truncated |= self.state.history.was_truncated();
+        report
     }
 
     pub fn into_report(mut self) -> RuntimeReport {
@@ -3762,6 +5859,16 @@ impl PageRuntime {
 
     pub fn pending_timers(&self) -> usize {
         self.state.timers.len()
+    }
+
+    /// Whether the embedder needs to keep scheduling event-loop turns. Static
+    /// pages retain their realm for DevTools/events without paying for a 30 Hz
+    /// idle timer.
+    pub fn needs_event_pump(&self) -> bool {
+        !self.state.timers.is_empty()
+            || !self.state.animation_frame_callbacks.is_empty()
+            || !self.state.pending_dispatches.is_empty()
+            || !self.state.pending_observer_callbacks.is_empty()
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -4007,7 +6114,7 @@ impl PageRuntime {
                     .invoke_callback(&timer.callback, Vec::new(), &mut host)
             };
             if let Err(error) = outcome {
-                self.report.errors.push(error);
+                push_report_error(&mut self.report, error);
             }
             self.report.timers_fired = self.report.timers_fired.saturating_add(1);
             fired += 1;
@@ -4106,7 +6213,7 @@ impl PageRuntime {
                 result
             };
             if let Err(error) = outcome {
-                self.report.errors.push(error);
+                push_report_error(&mut self.report, error);
             }
             invoked = invoked.saturating_add(1);
             if listener.once {
@@ -4139,29 +6246,129 @@ impl PageRuntime {
     /// dispatch already happened inside the host; this pass executes the
     /// JavaScript listener side after the turn completes.
     pub fn flush_pending(&mut self) -> Result<usize, String> {
-        let pending = std::mem::take(&mut self.state.pending_dispatches);
         let mut total = 0usize;
-        for dispatch in pending {
-            let target = if dispatch.node == LISTENER_WINDOW {
-                self.live_dom.root()
-            } else {
-                if !self.live_dom.node(dispatch.node).is_some() {
-                    continue;
+        for _ in 0..MAX_PENDING_TASKS {
+            let pending = std::mem::take(&mut self.state.pending_dispatches);
+            let had_dispatches = !pending.is_empty();
+            for dispatch in pending {
+                let target = if dispatch.node == LISTENER_WINDOW {
+                    self.live_dom.root()
+                } else {
+                    if self.live_dom.node(dispatch.node).is_none() {
+                        continue;
+                    }
+                    dispatch.node
+                };
+                let mut event = DomEvent::new(&dispatch.event_type, target);
+                event.detail = dispatch.detail;
+                if event.event_type == "submit" {
+                    total = total.saturating_add(self.js_dispatch_pass(target, &mut event)?);
+                    if !event.default_prevented {
+                        self.collect_submission(target)?;
+                    }
+                } else {
+                    total = total.saturating_add(self.js_dispatch_pass(target, &mut event)?);
                 }
-                dispatch.node
-            };
-            let mut event = DomEvent::new(&dispatch.event_type, target);
-            event.detail = dispatch.detail;
-            if event.event_type == "submit" {
-                total = total.saturating_add(self.js_dispatch_pass(target, &mut event)?);
-                if !event.default_prevented {
-                    self.collect_submission(target)?;
-                }
-            } else {
-                total = total.saturating_add(self.js_dispatch_pass(target, &mut event)?);
+            }
+            let observer_callbacks = self.flush_observer_callbacks()?;
+            total = total.saturating_add(observer_callbacks);
+            if !had_dispatches && observer_callbacks == 0 {
+                break;
             }
         }
+        if !self.state.pending_dispatches.is_empty()
+            || !self.state.pending_observer_callbacks.is_empty()
+        {
+            self.report.truncated = true;
+        }
         Ok(total)
+    }
+
+    /// Deliver queued observer records at the page microtask checkpoint. The
+    /// callback and record array are rooted only for the invocation; an
+    /// observer that queues another mutation is handled by the enclosing
+    /// `flush_pending` loop with a hard task budget.
+    fn flush_observer_callbacks(&mut self) -> Result<usize, String> {
+        let callbacks = std::mem::take(&mut self.state.pending_observer_callbacks);
+        let mut invoked = 0usize;
+        for observer_id in callbacks.into_iter().take(MAX_PENDING_TASKS) {
+            let Some((callback, records)) = self
+                .state
+                .mutation_observers
+                .get_mut(&observer_id)
+                .map(|entry| (entry.callback.clone(), std::mem::take(&mut entry.records)))
+            else {
+                continue;
+            };
+            if records.is_empty() {
+                continue;
+            }
+            let records = RuntimeHost::observer_records_value(records);
+            let outcome = {
+                let mut host = RuntimeHost::new(
+                    &mut self.live_dom,
+                    &mut self.report,
+                    &mut self.realm,
+                    &mut self.state,
+                );
+                self.engine.invoke_callback(
+                    &callback,
+                    vec![records, JsvValue::HostObject(observer_id)],
+                    &mut host,
+                )
+            };
+            if let Err(error) = outcome {
+                push_report_error(&mut self.report, error);
+            }
+            invoked = invoked.saturating_add(1);
+        }
+        Ok(invoked)
+    }
+
+    /// Layout observers are coalesced on render refresh. A browser page can
+    /// observe a node more than once, but a single refresh produces at most
+    /// one bounded record per (observer, target) pair.
+    fn queue_layout_observer_records(&mut self) {
+        let mut pending = Vec::new();
+        for (observer_id, entry) in self.state.mutation_observers.iter_mut() {
+            if !matches!(
+                entry.kind,
+                ObserverKind::Resize | ObserverKind::Intersection
+            ) {
+                continue;
+            }
+            let record_type = match entry.kind {
+                ObserverKind::Resize => "resize",
+                ObserverKind::Intersection => "intersection",
+                ObserverKind::Mutation => continue,
+            };
+            let had_records = !entry.records.is_empty();
+            for target in entry.targets.keys().copied().take(MAX_MUTATION_RECORDS) {
+                if entry.records.len() >= MAX_MUTATION_RECORDS {
+                    break;
+                }
+                entry.records.push_back(MutationRecord {
+                    record_type: record_type.to_string(),
+                    target,
+                    attribute_name: None,
+                    old_value: None,
+                    added_nodes: Vec::new(),
+                    removed_nodes: Vec::new(),
+                    previous_sibling: None,
+                    next_sibling: None,
+                });
+            }
+            if !had_records && !entry.records.is_empty() {
+                pending.push(*observer_id);
+            }
+        }
+        for observer_id in pending {
+            if self.state.pending_observer_callbacks.len() >= MAX_PENDING_TASKS {
+                self.report.truncated = true;
+                break;
+            }
+            self.state.pending_observer_callbacks.push(observer_id);
+        }
     }
 
     /// Serialize a form's named controls into a URL-encoded submission record
@@ -4378,15 +6585,13 @@ pub fn run_inline_scripts(dom: &mut Element, base_url: &str) -> RuntimeReport {
         Ok(page) => page,
         Err(error) => {
             let mut report = RuntimeReport::default();
-            report.errors.push(error);
+            push_report_error(&mut report, error);
             report.truncated = true;
             return report;
         }
     };
     let _ = page.run_document();
-    page.report
-        .console
-        .extend(page.engine.console_output.clone());
+    page.report.console.append(&mut page.engine.console_output);
     *dom = page.dom_element();
     page.into_report()
 }

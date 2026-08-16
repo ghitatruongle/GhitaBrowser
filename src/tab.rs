@@ -234,6 +234,10 @@ pub struct Tab {
     /// the DOM is serialized into this compact binary format to preserve
     /// it for faster wake (no network refetch) while using less memory.
     pub compressed_dom: Option<Vec<u8>>,
+    /// Persistent page runtime for the tab lifetime (Phase 1 & Phase 3).
+    /// Holds live DOM, JavaScript realm, event loop, registered event listeners,
+    /// custom elements, and active timers across UI turns.
+    pub runtime: Option<crate::web_runtime::PageRuntime>,
 }
 
 /// Result of waking a sleeping tab.
@@ -275,6 +279,7 @@ impl Tab {
             group_id: None,
             is_discarded: false,
             compressed_dom: None,
+            runtime: None,
         }
     }
 
@@ -288,6 +293,74 @@ impl Tab {
         }
         self.url = url.clone();
         self.layout = None;
+        self.runtime = None;
+    }
+
+    /// Attach an existing initialized PageRuntime to this tab.
+    pub fn attach_runtime(&mut self, runtime: crate::web_runtime::PageRuntime) {
+        self.runtime = Some(runtime);
+    }
+
+    /// Initialize a fresh PageRuntime for this tab's current DOM.
+    pub fn init_runtime(
+        &mut self,
+        css_rules: Vec<crate::css_parser::CssRule>,
+        viewport_width: u32,
+        base_url: &str,
+    ) -> Result<(), String> {
+        let mut runtime = crate::web_runtime::PageRuntime::from_element(
+            &self.dom,
+            css_rules,
+            viewport_width,
+            base_url,
+        )?;
+        let _ = runtime.run_document();
+        self.dom = runtime.dom_element();
+        self.runtime = Some(runtime);
+        Ok(())
+    }
+
+    /// Advance time in the tab's persistent runtime, pumping timers, microtasks,
+    /// observer callbacks, and updating the DOM representation.
+    pub fn pump_runtime(&mut self, elapsed_ms: u64) -> Result<usize, String> {
+        if let Some(ref mut runtime) = self.runtime {
+            let processed = runtime.pump_events(elapsed_ms)?;
+            self.dom = runtime.dom_element();
+            Ok(processed)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Evaluate JavaScript in the tab's persistent realm.
+    pub fn evaluate_js(&mut self, script: &str) -> Result<crate::javascript::JsvValue, String> {
+        if let Some(ref mut runtime) = self.runtime {
+            let result = runtime.evaluate(script)?;
+            self.dom = runtime.dom_element();
+            Ok(result)
+        } else {
+            Err("No active runtime on tab".to_string())
+        }
+    }
+
+    /// Dispatch a DOM event into the tab's persistent runtime.
+    pub fn dispatch_event(
+        &mut self,
+        target: u64,
+        event_type: &str,
+    ) -> Result<crate::live_dom::DispatchReport, String> {
+        if let Some(ref mut runtime) = self.runtime {
+            let report = runtime.dispatch_event_by_type(target, event_type, None)?;
+            self.dom = runtime.dom_element();
+            Ok(report)
+        } else {
+            Err("No active runtime on tab".to_string())
+        }
+    }
+
+    /// Heap bytes retained by the persistent page realm (for memory accounting).
+    pub fn runtime_heap_bytes(&self) -> usize {
+        self.runtime.as_ref().map(|r| r.heap_bytes()).unwrap_or(0)
     }
 
     pub fn push_history(&mut self, entry: HistoryEntry) {
@@ -415,6 +488,7 @@ impl Tab {
         // Drop the heavy in-memory data
         self.dom = Element::new("root");
         self.layout = None;
+        self.runtime = None;
         self.is_sleeping = true;
         self.slept_at = Some(chrono::Utc::now().timestamp());
 
@@ -609,6 +683,7 @@ impl Tab {
 
         self.dom = Element::new("root");
         self.layout = None;
+        self.runtime = None;
         // The sleeping snapshot can be as large as the DOM it was meant to
         // replace — discarding must release it too, or the "memory saved"
         // figure is fiction and the stale snapshot stays resident forever.

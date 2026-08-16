@@ -79,5 +79,5 @@ fn document_pipeline_handles_deep_input_without_unbounded_tree() {
 #[test]
 fn runtime_version_matches_package_version() {
     assert_eq!(ghitabrowser::VERSION, env!("CARGO_PKG_VERSION"));
-    assert_eq!(ghitabrowser::VERSION, "2.0.0");
+    assert_eq!(ghitabrowser::VERSION, "2.0.6");
 }

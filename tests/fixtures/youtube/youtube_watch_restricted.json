@@ -1,0 +1,42 @@
+{
+  "unplayable": {
+    "playabilityStatus": {
+      "status": "UNPLAYABLE",
+      "reason": "This video is unavailable in your region"
+    }
+  },
+  "login_required": {
+    "playabilityStatus": {
+      "status": "LOGIN_REQUIRED",
+      "reason": "Sign in to confirm your age",
+      "messages": [
+        "This video may be inappropriate for some users."
+      ]
+    }
+  },
+  "age_check_required": {
+    "playabilityStatus": {
+      "status": "AGE_CHECK_REQUIRED",
+      "reason": "Age-restricted video (based on Community Guidelines)"
+    }
+  },
+  "cipher_only": {
+    "playabilityStatus": {
+      "status": "OK"
+    },
+    "videoDetails": {
+      "videoId": "cipher12345",
+      "title": "Protected DRM Content",
+      "lengthSeconds": "300"
+    },
+    "streamingData": {
+      "formats": [
+        {
+          "itag": 18,
+          "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+          "cipher": "s=abc12345&sp=sig&url=https://googlevideo.com/"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,138 @@
+{
+  "track": "06_css_syntax_cascade_and_values",
+  "version": "2.0.5",
+  "features": {
+    "selectors": {
+      "type_selectors": true,
+      "class_selectors": true,
+      "id_selectors": true,
+      "universal_selector": true,
+      "attribute_selectors": {
+        "presence": "[attr]",
+        "exact": "[attr=value]",
+        "includes": "[attr~=value]",
+        "dash_match": "[attr|=value]",
+        "prefix": "[attr^=value]",
+        "suffix": "[attr$=value]",
+        "substring": "[attr*=value]",
+        "case_sensitivity_modifiers": ["i", "s"]
+      },
+      "pseudo_classes": [
+        ":root",
+        ":empty",
+        ":first-child",
+        ":last-child",
+        ":only-child",
+        ":first-of-type",
+        ":last-of-type",
+        ":only-of-type",
+        ":nth-child(An+B)",
+        ":nth-last-child(An+B)",
+        ":nth-of-type(An+B)",
+        ":nth-last-of-type(An+B)",
+        ":hover",
+        ":active",
+        ":focus",
+        ":focus-visible",
+        ":focus-within",
+        ":enabled",
+        ":disabled",
+        ":checked",
+        ":link",
+        ":visited",
+        ":target",
+        ":not()",
+        ":is()",
+        ":where()",
+        ":has()",
+        ":lang()"
+      ],
+      "pseudo_elements": [
+        "::before",
+        "::after",
+        "::placeholder",
+        "::first-letter",
+        "::first-line",
+        "::marker",
+        "::selection"
+      ],
+      "combinators": {
+        "descendant": " ",
+        "child": ">",
+        "adjacent_sibling": "+",
+        "general_sibling": "~"
+      }
+    },
+    "at_rules": {
+      "@import": { "url_syntax": true, "string_syntax": true },
+      "@media": {
+        "min_width": true,
+        "max_width": true,
+        "range_syntax": true,
+        "boolean_and_not_or": true
+      },
+      "@supports": {
+        "property_value_queries": true,
+        "selector_queries": true,
+        "boolean_not_and_or": true
+      },
+      "@layer": {
+        "named_layers": true,
+        "anonymous_layers": true,
+        "layer_ordering": true
+      }
+    },
+    "cascade_and_inheritance": {
+      "origins": ["UserAgent", "User", "Author"],
+      "importance": "!important",
+      "inline_styles": true,
+      "specificity_ordering": "(a, b, c)",
+      "source_order": true,
+      "css_wide_keywords": ["initial", "inherit", "unset", "revert"],
+      "inheritance_table": [
+        "color",
+        "font-family",
+        "font-size",
+        "font-weight",
+        "font-style",
+        "line-height",
+        "letter-spacing",
+        "word-spacing",
+        "text-align",
+        "visibility",
+        "cursor"
+      ]
+    },
+    "custom_properties": {
+      "var_resolution": true,
+      "fallback_values": true,
+      "cycle_detection": true,
+      "iacvt_handling": true,
+      "max_recursion_depth": 16
+    },
+    "values_and_units": {
+      "length_units": ["px", "pt", "em", "rem", "vw", "vh", "vmin", "vmax", "%"],
+      "math_functions": ["calc()", "min()", "max()", "clamp()"],
+      "color_formats": [
+        "#RGB",
+        "#RGBA",
+        "#RRGGBB",
+        "#RRGGBBAA",
+        "rgb()",
+        "rgba()",
+        "hsl()",
+        "hsla()",
+        "named_colors",
+        "transparent",
+        "currentColor"
+      ]
+    },
+    "diagnostics": {
+      "schema": "CssDiagnostics",
+      "unsupported_property_tracking": true,
+      "unsupported_selector_tracking": true,
+      "unsupported_at_rule_tracking": true,
+      "parse_error_records": true
+    }
+  }
+}

@@ -4,9 +4,7 @@ use iced::widget::{
     button, canvas, column, container, horizontal_space, row, scrollable, text, text_input,
     vertical_space,
 };
-use iced::{
-    keyboard, mouse, Application, Color, Command, Element, Length, Settings, Shadow, Theme,
-};
+use iced::{mouse, Application, Color, Command, Element, Length, Settings, Shadow, Theme};
 use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,6 +111,44 @@ fn is_spa_or_js_rendered(html: &str) -> bool {
     spa_score >= 10
 }
 
+/// Switch to a normal-flow layout only when the collision signal is strong.
+/// A few overlaps are legitimate (badges, menus, dialogs), while dozens of
+/// mostly-covered text boxes make a document unusable.
+fn requires_safe_flow_layout(overlapping_pairs: usize, collision_score: f64) -> bool {
+    (overlapping_pairs >= 8 && collision_score >= 0.02) || overlapping_pairs >= 24
+}
+
+fn has_navigable_prefix(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("file://")
+        || lower.starts_with("ghita://")
+        || lower.starts_with("about:")
+        || lower.starts_with("www.")
+}
+
+/// Recover replacement semantics if a platform text widget appends a newly
+/// typed absolute URL before the global Ctrl+L command is delivered. Restrict
+/// this to an exact old-value prefix/suffix so embedded redirect URLs in a
+/// normal query remain untouched.
+fn normalize_omnibox_replacement(previous: &str, edited: String) -> String {
+    if previous.is_empty() || edited == previous {
+        return edited;
+    }
+    if let Some(replacement) = edited.strip_prefix(previous) {
+        if has_navigable_prefix(replacement) {
+            return replacement.to_string();
+        }
+    }
+    if let Some(replacement) = edited.strip_suffix(previous) {
+        if has_navigable_prefix(replacement) {
+            return replacement.to_string();
+        }
+    }
+    edited
+}
+
 /// Extract YouTube video ID from URL (e.g., youtube.com/watch?v=ID, youtu.be/ID)
 /// Returns Some(video_id) if URL is a YouTube watch URL.
 fn extract_youtube_video_id(url: &str) -> Option<String> {
@@ -166,21 +202,33 @@ fn build_video_info_html(video_id: &str, source_url: &str) -> String {
     let safe_thumb = html_escape(&thumb_url);
 
     format!(
-        "<html><head><title>{title} ({id})</title></head>\
-         <body style=\"font-family: sans-serif; padding: 24px;\">\
+        "<html><head><title>{title} ({id}) - GhitaBrowser</title>\
+         <style>\
+         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f12; color: #e1e1e6; padding: 32px; margin: 0; line-height: 1.6; }}\
+         .card {{ background: #1a1a24; border: 1px solid #2e2e3e; border-radius: 12px; padding: 24px; max-width: 640px; margin: 0 auto; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }}\
+         h1 {{ font-size: 22px; margin-top: 0; color: #ffffff; }}\
+         .thumb {{ width: 100%; height: auto; border-radius: 8px; margin: 16px 0; border: 1px solid #333; }}\
+         .meta {{ background: #121218; padding: 12px 16px; border-radius: 8px; font-size: 14px; margin-bottom: 20px; }}\
+         .meta p {{ margin: 6px 0; }}\
+         .btn {{ display: inline-block; background: #3b82f6; color: #fff; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: 500; margin-right: 8px; margin-bottom: 8px; }}\
+         .btn:hover {{ background: #2563eb; }}\
+         .btn-secondary {{ background: #2a2a38; color: #cbd5e1; }}\
+         .btn-secondary:hover {{ background: #38384c; }}\
+         .notice {{ font-size: 13px; color: #94a3b8; margin-top: 20px; border-top: 1px solid #2a2a38; padding-top: 16px; }}\
+         </style></head>\
+         <body><div class=\"card\">\
          <h1>{title}</h1>\
-         <img src=\"{thumb}\" width=\"480\" height=\"360\" alt=\"Video thumbnail\"/>\
-         <h2>Video Information</h2>\
+         <img class=\"thumb\" src=\"{thumb}\" alt=\"Video thumbnail\"/>\
+         <div class=\"meta\">\
          <p><b>Video ID:</b> <code>{id}</code></p>\
-         <p><b>Source URL:</b> <a href=\"{url}\">{url}</a></p>\
-         <h2>Watch alternatives</h2>\
-         <ul>\
-         <li>Embed view: <a href=\"https://www.youtube.com/embed/{id}\">youtube.com/embed/{id}</a></li>\
-         <li>Search for this video via the address bar</li>\
-         <li>Invidious mirror (privacy-friendly YouTube frontend)</li>\
-         </ul>\
-         <p style=\"color: gray;\">The current YouTube player requires web-platform and media features outside this build's release UI.</p>\
-         </body></html>",
+         <p><b>Source URL:</b> <a style=\"color:#60a5fa;word-break:break-all;\" href=\"{url}\">{url}</a></p>\
+         </div>\
+         <div style=\"margin: 16px 0;\">\
+         <a class=\"btn\" href=\"https://www.youtube.com/embed/{id}\">Watch via Embed</a>\
+         <a class=\"btn btn-secondary\" href=\"ghita://search?q={id}\">Search in Ghita</a>\
+         </div>\
+         <p class=\"notice\">GhitaBrowser 2.0.6 document player mode active.</p>\
+         </div></body></html>",
         id = safe_id,
         url = safe_url,
         thumb = safe_thumb,
@@ -222,6 +270,18 @@ fn build_youtube_shell_from_model(
         }
         crate::youtube::YouTubeRoute::Watch { video_id } => {
             format!("Watch: {}", html_escape(video_id))
+        }
+        crate::youtube::YouTubeRoute::Playlist { playlist_id, .. } => {
+            format!("Playlist: {}", html_escape(playlist_id))
+        }
+        crate::youtube::YouTubeRoute::Channel { channel_id } => {
+            format!("Channel: {}", html_escape(channel_id))
+        }
+        crate::youtube::YouTubeRoute::Shorts { video_id } => {
+            format!("Shorts: {}", html_escape(video_id))
+        }
+        crate::youtube::YouTubeRoute::Embed { video_id } => {
+            format!("Embed: {}", html_escape(video_id))
         }
     };
     let mut cards = String::new();
@@ -683,6 +743,7 @@ pub enum Message {
     Reload,
     Home,
     FocusUrl,
+    ReplaceUrl,
     OpenFileDialog,
     LocalFilePicked(Option<std::path::PathBuf>),
 
@@ -825,6 +886,8 @@ pub enum Message {
     // ===== v1.2.0 Messages =====
     /// Timer tick for Memory Saver — checks if any inactive tab should sleep.
     MemorySaverTick,
+    /// Advance the persistent JavaScript event loop for the active tab.
+    PageRuntimeTick,
     /// Wake a sleeping tab (user clicked on it).
     WakeTab(usize),
     /// Timer tick for Memory Pressure monitor — checks if memory usage is too high.
@@ -932,6 +995,12 @@ impl Application for GhitaBrowserApp {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::UrlChanged(url) => {
+                let active_url = self
+                    .browser
+                    .active_tab()
+                    .map(|tab| tab.url.as_str())
+                    .unwrap_or_default();
+                let url = normalize_omnibox_replacement(active_url, url);
                 self.show_suggestions = !url.trim().is_empty();
                 self.url_input = url;
             }
@@ -977,10 +1046,17 @@ impl Application for GhitaBrowserApp {
             }
             Message::FocusUrl => {
                 self.show_menu = false;
-                return Command::batch([
-                    text_input::focus(text_input::Id::new(OMNIBOX_ID)),
-                    text_input::select_all(text_input::Id::new(OMNIBOX_ID)),
-                ]);
+                return text_input::focus(text_input::Id::new(OMNIBOX_ID));
+            }
+            Message::ReplaceUrl => {
+                // iced 0.12 does not reliably order focus and select-all
+                // commands after a custom page widget has handled input. Clear
+                // the edit buffer deterministically; the tab URL itself is
+                // unchanged and Escape restores it below.
+                self.show_menu = false;
+                self.show_suggestions = false;
+                self.url_input.clear();
+                return text_input::focus(text_input::Id::new(OMNIBOX_ID));
             }
             Message::OpenFileDialog => {
                 self.show_menu = false;
@@ -1332,6 +1408,38 @@ impl Application for GhitaBrowserApp {
                 // Tab is not sleeping/discarded - activate normally
                 self.browser.tabs.set_active_by_index(index);
                 return self.after_tab_change("");
+            }
+            Message::PageRuntimeTick => {
+                let active_id = self.browser.tabs.active_tab_id();
+                let mut runtime_error = None;
+                let mut repaint = false;
+
+                if let Some(tab_id) = active_id {
+                    if let Some(tab) = self.browser.tabs.get_tab_mut(tab_id) {
+                        if !tab.is_sleeping && !tab.is_discarded && tab.runtime.is_some() {
+                            match tab.pump_runtime(33) {
+                                Ok(processed) if processed > 0 => {
+                                    if let Some(runtime) = tab.runtime.as_mut() {
+                                        let render = runtime.refresh_render().clone();
+                                        tab.dom = render.dom;
+                                        tab.layout = render.layout;
+                                        repaint = true;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => runtime_error = Some(error),
+                            }
+                        }
+                    }
+                }
+
+                if repaint {
+                    self.rendered_content = self.browser.render_current();
+                    self.rebuild_display_list();
+                }
+                if let Some(error) = runtime_error {
+                    self.status_msg = format!("Page runtime error: {error}");
+                }
             }
             Message::MemorySaverTick => {
                 // Check settings at tick time (user may have changed them)
@@ -1823,7 +1931,25 @@ impl Application for GhitaBrowserApp {
             Message::ExecuteJs => {
                 let code = self.js_input_text.clone();
                 if !code.is_empty() {
-                    match self.browser.js_engine.execute_script(&code) {
+                    let mut repaint_page = false;
+                    let result = if let Some(tab) = self.browser.tabs.active_tab_mut() {
+                        if tab.runtime.is_some() {
+                            let result = tab.evaluate_js(&code);
+                            if let Some(runtime) = tab.runtime.as_mut() {
+                                let render = runtime.refresh_render().clone();
+                                tab.dom = render.dom;
+                                tab.layout = render.layout;
+                                repaint_page = true;
+                            }
+                            result
+                        } else {
+                            self.browser.js_engine.execute_script(&code)
+                        }
+                    } else {
+                        self.browser.js_engine.execute_script(&code)
+                    };
+
+                    match result {
                         Ok(val) => {
                             let output = val.to_display_string();
                             let line = format!("> {} = {}", code, output);
@@ -1848,6 +1974,10 @@ impl Application for GhitaBrowserApp {
                             self.status_msg = format!("JS Error: {}", e);
                         }
                     }
+                    if repaint_page {
+                        self.rendered_content = self.browser.render_current();
+                        self.rebuild_display_list();
+                    }
                     self.js_console_text = self.browser.js_engine.console_output.join("\n");
                     self.js_input_text = String::new();
                 }
@@ -1866,6 +1996,15 @@ impl Application for GhitaBrowserApp {
                     self.tab_search_open = false;
                 } else if self.task_manager.open {
                     self.task_manager.open = false;
+                } else if let Some(url) = self.browser.active_tab().map(|tab| tab.url.clone()) {
+                    if self.url_input != url {
+                        self.url_input = if is_blank_page(&url) {
+                            String::new()
+                        } else {
+                            url
+                        };
+                        self.show_suggestions = false;
+                    }
                 }
             }
             Message::ToggleVerticalTabs => {
@@ -2091,7 +2230,78 @@ impl Application for GhitaBrowserApp {
                         dom_nodes,
                         estimated_memory_bytes: estimated_document_bytes,
                     });
-                let runtime = prepared.runtime;
+                let mut runtime = prepared.runtime;
+                let mut dom = prepared.dom;
+                let mut title = prepared.title;
+                let mut layout_tree = prepared.layout;
+                let mut rendered = prepared.rendered_text;
+                let mut page_runtime = None;
+                let is_youtube_route = crate::youtube::YouTubeRoute::parse(&url).is_ok();
+
+                // The renderer worker intentionally returns an inert DOM. A
+                // persistent runtime belongs to the tab/UI process so event
+                // listeners, closures, timers and queued jobs survive after
+                // the initial page load instead of being discarded with the
+                // short-lived worker process.
+                if !is_pdf && !is_youtube_route {
+                    let mut runtime_rules = document_rules;
+                    for style in dom.find_all_tags("style") {
+                        if !style.text.trim().is_empty() {
+                            runtime_rules.extend(crate::css_parser::parse_css_with_media(
+                                style.text.trim(),
+                                self.browser.viewport_width(),
+                            ));
+                        }
+                    }
+                    let storage_dir = if incognito {
+                        None
+                    } else {
+                        self.browser.storage.storage_dir().cloned()
+                    };
+                    match crate::web_runtime::PageRuntime::from_element_with_storage_dir(
+                        &dom,
+                        runtime_rules,
+                        self.browser.viewport_width(),
+                        &url,
+                        storage_dir.as_ref(),
+                    ) {
+                        Ok(mut persistent_runtime) => {
+                            if let Err(error) = persistent_runtime.run_document() {
+                                self.browser
+                                    .js_engine
+                                    .console_output
+                                    .push(format!("Page runtime startup error: {error}"));
+                            }
+                            let render = persistent_runtime.refresh_render().clone();
+                            dom = render.dom;
+                            layout_tree = render.layout;
+                            rendered = layout_tree
+                                .as_ref()
+                                .map(|root| {
+                                    crate::text_renderer::TextRenderer::new(
+                                        self.browser.viewport_width(),
+                                        self.browser.viewport_height(),
+                                    )
+                                    .render_to_text(root)
+                                })
+                                .unwrap_or_else(|| "[Empty page]".to_string());
+                            title = dom
+                                .find_tag("title")
+                                .or_else(|| dom.find_tag("h1"))
+                                .map(|element| element.text.trim().to_string())
+                                .filter(|title| !title.is_empty())
+                                .unwrap_or_else(|| url.clone());
+                            runtime = persistent_runtime.report_snapshot();
+                            page_runtime = Some(persistent_runtime);
+                        }
+                        Err(error) => {
+                            self.browser
+                                .js_engine
+                                .console_output
+                                .push(format!("Page runtime unavailable: {error}"));
+                        }
+                    }
+                }
                 if !incognito {
                     if let Ok(parsed) = url::Url::parse(&url) {
                         if matches!(parsed.scheme(), "http" | "https") {
@@ -2106,10 +2316,17 @@ impl Application for GhitaBrowserApp {
                 for line in &runtime.console {
                     self.browser.js_engine.console_output.push(line.clone());
                 }
-                let dom = prepared.dom;
-                let title = prepared.title;
-                let layout_tree = prepared.layout;
-                let rendered = prepared.rendered_text;
+                for error in runtime.errors.iter().take(32) {
+                    self.browser
+                        .js_engine
+                        .console_output
+                        .push(format!("Page script error: {error}"));
+                }
+                let console = &mut self.browser.js_engine.console_output;
+                if console.len() > 500 {
+                    let overflow = console.len() - 500;
+                    console.drain(0..overflow);
+                }
                 self.browser.last_render_stats = Some(stats);
 
                 // 7. Update the originating tab (may differ from the active tab now)
@@ -2139,6 +2356,7 @@ impl Application for GhitaBrowserApp {
                     tab.url = url.clone();
                     // Keep the fresh layout on the tab for pixel painting & tab switching
                     tab.layout = layout_tree.clone();
+                    tab.runtime = page_runtime;
                 } else {
                     // The tab was closed before the load finished — discard the result
                     self.is_loading = false;
@@ -2153,7 +2371,7 @@ impl Application for GhitaBrowserApp {
                 self.last_load_time = Some(fetch_time + total_time);
                 self.is_loading = false;
                 self.render_stats_text = format!(
-                    "Fetch: {}ms | Parse: {}ms | Style: {}ms | Layout: {}ms | Render: {}ms | Total: {}ms | {} DOM nodes | {} scripts | {} DOM mutations | {} runtime jobs | {} KiB realm heap | {} budget warnings",
+                    "Fetch: {}ms | Parse: {}ms | Style: {}ms | Layout: {}ms | Render: {}ms | Total: {}ms | {} DOM nodes | {} scripts ({} failed) | {} DOM mutations | {} runtime jobs | {} KiB realm heap | {} budget warnings",
                     fetch_time,
                     parse_time,
                     style_time,
@@ -2162,6 +2380,7 @@ impl Application for GhitaBrowserApp {
                     total_time,
                     dom_nodes,
                     runtime.scripts_executed,
+                    runtime.scripts_failed,
                     runtime.dom_mutations,
                     runtime.scheduled_tasks,
                     runtime.realm_heap_bytes.div_ceil(1024),
@@ -2184,18 +2403,37 @@ impl Application for GhitaBrowserApp {
 
                     // Detect SPA/JS-rendered pages (e.g., YouTube, Twitter)
                     // and show a user-friendly fallback instead of empty/skeleton content
-                    let is_spa =
-                        !is_pdf && is_spa_or_js_rendered(&html) && display_list.items.len() < 10;
+                    let visible_metrics = crate::paint::calculate_visible_metrics(
+                        &display_list,
+                        self.browser.viewport_width() as f32,
+                        self.browser.viewport_height() as f32,
+                    );
+                    let stalled_runtime = runtime.dom_mutations == 0
+                        && runtime.scheduled_tasks == 0
+                        && runtime.animation_frames_fired == 0;
+                    let visibly_sparse = visible_metrics.visible_text_characters < 128
+                        && visible_metrics.completeness_score < 0.35;
+                    let (overlapping_pairs, collision_score) = layout_tree
+                        .as_ref()
+                        .map(crate::compatibility_diagnostics::evaluate_layout_overlap)
+                        .unwrap_or((0, 0.0));
+                    let broken_author_layout =
+                        requires_safe_flow_layout(overlapping_pairs, collision_score);
+                    let is_spa = !is_pdf
+                        && is_spa_or_js_rendered(&html)
+                        && (display_list.items.len() < 10
+                            || visible_metrics.has_major_blank_region
+                            || (stalled_runtime && visibly_sparse));
                     let sparse_content =
                         !is_spa && display_list.items.len() < 3 && html.len() > 50000;
 
                     if is_spa {
                         // Parse YouTube's bounded server bootstrap into the
                         // browser-owned shell before using the static fallback.
-                        let page_html = if crate::youtube::YouTubeRoute::parse(&url).is_ok() {
+                        let page_html = if is_youtube_route {
                             if let Some(shell_html) = build_youtube_shell_html(&url, &html) {
                                 self.status_msg =
-                                    "YouTube shell loaded; live playback gate pending".to_string();
+                                    "YouTube shell loaded (degraded mode)".to_string();
                                 shell_html
                             } else if let Some(video_id) = extract_youtube_video_id(&url) {
                                 self.status_msg =
@@ -2207,7 +2445,7 @@ impl Application for GhitaBrowserApp {
                         } else {
                             // Generic SPA fallback
                             self.status_msg = format!(
-                                "JavaScript-only page: {} cannot be rendered without JS engine",
+                                "JavaScript application at {} could not complete its initial render",
                                 url
                             );
                             build_spa_fallback_html(&title, &url)
@@ -2238,6 +2476,51 @@ impl Application for GhitaBrowserApp {
                         };
                         self.display_list = Arc::new(spa_list);
                         self.rendered_content = spa_rendered;
+                    } else if broken_author_layout {
+                        // Keep the page usable when unsupported author CSS
+                        // produces severe text collisions. Re-lay out the
+                        // already-scripted DOM with browser defaults only,
+                        // preserving text, links and images in normal flow.
+                        let recovery_dom =
+                            self.browser.tabs.get_tab(tab_id).map(|tab| tab.dom.clone());
+                        let recovery_layout = recovery_dom.as_ref().and_then(|dom| {
+                            crate::layout::create_layout_tree(
+                                dom,
+                                &self.browser.css_rules,
+                                self.browser.viewport_width(),
+                            )
+                        });
+                        let recovery_list = recovery_layout
+                            .as_ref()
+                            .map(|root| {
+                                crate::paint::build_display_list_with_cache(
+                                    root,
+                                    Some(&self.browser.image_cache),
+                                )
+                            })
+                            .unwrap_or_default();
+                        let recovery_text = recovery_layout
+                            .as_ref()
+                            .map(|root| {
+                                crate::text_renderer::TextRenderer::new(
+                                    self.browser.viewport_width(),
+                                    self.browser.viewport_height(),
+                                )
+                                .render_to_text(root)
+                            })
+                            .unwrap_or_else(|| rendered.clone());
+                        if let Some(tab) = self.browser.tabs.get_tab_mut(tab_id) {
+                            tab.layout = recovery_layout;
+                            // A runtime repaint would immediately restore the
+                            // broken author layout. Compatibility mode is a
+                            // bounded static representation until navigation.
+                            tab.runtime = None;
+                        }
+                        self.status_msg = format!(
+                            "Loaded in compatibility layout: {url} ({overlapping_pairs} text collisions)"
+                        );
+                        self.display_list = Arc::new(recovery_list);
+                        self.rendered_content = recovery_text;
                     } else if display_list.is_empty() && !html.is_empty() {
                         // Display list empty - try Reader Mode fallback
                         let article =
@@ -2435,7 +2718,11 @@ impl Application for GhitaBrowserApp {
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        let keyboard_sub = keyboard::on_key_press(handle_keyboard);
+        // Browser shortcuts must also observe events captured by the omnibox
+        // or another text input. `keyboard::on_key_press` only forwards ignored
+        // events, which makes Ctrl+L/F6 stop working as soon as the address bar
+        // owns focus.
+        let keyboard_sub = iced::event::listen_with(handle_keyboard_event);
         let mut subs: Vec<iced::Subscription<Message>> = vec![keyboard_sub];
 
         // Memory Saver: tick every 30 seconds to check for inactive tabs.
@@ -2457,6 +2744,20 @@ impl Application for GhitaBrowserApp {
             );
         }
 
+        let active_runtime = self.browser.active_tab().is_some_and(|tab| {
+            tab.runtime
+                .as_ref()
+                .is_some_and(crate::web_runtime::PageRuntime::needs_event_pump)
+                && !tab.is_sleeping
+                && !tab.is_discarded
+        });
+        if active_runtime {
+            subs.push(
+                iced::time::every(std::time::Duration::from_millis(33))
+                    .map(|_| Message::PageRuntimeTick),
+            );
+        }
+
         #[cfg(target_os = "windows")]
         if self.youtube_playback.is_some() {
             subs.push(
@@ -2471,6 +2772,15 @@ impl Application for GhitaBrowserApp {
 
 // ===== Keyboard Shortcuts (Chrome bindings) =====
 
+fn handle_keyboard_event(event: iced::Event, _status: iced::event::Status) -> Option<Message> {
+    match event {
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            handle_keyboard(key, modifiers)
+        }
+        _ => None,
+    }
+}
+
 fn handle_keyboard(
     key: iced::keyboard::Key,
     modifiers: iced::keyboard::Modifiers,
@@ -2482,7 +2792,7 @@ fn handle_keyboard(
     if let Key::Named(named) = &key {
         match named {
             Named::F5 => return Some(Message::Reload),
-            Named::F6 => return Some(Message::FocusUrl),
+            Named::F6 => return Some(Message::ReplaceUrl),
             Named::F12 => return Some(Message::ToggleDevTools),
             _ => {}
         }
@@ -2511,7 +2821,7 @@ fn handle_keyboard(
 
     if modifiers.control() {
         return match key {
-            Key::Character(c) if c == "l" || c == "L" => Some(Message::FocusUrl),
+            Key::Character(c) if c == "l" || c == "L" => Some(Message::ReplaceUrl),
             Key::Character(c) if c == "t" || c == "T" => Some(Message::NewTab),
             Key::Character(c) if c == "w" || c == "W" => Some(Message::CloseCurrentTab),
             Key::Character(c) if c == "r" || c == "R" => Some(Message::Reload),
@@ -2619,10 +2929,18 @@ impl GhitaBrowserApp {
                 crate::youtube::YouTubeRoute::Search { query } => {
                     return self.start_youtube_search(query);
                 }
-                crate::youtube::YouTubeRoute::Watch { video_id } => {
+                crate::youtube::YouTubeRoute::Watch { video_id }
+                | crate::youtube::YouTubeRoute::Shorts { video_id }
+                | crate::youtube::YouTubeRoute::Embed { video_id } => {
                     return self.start_youtube_playback(video_id);
                 }
-                crate::youtube::YouTubeRoute::Home => {}
+                crate::youtube::YouTubeRoute::Playlist {
+                    video_id: Some(video_id),
+                    ..
+                } => {
+                    return self.start_youtube_playback(video_id);
+                }
+                _ => {}
             }
         }
         if target.starts_with("ghita://search") {
@@ -4543,31 +4861,42 @@ impl<'a> iced_core::Widget<Message, Theme, iced::Renderer> for WebPageWidget<'a>
             }
         });
 
-        // 2. Draw the page geometry layer
-        iced::widget::canvas::Renderer::draw(renderer, vec![geometry]);
+        // 2. Custom widgets receive document-local geometry, but the renderer
+        // operates in window coordinates. Translate both geometry and decoded
+        // images to the assigned widget bounds and clip them so page pixels can
+        // never cover the browser chrome above the content viewport.
+        iced_core::Renderer::with_layer(renderer, bounds, |renderer| {
+            iced_core::Renderer::with_translation(
+                renderer,
+                iced_core::Vector::new(bounds.x, bounds.y),
+                |renderer| {
+                    iced::widget::canvas::Renderer::draw(renderer, vec![geometry]);
 
-        // 3. Draw real decoded images on top of the geometry. The geometry layer
-        // is rasterized at effective_zoom() (capped for OOM protection), so
-        // the images must use the SAME scale or they misalign.
-        let img_zoom = self.effective_zoom();
-        for item in &self.list.items {
-            if let DisplayItem::Image {
-                x, y, w, h, url, ..
-            } = item
-            {
-                if let Some(handle) = self.images.get(url) {
-                    iced_core::image::Renderer::draw(
-                        renderer,
-                        handle.clone(),
-                        iced_core::image::FilterMethod::Linear,
-                        iced_core::Rectangle::new(
-                            iced_core::Point::new(x * img_zoom, y * img_zoom),
-                            iced_core::Size::new(w * img_zoom, h * img_zoom),
-                        ),
-                    );
-                }
-            }
-        }
+                    // 3. Draw real decoded images on top of the geometry. The
+                    // geometry layer is rasterized at effective_zoom() (capped
+                    // for OOM protection), so images use the same scale.
+                    let img_zoom = self.effective_zoom();
+                    for item in &self.list.items {
+                        if let DisplayItem::Image {
+                            x, y, w, h, url, ..
+                        } = item
+                        {
+                            if let Some(handle) = self.images.get(url) {
+                                iced_core::image::Renderer::draw(
+                                    renderer,
+                                    handle.clone(),
+                                    iced_core::image::FilterMethod::Linear,
+                                    iced_core::Rectangle::new(
+                                        iced_core::Point::new(x * img_zoom, y * img_zoom),
+                                        iced_core::Size::new(w * img_zoom, h * img_zoom),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                },
+            );
+        });
     }
 
     fn on_event(
@@ -5780,6 +6109,65 @@ mod widget_tests {
             String::new(),
         );
         assert!((widget.effective_zoom() - 2.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn safe_flow_layout_requires_a_strong_collision_signal() {
+        assert!(!requires_safe_flow_layout(7, 0.9));
+        assert!(!requires_safe_flow_layout(12, 0.01));
+        assert!(requires_safe_flow_layout(8, 0.02));
+        assert!(requires_safe_flow_layout(24, 0.0));
+    }
+
+    #[test]
+    fn address_bar_shortcuts_use_deterministic_replacement_mode() {
+        assert!(matches!(
+            handle_keyboard(
+                iced::keyboard::Key::Character("l".into()),
+                iced::keyboard::Modifiers::CTRL
+            ),
+            Some(Message::ReplaceUrl)
+        ));
+        assert!(matches!(
+            handle_keyboard(
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::F6),
+                iced::keyboard::Modifiers::empty()
+            ),
+            Some(Message::ReplaceUrl)
+        ));
+    }
+
+    #[test]
+    fn omnibox_recovers_absolute_urls_appended_by_a_captured_shortcut() {
+        assert_eq!(
+            normalize_omnibox_replacement(
+                "https://old.test/path",
+                "https://old.test/pathhttps://new.test/".to_string()
+            ),
+            "https://new.test/"
+        );
+        assert_eq!(
+            normalize_omnibox_replacement(
+                "file:///C:/old.html",
+                "file:///C:/old.htmlfile:///C:/new.html".to_string()
+            ),
+            "file:///C:/new.html"
+        );
+        assert_eq!(
+            normalize_omnibox_replacement(
+                "https://old.test/",
+                "https://old.test/?next=https://new.test/".to_string()
+            ),
+            "https://old.test/?next=https://new.test/"
+        );
+
+        let active_url = "https://old.test/";
+        let mut edited = active_url.to_string();
+        for character in "https://new.test/".chars() {
+            edited.push(character);
+            edited = normalize_omnibox_replacement(active_url, edited);
+        }
+        assert_eq!(edited, "https://new.test/");
     }
 
     #[test]
