@@ -112,11 +112,13 @@ fn descendant_and_child_combinators_match_against_ancestry() {
             tag: "nav".to_string(),
             classes: vec![],
             id: None,
+            attrs: Default::default(),
         },
         ElementAncestry {
             tag: "body".to_string(),
             classes: vec![],
             id: None,
+            attrs: Default::default(),
         },
     ];
     let link = compute_computed_style_with_ancestors(
@@ -157,6 +159,7 @@ fn descendant_and_child_combinators_match_against_ancestry() {
             tag: "ul".to_string(),
             classes: vec!["menu".to_string()],
             id: None,
+            attrs: Default::default(),
         }],
     );
     assert_eq!(direct.display.as_deref(), Some("list-item"));
@@ -174,6 +177,7 @@ fn descendant_and_child_combinators_match_against_ancestry() {
             tag: "div".to_string(),
             classes: vec![],
             id: Some("app".to_string()),
+            attrs: Default::default(),
         }],
     );
     assert_eq!(hot.color.as_deref(), Some("orange"));

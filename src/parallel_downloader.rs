@@ -30,7 +30,18 @@ impl ParallelDownloadTask {
         total_size: u64,
         num_connections: usize,
     ) -> Self {
-        let num_connections = num_connections.clamp(1, 16);
+        // Never slice a file into more chunks than it has bytes: with fewer
+        // bytes than connections, chunk_size would be zero and the
+        // inclusive end-byte arithmetic below would underflow.
+        let num_connections = {
+            let requested = num_connections.clamp(1, 16);
+            if total_size > 0 && (requested as u64) > total_size {
+                total_size as usize
+            } else {
+                requested
+            }
+        };
+        let num_connections = if total_size == 0 { 1 } else { num_connections };
         let chunk_size = if total_size > 0 {
             total_size / num_connections as u64
         } else {

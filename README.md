@@ -30,14 +30,12 @@ GhitaBrowser is not a full modern web-platform implementation. Its JavaScript
 engine supports a bounded language subset but not a complete DOM or Web APIs.
 Sites requiring unsupported SPA hydration, DRM, live video output, WebRTC,
 service workers or browser extensions may show a readable fallback instead of
-the interactive app. The bounded headless media/MSE profile and its exact
-release-UI limits are documented in `docs/media-conformance.md` and
-`docs/html-media-mse-conformance.md`.
+the interactive app. Media and MSE processing remain bounded, and direct
+YouTube playback is an explicit opt-in for the personal build.
 
 PiP, Web Capture, sidebar apps, quick notes, split-screen and password autofill
 are not advertised as 2.0 features because their experimental modules do not yet
-meet the release criteria. See [the exact 2.0 scope](docs/2.0.0-scope.md) and
-[security boundaries](SECURITY.md).
+meet the release criteria. See the [security boundaries](SECURITY.md).
 
 ## Build and test
 
@@ -58,6 +56,28 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 # Run the complete non-installing release gate
 powershell -ExecutionPolicy Bypass -File .\tools\release-gate.ps1
 ```
+
+The central runner keeps build jobs and metrics consistent across three tiers:
+
+```powershell
+.\tools\test.ps1 -Tier fast
+.\tools\test.ps1 -Tier release
+.\tools\test.ps1 -Tier full
+```
+
+On a freshly cleaned workspace, `target/debug` should remain below 8 GB. That
+budget is reported in `dist/build-metrics`; the runner never deletes existing
+artifacts automatically.
+
+For the focused personal-release check used by the primary Windows machine:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\personal-release-gate.ps1
+powershell -ExecutionPolicy Bypass -File .\tools\personal-release-gate.ps1 -Package
+```
+
+The broader `tools/release-gate.ps1` remains available for public-release
+quality checks, but it is not required for a personal build.
 
 Run performance benchmarks with:
 
@@ -101,14 +121,9 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ## Project documents
 
-- [Architecture](docs/architecture.md)
-- [Engine and media roadmap](docs/engine-media-roadmap.md)
-- [2.0 release scope](docs/2.0.0-scope.md)
-- [2.0 dependency and license audit](docs/dependency-audit.md)
+- [Personal release checklist](PERSONAL_RELEASE_CHECKLIST.md)
 - [Changelog](CHANGELOG.md)
 - [Security policy](SECURITY.md)
-- [Clean-room policy](docs/clean-room-policy.md)
-- [Specification provenance](docs/specification-provenance.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 - [Contributing](CONTRIBUTING.md)
 

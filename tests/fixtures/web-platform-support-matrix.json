@@ -1,0 +1,240 @@
+{
+  "track": 9,
+  "name": "Web Platform Support Matrix & Fail-Closed Conformance",
+  "conformance_version": "2.0.6",
+  "purpose": "Single source of truth for which web platform surfaces GhitaBrowser exposes to page scripts, and which are intentionally absent. Every unsupported entry must fail closed (throw TypeError on window.* access, resolve to undefined on navigator.*) instead of silently degrading. The companion test web_platform_conformance_test.rs drives these probes through the real product path (PageRuntime::evaluate).",
+  "features": [
+    {
+      "id": "WP-F01",
+      "name": "Fetch API",
+      "status": "implemented",
+      "probe": "typeof fetch === \"function\"",
+      "expect": "true",
+      "description": "fetch() is exposed on window with quota-bounded bodies"
+    },
+    {
+      "id": "WP-F02",
+      "name": "WebSocket",
+      "status": "implemented",
+      "probe": "typeof WebSocket === \"function\"",
+      "expect": "true",
+      "description": "WebSocket constructor bound through the realtime channel"
+    },
+    {
+      "id": "WP-F03",
+      "name": "Server-Sent Events",
+      "status": "implemented",
+      "probe": "typeof EventSource === \"function\"",
+      "expect": "true",
+      "description": "EventSource constructor"
+    },
+    {
+      "id": "WP-F04",
+      "name": "BroadcastChannel",
+      "status": "implemented",
+      "probe": "typeof BroadcastChannel === \"function\"",
+      "expect": "true",
+      "description": "Same-origin cross-tab messaging bus"
+    },
+    {
+      "id": "WP-F05",
+      "name": "Web Storage",
+      "status": "implemented",
+      "probe": "typeof localStorage.getItem === \"function\"",
+      "expect": "true",
+      "description": "localStorage with the 4 MB per-origin quota"
+    },
+    {
+      "id": "WP-F06",
+      "name": "IndexedDB",
+      "status": "implemented",
+      "probe": "typeof indexedDB.open === \"function\"",
+      "expect": "true",
+      "description": "indexedDB.open / deleteDatabase / databases"
+    },
+    {
+      "id": "WP-F07",
+      "name": "Cache Storage",
+      "status": "implemented",
+      "probe": "typeof caches.open === \"function\"",
+      "expect": "true",
+      "description": "caches.open / has / delete / keys / match"
+    },
+    {
+      "id": "WP-F08",
+      "name": "Service Workers",
+      "status": "implemented",
+      "probe": "typeof navigator.serviceWorker.register === \"function\"",
+      "expect": "true",
+      "description": "navigator.serviceWorker.register / getRegistration"
+    },
+    {
+      "id": "WP-F09",
+      "name": "Observers",
+      "status": "implemented",
+      "probe": "typeof MutationObserver === \"function\" && typeof ResizeObserver === \"function\" && typeof IntersectionObserver === \"function\"",
+      "expect": "true",
+      "description": "MutationObserver, ResizeObserver, IntersectionObserver"
+    },
+    {
+      "id": "WP-F10",
+      "name": "Streams",
+      "status": "implemented",
+      "probe": "typeof ReadableStream === \"function\"",
+      "expect": "true",
+      "description": "ReadableStream with backpressure and cancellation"
+    },
+    {
+      "id": "WP-F11",
+      "name": "Canvas 2D",
+      "status": "implemented",
+      "probe": "typeof document.createElement('canvas').getContext === \"function\"",
+      "expect": "true",
+      "description": "canvas.getContext('2d') with bounded command list"
+    },
+    {
+      "id": "WP-F12",
+      "name": "Media Source Extensions",
+      "status": "implemented",
+      "probe": "typeof MediaSource === \"function\"",
+      "expect": "true",
+      "description": "MediaSource is constructible; buffering is policy-gated"
+    },
+    {
+      "id": "WP-F13",
+      "name": "Web Crypto",
+      "status": "implemented",
+      "probe": "typeof crypto.getRandomValues === \"function\" && typeof crypto.subtle === \"object\"",
+      "expect": "true",
+      "description": "crypto.getRandomValues / randomUUID / subtle object"
+    },
+    {
+      "id": "WP-F14",
+      "name": "Timers & Animation Frames",
+      "status": "implemented",
+      "probe": "typeof setTimeout === \"function\" && typeof requestAnimationFrame === \"function\"",
+      "expect": "true",
+      "description": "Bounded timers (256 active, <= 60 s delay) and RAF pump"
+    },
+    {
+      "id": "WP-F15",
+      "name": "History & Navigation",
+      "status": "implemented",
+      "probe": "typeof history.pushState === \"function\"",
+      "expect": "true",
+      "description": "pushState / replaceState / back / forward"
+    },
+    {
+      "id": "WP-F16",
+      "name": "Custom Elements & Shadow DOM",
+      "status": "implemented",
+      "probe": "typeof customElements.define === \"function\" && typeof document.createElement('div').attachShadow === \"function\"",
+      "expect": "true",
+      "description": "CustomElementRegistry lifecycle and attachShadow"
+    },
+    {
+      "id": "WP-F17",
+      "name": "ECMAScript Core",
+      "status": "implemented",
+      "probe": "typeof Promise === \"object\" && typeof Proxy === \"function\" && typeof Symbol === \"object\" && typeof Intl === \"object\"",
+      "expect": "true",
+      "description": "Promises, Proxy, Symbol, Intl, typed arrays, modules, generators"
+    },
+    {
+      "id": "WP-U01",
+      "name": "WebAssembly",
+      "status": "unsupported_fail_closed",
+      "probe": "window.WebAssembly",
+      "expect": "throws",
+      "description": "No page-facing WebAssembly; the internal MVP parser/validator stays disabled for pages"
+    },
+    {
+      "id": "WP-U02",
+      "name": "WebTransport",
+      "status": "unsupported_fail_closed",
+      "probe": "window.WebTransport",
+      "expect": "throws",
+      "description": "QUIC WebTransport is not exposed to page scripts"
+    },
+    {
+      "id": "WP-U03",
+      "name": "WebRTC",
+      "status": "unsupported_fail_closed",
+      "probe": "window.RTCPeerConnection",
+      "expect": "throws",
+      "description": "RTCPeerConnection is not constructible from pages; policy layer exists server-side only"
+    },
+    {
+      "id": "WP-U04",
+      "name": "WebGPU",
+      "status": "unsupported_fail_closed",
+      "probe": "window.WebGPU",
+      "expect": "throws",
+      "description": "WebGPU is not exposed"
+    },
+    {
+      "id": "WP-U05",
+      "name": "Web USB / Serial / HID / Bluetooth",
+      "status": "unsupported_fail_closed",
+      "probe": "window.USB || window.serial || window.HID || window.Bluetooth",
+      "expect": "throws",
+      "description": "Hardware APIs fail closed: accessing any of them throws"
+    },
+    {
+      "id": "WP-U06",
+      "name": "Clipboard",
+      "status": "unsupported_fail_closed",
+      "probe": "window.clipboard",
+      "expect": "throws",
+      "description": "window.clipboard is not exposed (no silent clipboard access)"
+    },
+    {
+      "id": "WP-U07",
+      "name": "Notifications",
+      "status": "unsupported_fail_closed",
+      "probe": "window.Notification",
+      "expect": "throws",
+      "description": "Web Notifications are not exposed"
+    },
+    {
+      "id": "WP-U08",
+      "name": "WebAuthn",
+      "status": "unsupported_fail_closed",
+      "probe": "window.PublicKeyCredential",
+      "expect": "throws",
+      "description": "PublicKeyCredential is not exposed"
+    },
+    {
+      "id": "WP-U09",
+      "name": "Speech Synthesis",
+      "status": "unsupported_fail_closed",
+      "probe": "window.speechSynthesis",
+      "expect": "throws",
+      "description": "No speech synthesis surface"
+    },
+    {
+      "id": "WP-U10",
+      "name": "OffscreenCanvas",
+      "status": "unsupported_fail_closed",
+      "probe": "window.OffscreenCanvas",
+      "expect": "throws",
+      "description": "OffscreenCanvas is not exposed"
+    },
+    {
+      "id": "WP-U11",
+      "name": "SharedArrayBuffer / Atomics",
+      "status": "unsupported_fail_closed",
+      "probe": "window.SharedArrayBuffer || window.Atomics",
+      "expect": "throws",
+      "description": "Shared memory surfaces are absent; accessing either throws"
+    },
+    {
+      "id": "WP-U12",
+      "name": "Navigator Hardware Surfaces",
+      "status": "unsupported_fail_closed",
+      "probe": "navigator.bluetooth === undefined && navigator.usb === undefined && navigator.serial === undefined && navigator.share === undefined && navigator.getBattery === undefined",
+      "expect": "true",
+      "description": "navigator.* hardware/ambient surfaces resolve to undefined rather than leaking capability"
+    }
+  ]
+}

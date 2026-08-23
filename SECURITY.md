@@ -37,7 +37,8 @@ an operating-system credential vault is used.
 
 ## Dependency status
 
-The 2.0.0 locked dependency graph has no known RustSec vulnerability, but it
-does retain documented informational warnings in the transitive Iced 0.12
-graphics and font stack. See [the 2.0.0 dependency audit](docs/dependency-audit.md)
-for the exact advisories, exposure analysis and upgrade requirement.
+The 2.0.0 locked dependency graph had no known RustSec vulnerability at the time
+it was audited, but it retained informational warnings in the transitive Iced
+0.12 graphics and font stack. The public-release security audit remains
+available through the full release gate; it is optional for a personal build,
+and this statement does not claim a newer audit result.

@@ -307,8 +307,16 @@ pub fn global_pool() -> std::sync::Arc<std::sync::Mutex<StringPool>> {
 }
 
 /// Intern a string using the global pool.
+///
+/// A poisoned lock is recovered instead of panicking: interning only appends
+/// to the pool, so the map stays consistent even if an earlier caller
+/// panicked while holding the lock. Failing to recover would turn one
+/// unrelated panic into a browser-wide abort on the next parse.
 pub fn intern(s: &str) -> Arc<str> {
-    global_pool().lock().unwrap().intern(s)
+    global_pool()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .intern(s)
 }
 
 #[cfg(test)]

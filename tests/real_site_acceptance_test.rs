@@ -358,3 +358,20 @@ fn test_local_release_readiness_audit_evaluation() {
     assert!(manifest.fixtures.len() >= 10);
     verify_acceptance_manifest(&manifest, Path::new(".")).expect("manifest verification passes");
 }
+
+#[test]
+fn unsupported_runtime_keeps_readable_page_text() {
+    let html = ghitabrowser::ui::build_readable_fallback(
+        "https://app.test/?token=secret",
+        "App",
+        "unsupported hydration",
+        "Account overview and recent activity",
+    );
+    assert!(html.contains("Account overview"));
+    assert!(html.contains("unsupported hydration"));
+    assert!(html.contains("https://app.test/"));
+    assert!(
+        !html.contains("token=secret"),
+        "fallback must redact URL secrets"
+    );
+}

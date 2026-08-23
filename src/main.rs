@@ -6,6 +6,16 @@ fn main() {
     #[cfg(debug_assertions)]
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match ghitabrowser::compatibility_probe::try_run_cli(&args) {
+        Ok(Some(passed)) => std::process::exit(if passed { 0 } else { 2 }),
+        Err(error) => {
+            log::error!("Compatibility probe failed: {error}");
+            std::process::exit(2);
+        }
+        Ok(None) => {}
+    }
+
     let initial_target = std::env::args_os().nth(1).map(|argument| {
         let argument = argument.to_string_lossy().into_owned();
         if let Some(report_path) = argument.strip_prefix("--release-smoke-report=") {

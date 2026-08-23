@@ -321,22 +321,46 @@ fn build_youtube_shell_from_model(
     )
 }
 
-fn build_spa_fallback_html(title: &str, url: &str) -> String {
-    let safe_title = if title.is_empty() {
-        "JavaScript Required".to_string()
+/// Build a bounded, escaped fallback document for pages that require Web APIs
+/// outside GhitaBrowser's profile. Readable text extracted from the original
+/// response is retained instead of replacing the page with a blank shell.
+pub fn build_readable_fallback(url: &str, title: &str, reason: &str, text: &str) -> String {
+    fn escaped_bounded(input: &str, limit: usize) -> String {
+        html_escape(&input.chars().take(limit).collect::<String>())
+    }
+
+    let safe_title = if title.trim().is_empty() {
+        "Readable fallback".to_string()
     } else {
-        html_escape(title)
+        escaped_bounded(title, 256)
     };
-    let safe_url = html_escape(url);
+    let redacted_url = crate::compatibility_diagnostics::redact_sensitive_url(url);
+    let safe_url = escaped_bounded(&redacted_url, 2_048);
+    let safe_reason = escaped_bounded(reason, 512);
+    let safe_text = escaped_bounded(text, 32_768);
+    let extracted = if safe_text.trim().is_empty() {
+        "<p>No additional document text could be extracted.</p>".to_string()
+    } else {
+        format!("<h2>Readable content</h2><article><p>{safe_text}</p></article>")
+    };
     format!(
         "<html><head><title>{safe_title}</title></head>\
          <body><h1>This page requires unsupported web features</h1>\
-         <p>The application at <b>{safe_url}</b> requires JavaScript or Web APIs outside GhitaBrowser's bounded runtime profile.</p>\
+         <p>{safe_reason}</p>\
          <h2>What you can do:</h2><ul>\
          <li>Reload after checking the address and connection</li>\
          <li>Try a simpler/mobile page when the site provides one</li>\
          <li>Use Reader Mode for document-focused content</li></ul>\
-         <p><b>Address:</b> {safe_url}</p></body></html>"
+         <p><b>Address:</b> {safe_url}</p>{extracted}</body></html>"
+    )
+}
+
+fn build_spa_fallback_html(title: &str, url: &str, readable_text: &str) -> String {
+    build_readable_fallback(
+        url,
+        title,
+        "This application requires JavaScript or Web APIs outside GhitaBrowser's bounded runtime profile.",
+        readable_text,
     )
 }
 
@@ -413,6 +437,25 @@ fn humanize_error(err: &str) -> (String, String) {
                 err.split(':').next().unwrap_or(err)
             ),
         )
+    }
+}
+
+pub fn format_memory_relief_status(report: &crate::memory_tracker::MemoryReliefReport) -> String {
+    use crate::memory_tracker::{MemoryPressureLevel, MemoryTracker};
+
+    match report.level {
+        MemoryPressureLevel::Disabled | MemoryPressureLevel::Normal => String::new(),
+        MemoryPressureLevel::Moderate => format!(
+            "Memory Saver: slept {} tab(s), freed {}",
+            report.slept_tabs.len(),
+            MemoryTracker::format_bytes(report.before_bytes.saturating_sub(report.after_bytes)),
+        ),
+        MemoryPressureLevel::Critical => format!(
+            "Memory pressure: slept {} and discarded {} tab(s), freed {}",
+            report.slept_tabs.len(),
+            report.discarded_tabs.len(),
+            MemoryTracker::format_bytes(report.before_bytes.saturating_sub(report.after_bytes)),
+        ),
     }
 }
 
@@ -705,6 +748,9 @@ pub struct GhitaBrowserApp {
     // newer load was started for the same tab in the meantime.
     load_seq: u64,
     pending_loads: HashMap<usize, u64>,
+    /// Image batches use a separate channel so scheduling a batch on a tab
+    /// switch cannot invalidate an in-flight document load for that tab.
+    pending_image_batches: HashMap<usize, u64>,
     load_cancellations: HashMap<usize, crate::network_scheduler::CancellationToken>,
 
     #[cfg(target_os = "windows")]
@@ -738,6 +784,10 @@ pub enum Message {
     UrlChanged(String),
     Navigate,
     OpenUrl(String),
+    /// Link activated inside a rendered page. Local-file targets from web
+    /// content are blocked (only file:// pages and explicit user actions may
+    /// open local documents).
+    OpenUrlFromPage(String),
     GoBack,
     GoForward,
     Reload,
@@ -845,6 +895,8 @@ pub enum Message {
     SetPixelRendering(bool),
     SetMemorySaver(bool),
     SetMemoryPressure(bool),
+    /// Opt-in gate for direct YouTube live playback (default off).
+    SetYouTubeLivePlayback(bool),
 
     // DevTools
     ToggleDevTools,
@@ -939,6 +991,7 @@ impl Application for GhitaBrowserApp {
             search_state: HashMap::new(),
             load_seq: 0,
             pending_loads: HashMap::new(),
+            pending_image_batches: HashMap::new(),
             load_cancellations: HashMap::new(),
             #[cfg(target_os = "windows")]
             youtube_playback: None,
@@ -1015,13 +1068,39 @@ impl Application for GhitaBrowserApp {
             Message::OpenUrl(url) => {
                 return self.navigate(url);
             }
+            Message::OpenUrlFromPage(url) => {
+                // Web-initiated navigation to local documents is blocked
+                // unless the originating page is itself a local file (the
+                // same policy real browsers apply to file:// links).
+                if url.starts_with("file://") {
+                    let current_is_local = self
+                        .browser
+                        .tabs
+                        .active_tab()
+                        .map(|tab| tab.url.starts_with("file://"))
+                        .unwrap_or(false);
+                    if !current_is_local {
+                        self.status_msg =
+                            "Blocked: web pages cannot open local files".to_string();
+                        return Command::none();
+                    }
+                }
+                return self.navigate(url);
+            }
             Message::GoBack => {
                 self.browser.go_back();
+                // Leaving the watch page must stop the live player; the
+                // overlay is keyed by tab id alone, so without teardown the
+                // video (and audio) would keep playing over the older page.
+                #[cfg(target_os = "windows")]
+                self.teardown_youtube_playback_if_not_watching();
                 self.invalidate_active_tab_loads();
                 return self.after_tab_change("Navigated back");
             }
             Message::GoForward => {
                 self.browser.go_forward();
+                #[cfg(target_os = "windows")]
+                self.teardown_youtube_playback_if_not_watching();
                 self.invalidate_active_tab_loads();
                 return self.after_tab_change("Navigated forward");
             }
@@ -1486,20 +1565,13 @@ impl Application for GhitaBrowserApp {
                 }
             }
             Message::MemoryPressureTick => {
-                // Check settings at tick time
-                let settings = &self.browser.storage.settings;
-                if settings.memory_pressure_threshold_mb > 0 {
-                    let threshold = settings.memory_pressure_threshold_mb;
-                    // Keep at least 2 tabs alive (active + one spare)
-                    if let Some(discarded_id) = self.browser.check_memory_pressure(threshold, 2) {
-                        let tab_title = self
-                            .browser
-                            .tabs
-                            .get_tab(discarded_id)
-                            .map(|t| t.title.clone())
-                            .unwrap_or_default();
-                        self.status_msg = format!("X Tab discarded (memory): {}", tab_title);
-                    }
+                let soft = self.browser.storage.settings.memory_soft_limit_mb;
+                let hard = self.browser.storage.settings.memory_pressure_threshold_mb;
+                let budget = crate::memory_tracker::MemoryBudget::from_mb(soft, hard);
+                let report = self.browser.relieve_memory_pressure(budget, 2);
+                let status = format_memory_relief_status(&report);
+                if !status.is_empty() {
+                    self.status_msg = status;
                 }
             }
             Message::ImagesLoaded {
@@ -1894,6 +1966,16 @@ impl Application for GhitaBrowserApp {
                     "Memory pressure protection disabled".to_string()
                 };
             }
+            Message::SetYouTubeLivePlayback(on) => {
+                self.browser.storage.settings.youtube_live_playback_enabled = on;
+                self.status_msg = if on {
+                    "YouTube live playback enabled — videos play through the bounded Rust adapter"
+                        .to_string()
+                } else {
+                    "YouTube live playback disabled — videos open in the navigation shell"
+                        .to_string()
+                };
+            }
             Message::HomepageChanged(home) => {
                 self.homepage_input = home.clone();
                 if !home.trim().is_empty() {
@@ -2022,6 +2104,7 @@ impl Application for GhitaBrowserApp {
                 config.enabled = on;
                 self.browser.adblocker = crate::adblock::AdBlocker::new(config);
                 self.browser.storage.settings.adblock_enabled = on;
+                self.browser.storage.save();
                 self.status_msg = if on {
                     "AdBlock & Tracker Blocker enabled".to_string()
                 } else {
@@ -2034,9 +2117,11 @@ impl Application for GhitaBrowserApp {
                     .active_tab()
                     .and_then(|tab| crate::ui_helpers::host(&tab.url));
                 if let Some(domain) = domain {
-                    let enabled = self.browser.adblocker.toggle_domain(domain.clone());
+                    let enabled = !self.browser.adblocker.is_domain_enabled(&domain);
+                    let _ = self.browser.adblocker.set_domain_enabled(&domain, enabled);
                     self.browser.storage.settings.adblock_disabled_domains =
                         self.browser.adblocker.config().disabled_domains.clone();
+                    self.browser.storage.save();
                     self.status_msg = if enabled {
                         format!("Request blocker enabled for {domain}; reload to apply")
                     } else {
@@ -2419,8 +2504,19 @@ impl Application for GhitaBrowserApp {
                         .unwrap_or((0, 0.0));
                     let broken_author_layout =
                         requires_safe_flow_layout(overlapping_pairs, collision_score);
+                    // When the page's own scripts actually ran and mutated the
+                    // DOM, the runtime evidence outweighs the HTML-marker
+                    // heuristic: the page rendered, so it must not be replaced
+                    // by the generic "JavaScript Required" shell. Conversely,
+                    // scripts that were seen but never ran on a sparse page
+                    // are exactly the unrendered-app case the fallback exists
+                    // for.
+                    let runtime_rendered_content =
+                        runtime.scripts_executed > 0 && runtime.dom_mutations > 0;
                     let is_spa = !is_pdf
-                        && is_spa_or_js_rendered(&html)
+                        && !runtime_rendered_content
+                        && (is_spa_or_js_rendered(&html)
+                            || (runtime.scripts_seen > 0 && runtime.scripts_executed == 0))
                         && (display_list.items.len() < 10
                             || visible_metrics.has_major_blank_region
                             || (stalled_runtime && visibly_sparse));
@@ -2428,6 +2524,9 @@ impl Application for GhitaBrowserApp {
                         !is_spa && display_list.items.len() < 3 && html.len() > 50000;
 
                     if is_spa {
+                        let readable_text =
+                            crate::reader_mode::ReaderModeExtractor::extract(&html, &url, &title)
+                                .text_content;
                         // Parse YouTube's bounded server bootstrap into the
                         // browser-owned shell before using the static fallback.
                         let page_html = if is_youtube_route {
@@ -2440,7 +2539,7 @@ impl Application for GhitaBrowserApp {
                                     format!("YouTube video {} (live player unavailable)", video_id);
                                 build_video_info_html(&video_id, &url)
                             } else {
-                                build_spa_fallback_html(&title, &url)
+                                build_spa_fallback_html(&title, &url, &readable_text)
                             }
                         } else {
                             // Generic SPA fallback
@@ -2448,7 +2547,7 @@ impl Application for GhitaBrowserApp {
                                 "JavaScript application at {} could not complete its initial render",
                                 url
                             );
-                            build_spa_fallback_html(&title, &url)
+                            build_spa_fallback_html(&title, &url, &readable_text)
                         };
                         let spa_dom = parse_html(&page_html);
                         let spa_layout = crate::layout::create_layout_tree(
@@ -2931,13 +3030,15 @@ impl GhitaBrowserApp {
                 }
                 crate::youtube::YouTubeRoute::Watch { video_id }
                 | crate::youtube::YouTubeRoute::Shorts { video_id }
-                | crate::youtube::YouTubeRoute::Embed { video_id } => {
-                    return self.start_youtube_playback(video_id);
-                }
-                crate::youtube::YouTubeRoute::Playlist {
+                | crate::youtube::YouTubeRoute::Embed { video_id }
+                | crate::youtube::YouTubeRoute::Playlist {
                     video_id: Some(video_id),
                     ..
-                } => {
+                } if self.browser.storage.settings.youtube_live_playback_enabled => {
+                    // Live playback is opt-in (Settings → Media). With the
+                    // gate off, the navigation falls through to a normal
+                    // fetch so the page renders through the bounded YouTube
+                    // shell instead of calling YouTube's internal endpoints.
                     return self.start_youtube_playback(video_id);
                 }
                 _ => {}
@@ -2967,6 +3068,7 @@ impl GhitaBrowserApp {
             self.load_seq = self.load_seq.wrapping_add(1);
             let seq = self.load_seq;
             self.pending_loads.insert(tab_id, seq);
+            self.pending_image_batches.remove(&tab_id);
         }
     }
 
@@ -2990,6 +3092,7 @@ impl GhitaBrowserApp {
         self.load_seq = self.load_seq.wrapping_add(1);
         let seq = self.load_seq;
         self.pending_loads.insert(tab_id, seq);
+        self.pending_image_batches.remove(&tab_id);
         if let Some(previous) = self.load_cancellations.remove(&tab_id) {
             previous.cancel();
         }
@@ -3064,6 +3167,7 @@ impl GhitaBrowserApp {
         self.load_seq = self.load_seq.wrapping_add(1);
         let seq = self.load_seq;
         self.pending_loads.insert(tab_id, seq);
+        self.pending_image_batches.remove(&tab_id);
         if let Some(previous) = self.load_cancellations.remove(&tab_id) {
             previous.cancel();
         }
@@ -3126,6 +3230,34 @@ impl GhitaBrowserApp {
         }
     }
 
+    /// Stop live playback when the owning tab is no longer showing a watch
+    /// route (Back/Forward/internal pages). Without this the player overlay
+    /// hijacked the content area and audio kept playing over unrelated pages.
+    #[cfg(target_os = "windows")]
+    fn teardown_youtube_playback_if_not_watching(&mut self) {
+        let Some(playback) = self.youtube_playback.as_ref() else {
+            return;
+        };
+        let still_watching = self
+            .browser
+            .tabs
+            .get_tab(playback.tab_id)
+            .map(|tab| {
+                crate::youtube::YouTubeRoute::parse(&tab.url).is_ok_and(|route| {
+                    matches!(
+                        route,
+                        crate::youtube::YouTubeRoute::Watch { .. }
+                            | crate::youtube::YouTubeRoute::Shorts { .. }
+                            | crate::youtube::YouTubeRoute::Embed { .. }
+                    )
+                })
+            })
+            .unwrap_or(false);
+        if !still_watching {
+            self.teardown_youtube_playback();
+        }
+    }
+
     /// Kick off an async web search for a ghita://search page — UI stays responsive
     fn start_search(&mut self, page_url: &str) -> Command<Message> {
         let query = search_query_from_url(page_url).unwrap_or_default();
@@ -3137,6 +3269,7 @@ impl GhitaBrowserApp {
         self.load_seq = self.load_seq.wrapping_add(1);
         let seq = self.load_seq;
         self.pending_loads.insert(tab_id, seq);
+        self.pending_image_batches.remove(&tab_id);
         if let Some(previous) = self.load_cancellations.remove(&tab_id) {
             previous.cancel();
         }
@@ -3197,6 +3330,9 @@ impl GhitaBrowserApp {
         // An internal navigation supersedes any fetch still in flight for this
         // tab, so its response can no longer overwrite this page.
         if !new_tab {
+            // Leaving the watch page must stop the live player (see GoBack).
+            #[cfg(target_os = "windows")]
+            self.teardown_youtube_playback_if_not_watching();
             self.invalidate_active_tab_loads();
         }
 
@@ -3307,7 +3443,7 @@ impl GhitaBrowserApp {
         let tab_id = self.browser.tabs.active_tab_id().unwrap_or(0);
         self.load_seq = self.load_seq.wrapping_add(1);
         let seq = self.load_seq;
-        self.pending_loads.insert(tab_id, seq);
+        self.pending_image_batches.insert(tab_id, seq);
 
         Command::perform(
             async move {
@@ -3747,10 +3883,15 @@ impl GhitaBrowserApp {
     }
 
     fn build_task_manager_panel(&self, pal: &'static Pal) -> Element<'_, Message> {
+        let memory = self.browser.estimate_memory();
+        let soft = self.browser.storage.settings.memory_soft_limit_mb;
+        let hard = self.browser.storage.settings.memory_pressure_threshold_mb;
         let mut tasks = column![row![
             text(format!(
-                "Task Manager — {:.1} MB estimated",
-                self.task_manager.total_memory_mb()
+                "Task Manager — {:.1} MB estimated (images {:.1}, resources {:.1}; budget {soft}/{hard} MB)",
+                crate::memory_tracker::MemoryTracker::bytes_to_mb(memory.total_bytes),
+                crate::memory_tracker::MemoryTracker::bytes_to_mb(memory.image_cache_bytes),
+                crate::memory_tracker::MemoryTracker::bytes_to_mb(memory.resource_cache_bytes),
             ))
             .size(14)
             .style(iced::theme::Text::from(pal.text)),
@@ -4921,7 +5062,7 @@ impl<'a> iced_core::Widget<Message, Theme, iced::Renderer> for WebPageWidget<'a>
                 let y = pos.y / effective;
                 if let Some(href) = self.list.link_at(x, y) {
                     let resolved = resolve_href(&self.base_url, href);
-                    shell.publish(Message::OpenUrl(resolved));
+                    shell.publish(Message::OpenUrlFromPage(resolved));
                     return iced_core::event::Status::Captured;
                 }
             }
@@ -5526,6 +5667,7 @@ impl GhitaBrowserApp {
         let bar_on = self.show_bookmarks_bar;
         let memory_saver_on = settings.tab_memory_saver;
         let memory_pressure_on = settings.memory_pressure_threshold_mb > 0;
+        let youtube_live_on = settings.youtube_live_playback_enabled;
 
         let page = column![
             text("Settings")
@@ -5665,6 +5807,27 @@ impl GhitaBrowserApp {
             text("Pixel mode paints pages on a real graphics canvas with clickable links")
                 .size(11)
                 .style(iced::theme::Text::from(pal.text_dim)),
+            section("Media"),
+            row![
+                text("YouTube live playback")
+                    .size(13)
+                    .style(iced::theme::Text::from(pal.text))
+                    .width(Length::Fixed(180.0)),
+                choice_btn("On", youtube_live_on, Message::SetYouTubeLivePlayback(true)),
+                choice_btn(
+                    "Off",
+                    !youtube_live_on,
+                    Message::SetYouTubeLivePlayback(false)
+                ),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+            text(
+                "Plays videos through the built-in adapter. Off by default; \
+                 disabled, YouTube pages show the navigation shell instead.",
+            )
+            .size(11)
+            .style(iced::theme::Text::from(pal.text_dim)),
             section("Privacy and security"),
             row![
                 button(text("Clear browsing data").size(12))

@@ -13,13 +13,6 @@ const BYTES_PER_DOM_NODE: usize = 210;
 /// Layout nodes carry a full Element clone plus computed style, so they're heavier.
 const BYTES_PER_LAYOUT_NODE: usize = 320;
 
-/// Average bytes overhead per history entry (url + title strings + Element clone + Option<LayoutNode>).
-const BYTES_PER_HISTORY_ENTRY: usize = 512;
-
-/// Estimated bytes per cached resource entry (URL string + FetchResult with body + headers).
-/// The body dominates; this is a baseline overhead on top of body size.
-const BYTES_PER_CACHE_OVERHEAD: usize = 256;
-
 /// Memory estimate for a single tab, broken down by subsystem.
 #[derive(Debug, Clone, Default)]
 pub struct TabMemoryEstimate {
@@ -29,6 +22,10 @@ pub struct TabMemoryEstimate {
     pub layout_bytes: usize,
     /// History stack memory (bytes)
     pub history_bytes: usize,
+    /// Compressed DOM snapshots retained by navigation history.
+    pub history_snapshot_bytes: usize,
+    /// Snapshot retained while this tab is sleeping.
+    pub sleep_snapshot_bytes: usize,
     /// Persistent JavaScript runtime / realm memory (bytes)
     pub runtime_bytes: usize,
     /// Total estimated memory for this tab (bytes)
@@ -46,6 +43,60 @@ pub struct BrowserMemoryEstimate {
     pub resource_cache_bytes: usize,
     /// Total estimated memory across all subsystems (bytes)
     pub total_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    pub soft_limit_bytes: usize,
+    pub hard_limit_bytes: usize,
+}
+
+impl MemoryBudget {
+    pub fn from_mb(soft_limit_mb: u32, hard_limit_mb: u32) -> Self {
+        const MB: usize = 1024 * 1024;
+        Self::from_bytes(
+            (soft_limit_mb as usize).saturating_mul(MB),
+            (hard_limit_mb as usize).saturating_mul(MB),
+        )
+    }
+
+    pub fn from_bytes(soft_limit_bytes: usize, hard_limit_bytes: usize) -> Self {
+        Self {
+            soft_limit_bytes: soft_limit_bytes.min(hard_limit_bytes),
+            hard_limit_bytes,
+        }
+    }
+
+    pub fn level_for(self, bytes: usize) -> MemoryPressureLevel {
+        if self.hard_limit_bytes == 0 {
+            MemoryPressureLevel::Disabled
+        } else if bytes >= self.hard_limit_bytes {
+            MemoryPressureLevel::Critical
+        } else if bytes >= self.soft_limit_bytes {
+            MemoryPressureLevel::Moderate
+        } else {
+            MemoryPressureLevel::Normal
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryPressureLevel {
+    Disabled,
+    #[default]
+    Normal,
+    Moderate,
+    Critical,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryReliefReport {
+    pub level: MemoryPressureLevel,
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+    pub cache_bytes_freed: usize,
+    pub slept_tabs: Vec<usize>,
+    pub discarded_tabs: Vec<usize>,
 }
 
 /// Tracks and estimates memory usage across the browser.
@@ -70,25 +121,20 @@ impl MemoryTracker {
     /// Estimate memory used by a single DOM tree.
     pub fn estimate_dom(dom: &Element) -> usize {
         let node_count = count_dom_nodes(dom);
-        node_count * BYTES_PER_DOM_NODE
+        node_count.saturating_mul(BYTES_PER_DOM_NODE)
     }
 
     /// Estimate memory used by a layout tree.
     pub fn estimate_layout(layout: &LayoutNode) -> usize {
         let node_count = count_layout_nodes(layout);
-        node_count * BYTES_PER_LAYOUT_NODE
+        node_count.saturating_mul(BYTES_PER_LAYOUT_NODE)
     }
 
     /// Estimate memory used by a tab's history stack.
-    /// Each entry holds a URL, title, full DOM clone, and optional layout clone.
-    /// We can't cheaply walk every DOM in history, so we use the entry count
-    /// multiplied by an average that includes a typical small page DOM.
+    /// History entries already own bounded compressed snapshots, so account
+    /// their actual retained capacities instead of assuming a typical page.
     pub(crate) fn estimate_history(tab: &Tab) -> usize {
-        let entry_count = tab.history_len();
-        // Each history entry clones the DOM at navigation time. We estimate
-        // an average page DOM at ~50 nodes (small-to-medium pages dominate).
-        let avg_dom_per_entry = 50 * BYTES_PER_DOM_NODE;
-        entry_count * (BYTES_PER_HISTORY_ENTRY + avg_dom_per_entry)
+        tab.history_retained_bytes()
     }
 
     /// Estimate total memory for a single tab.
@@ -99,14 +145,20 @@ impl MemoryTracker {
         // Sleeping tabs drop the live DOM but keep its serialized snapshot —
         // that retained memory must be counted, or the estimator reports a
         // sleeping 100 MB tab as ~200 bytes.
-        let snapshot_bytes = tab.compressed_snapshot_bytes();
+        let sleep_snapshot_bytes = tab.compressed_snapshot_bytes();
         let runtime_bytes = tab.runtime_heap_bytes();
-        let total_bytes = dom_bytes + layout_bytes + history_bytes + snapshot_bytes + runtime_bytes;
+        let total_bytes = dom_bytes
+            .saturating_add(layout_bytes)
+            .saturating_add(history_bytes)
+            .saturating_add(sleep_snapshot_bytes)
+            .saturating_add(runtime_bytes);
 
         TabMemoryEstimate {
             dom_bytes,
             layout_bytes,
             history_bytes,
+            history_snapshot_bytes: history_bytes,
+            sleep_snapshot_bytes,
             runtime_bytes,
             total_bytes,
         }
@@ -118,11 +170,9 @@ impl MemoryTracker {
     }
 
     /// Estimate memory used by the resource cache.
-    /// Sums body sizes of all cached entries plus per-entry overhead.
+    /// Uses the cache's complete owned-byte accounting.
     pub fn estimate_resource_cache(cache: &crate::network::ResourceCache) -> usize {
-        let body_bytes: usize = cache.total_bytes();
-        let overhead = cache.len() * BYTES_PER_CACHE_OVERHEAD;
-        body_bytes + overhead
+        cache.total_bytes()
     }
 
     /// Estimate total browser memory across all tabs and caches.
@@ -134,10 +184,14 @@ impl MemoryTracker {
         let tab_estimates: Vec<TabMemoryEstimate> =
             tabs.iter().map(|t| Self::estimate_tab(t)).collect();
 
-        let tabs_total: usize = tab_estimates.iter().map(|e| e.total_bytes).sum();
+        let tabs_total = tab_estimates.iter().fold(0usize, |total, estimate| {
+            total.saturating_add(estimate.total_bytes)
+        });
         let image_cache_bytes = Self::estimate_image_cache(image_cache);
         let resource_cache_bytes = Self::estimate_resource_cache(resource_cache);
-        let total_bytes = tabs_total + image_cache_bytes + resource_cache_bytes;
+        let total_bytes = tabs_total
+            .saturating_add(image_cache_bytes)
+            .saturating_add(resource_cache_bytes);
 
         BrowserMemoryEstimate {
             tabs: tab_estimates,
@@ -331,7 +385,42 @@ mod tests {
         assert_eq!(tab.history_len(), 2);
 
         let estimate = MemoryTracker::estimate_tab(&tab);
-        // History should account for 2 entries
-        assert!(estimate.history_bytes >= 2 * BYTES_PER_HISTORY_ENTRY);
+        assert_eq!(estimate.history_bytes, tab.history_retained_bytes());
+        assert!(estimate.history_bytes > 0);
+    }
+
+    #[test]
+    fn history_estimate_uses_retained_snapshot_bytes() {
+        let small = crate::tab::HistoryEntry::new(
+            "https://example.test/small".to_string(),
+            "Small".to_string(),
+            &crate::parser::parse_html("<p>x</p>"),
+        );
+        let large = crate::tab::HistoryEntry::new(
+            "https://example.test/large".to_string(),
+            "Large".to_string(),
+            &crate::parser::parse_html(&format!(
+                "<main>{}</main>",
+                "meaningful text ".repeat(20_000)
+            )),
+        );
+        assert!(large.retained_bytes() > small.retained_bytes());
+    }
+
+    #[test]
+    fn memory_budget_levels_are_deterministic() {
+        let budget = MemoryBudget::from_mb(400, 500);
+        assert_eq!(
+            budget.level_for(399 * 1024 * 1024),
+            MemoryPressureLevel::Normal
+        );
+        assert_eq!(
+            budget.level_for(400 * 1024 * 1024),
+            MemoryPressureLevel::Moderate
+        );
+        assert_eq!(
+            budget.level_for(500 * 1024 * 1024),
+            MemoryPressureLevel::Critical
+        );
     }
 }

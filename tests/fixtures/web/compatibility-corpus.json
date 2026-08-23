@@ -1,0 +1,98 @@
+[
+  {
+    "id": "wikipedia-article",
+    "category": "article",
+    "base_url": "https://wikipedia.test/wiki/Rust",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<article><h1>Rust programming language</h1><p>Rust is a systems programming language focused on safety, speed, and concurrency. It gives developers control over memory without requiring a garbage collector.</p><p>Ownership and borrowing prevent common data races while expressive types document intent.</p><p>The language is used for command line tools, network services, embedded software, and browser components.</p></article>"
+  },
+  {
+    "id": "documentation",
+    "category": "docs",
+    "base_url": "https://docs.test/api",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<nav>API Reference Guide Examples</nav><main><h1>Client fetch API</h1><pre>fn fetch(url: &amp;str) -&gt; Result&lt;Response&gt;</pre><p>The client validates the URL and returns a bounded response with status, headers, and body.</p><h2>Error handling</h2><p>Callers receive an explicit timeout, invalid request, or transport error and can retry only safe operations.</p><p>Examples use deterministic local fixtures so documentation remains useful while offline.</p></main>"
+  },
+  {
+    "id": "news",
+    "category": "news",
+    "base_url": "https://news.test/story",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<header>Daily News Sections Search</header><main><h1>Independent project publishes a maintenance release</h1><p>The update focuses on navigation reliability, readable fallback pages, and lower resource use for personal computers.</p><p>Developers measured startup, multiple tabs, local files, and session restore before preparing the package.</p><p>The maintainer said unsupported interactive features should degrade to readable content instead of a blank screen.</p></main>"
+  },
+  {
+    "id": "blog",
+    "category": "blog",
+    "base_url": "https://blog.test/post",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<article><h1>Build notes for a small personal browser</h1><p>A personal browser can stay responsive by bounding network responses, runtime work, decoded media, and caches.</p><p>Measurements guide each optimization: a fast test loop catches local mistakes, while a release tier checks high-risk integration paths.</p><p>Memory pressure first evicts stale cache entries, then sleeps inactive tabs, and only discards eligible tabs as a last resort.</p></article>"
+  },
+  {
+    "id": "forum",
+    "category": "forum",
+    "base_url": "https://forum.test/thread/1",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<main><h1>Discussion: reliable release checks</h1><section><b>Alice</b><p>Start with a deterministic fixture and record the expected readable text, layout boxes, and timeout.</p></section><section><b>Bob</b><p>Add a live smoke pass separately so temporary network failures do not make unit tests flaky.</p></section><section><b>Chau</b><p>Compare protection enabled and disabled to detect false positives before changing filter rules.</p></section></main>"
+  },
+  {
+    "id": "search",
+    "category": "search",
+    "base_url": "https://search.test/?q=rust",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<main><h1>Search results for Rust</h1><ol><li><a href='/1'>Rust language documentation</a><p>Official reference for ownership, borrowing, packages, testing, and tooling.</p></li><li><a href='/2'>The Rust programming language book</a><p>A learning guide with practical examples and explanations.</p></li><li><a href='/3'>Rust package registry</a><p>Discover reusable libraries, versions, licenses, and dependency metadata.</p></li></ol><p>About three useful results were found.</p></main>"
+  },
+  {
+    "id": "product",
+    "category": "commerce",
+    "base_url": "https://shop.test/product/1",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<main><h1>Compact mechanical keyboard</h1><p>A durable wired keyboard with replaceable switches, a detachable cable, and a two-year personal warranty.</p><strong>Price: 49 dollars</strong><p>Available in quiet and tactile variants. The package contains the keyboard, cable, key puller, and printed guide.</p><p>Delivery estimates and return conditions remain visible before the customer chooses to add the item to the cart.</p><button>Add to cart</button></main>"
+  },
+  {
+    "id": "dashboard",
+    "category": "dashboard",
+    "base_url": "https://dashboard.test/",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<main><h1>Service overview dashboard</h1><div class='grid'><section><h2>Requests</h2><p>Forty two successful requests during the selected hour.</p></section><section><h2>Errors</h2><p>Zero application errors and no failed background jobs.</p></section><section><h2>Latency</h2><p>Median response time is twelve milliseconds.</p></section></div><p>Last updated from the deterministic local dataset. Use the range control to compare previous periods.</p></main>"
+  },
+  {
+    "id": "form-table",
+    "category": "forms",
+    "base_url": "https://forms.test/",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<main><h1>Deployment form and status table</h1><form><label>Deployment name<input name='name'></label><label>Environment<select><option>Test</option><option>Production</option></select></label><button>Save deployment</button></form><table><tr><th>Status</th><th>Count</th><th>Description</th></tr><tr><td>Ready</td><td>4</td><td>Validated packages waiting for approval.</td></tr><tr><td>Running</td><td>2</td><td>Jobs currently processing local fixtures.</td></tr></table><p>All required fields show a readable label and validation guidance.</p></main>"
+  },
+  {
+    "id": "web-components",
+    "category": "spa",
+    "base_url": "https://spa.test/",
+    "min_text_bytes": 256,
+    "allow_fallback": true,
+    "html": "<main><h1>Personal task application</h1><p>The initial document contains meaningful navigation and recovery instructions before hydration.</p><x-task-list><p>Loading the task list. Existing tasks remain available in the readable fallback if scripting is unsupported.</p></x-task-list><script>document.querySelector('x-task-list').textContent='One task is ready. Review the compatibility report, run the focused tests, inspect the package version, and keep all worktree changes for the owner.';</script><p>Use the local form to create, complete, or archive a task without contacting an external service.</p></main>"
+  },
+  {
+    "id": "multilingual",
+    "category": "i18n",
+    "base_url": "https://i18n.test/",
+    "min_text_bytes": 256,
+    "allow_fallback": false,
+    "html": "<main><h1>Xin chào — Multilingual sample</h1><p>Tiếng Việt hiển thị rõ ràng với dấu, khoảng cách và xuống dòng đúng.</p><p dir='rtl'>مرحبا بالعالم. هذا نص تجريبي للتحقق من اتجاه الكتابة وعرض المحتوى بشكل مقروء.</p><p>你好，世界。这段内容用于检查字体回退、标点和可读布局。</p><p>English fallback text explains that every language block should remain selectable and meaningful when a preferred font is unavailable.</p></main>"
+  },
+  {
+    "id": "youtube-shell",
+    "category": "media-shell",
+    "base_url": "https://www.youtube.com/results?search_query=rust",
+    "min_text_bytes": 256,
+    "allow_fallback": true,
+    "html": "<main><h1>YouTube search results</h1><p>Interactive playback is optional for this personal release. Search results, titles, descriptions, and navigation links must remain readable when the live player adapter is disabled.</p><article><a href='/watch?v=one'>Rust ownership explained</a><p>A practical introduction to borrowing, lifetimes, and safe concurrency.</p></article><article><a href='/watch?v=two'>Build a small command line tool</a><p>A step-by-step project using packages, tests, and error handling.</p></article><p>Enable live playback manually only when the bounded media route is needed.</p></main>"
+  }
+]

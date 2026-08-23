@@ -12,6 +12,31 @@ Semantic Versioning.
 - Vietnamese IME input normalization and improved Omnibox text editing resilience.
 - Layout Box Model accuracy improvements in `layout.rs`: enhanced Flexbox gap/wrap calculations, margin collapsing, multi-line typography wrapping.
 - Resilient YouTube playback fallback in `youtube.rs` with multi-client profile discovery and adaptive format selection.
+- A conservative request-filtering policy blocks only recognized third-party
+  advertising or tracking subresources while preserving documents, local and
+  same-site resources, styles, fonts, media and explicit allow rules.
+- A representative compatibility corpus, readable fallback and bounded live-site
+  probe make the personal release gate require at least 90% usable outcomes with
+  no timeouts.
+- RAM pressure now uses measured history, response-cache and image-cache bytes,
+  with 400 MB/500 MB soft and hard budgets and protected active, pinned, audible,
+  internal and error tabs.
+
+### Hardened (release-blocking fixes)
+- Inline text boxes are now sized with real glyph advances from the cosmic-text shaping engine (`text_shaper::measure_text_width`), falling back to the heuristic estimator only when the shaping budget rejects a request (`layout.rs`).
+- Response finalization (content-type / PDF routing / charset decoding) is unified between the blocking `ureq` path and the async `reqwest` scheduler path through one shared policy (`network::finalize_fetch_response`), with a transport-conformance test proving both paths cannot drift.
+- Poisoned-mutex panics are recovered instead of aborting the browser: `messaging::BroadcastChannelBus` and `string_pool` now heal poisoned `Mutex`/`RwLock` state and continue.
+- Debug-mode `MAX_CALL_DEPTH` raised from 4 to 8 so JS engine recursion is usable during development while release stays at 32.
+- YouTube playback is gated behind an explicit opt-in setting and the SPA/render decision now consults the runtime report (`is_spa_or_js_rendered`) instead of relying on heuristics alone.
+- Direct YouTube playback is opt-in and disabled by default for the personal
+  release; the normal navigation shell remains the safe fallback.
+- CI and local release runners use one Cargo build job with incremental debug
+  artifacts disabled, preventing the artifact race and excessive disk use;
+  release artifacts are versioned from `Cargo.toml` (`v2.0.6`).
+- Personal packaging rejects staged executables whose ProductVersion does not
+  match 2.0.6, preventing a stale 2.0.5 binary from being labeled 2.0.6.
+- The flaky per-frame timing assertion in the dynamic-rendering acceptance test now measures p95 and an absolute cap instead of asserting every single frame.
+- Added `tests/fixtures/web-platform-support-matrix.json` + `tests/web_platform_conformance_test.rs`: a documented support matrix whose unsupported surfaces are enforced to fail closed (TypeError on `window.*`, `undefined` on `navigator.*`).
 
 ## [2.0.0] - 2026-08-09
 

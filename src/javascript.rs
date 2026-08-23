@@ -105,11 +105,15 @@ const MAX_STRING_BUDGET: usize = 32 * 1024 * 1024;
 /// Deep or circular recursion (`function f() { return f() }`) errors out here
 /// instead of overflowing the stack (a stack overflow in Rust aborts the whole
 /// process). Debug builds are the constraint: unoptimized interpreter frames
-/// are large (~several KB per JS call level, spread over eval_expr →
-/// call_function → body → block eval), and `cargo test` runs on ~2 MB test
-/// threads, so the debug cap is much lower than the release cap.
+/// are large (measured ~240 KB per JS call level in the worst case, spread
+/// over eval_expr → call_function → body → block eval), and `cargo test` runs
+/// on ~2 MB test threads. 8 levels (2× the historical 4) stays comfortably
+/// inside 2 MB while letting ordinary recursive page scripts run in dev; CI
+/// raises the test-thread stack via `RUST_MIN_STACK` for extra headroom. A
+/// stack overflow would abort the whole process, so the cap is deliberately
+/// conservative.
 #[cfg(debug_assertions)]
-const MAX_CALL_DEPTH: u64 = 4;
+const MAX_CALL_DEPTH: u64 = 8;
 #[cfg(not(debug_assertions))]
 const MAX_CALL_DEPTH: u64 = 32;
 
@@ -1120,6 +1124,19 @@ impl PartialEq for JsvValue {
                     && left_body == right_body
                     && left_env.same_record(right_env)
             }
+            (
+                Self::Function(left_name, left_params, left_body, left_env),
+                Self::Function(right_name, right_params, right_body, right_env),
+            )
+            | (
+                Self::AsyncFunction(left_name, left_params, left_body, left_env),
+                Self::AsyncFunction(right_name, right_params, right_body, right_env),
+            ) => {
+                left_name == right_name
+                    && left_params == right_params
+                    && left_body == right_body
+                    && left_env.same_record(right_env)
+            }
             (Self::NativeFn(left), Self::NativeFn(right)) => left == right,
             (Self::BoundNativeFn(left_name, left), Self::BoundNativeFn(right_name, right)) => {
                 left_name == right_name && left == right
@@ -1195,7 +1212,7 @@ impl JsvValue {
         match self {
             JsvValue::Null | JsvValue::Undefined => false,
             JsvValue::Boolean(b) => *b,
-            JsvValue::Number(n) => *n != 0.0,
+            JsvValue::Number(n) => *n != 0.0 && !n.is_nan(),
             JsvValue::String(s) => !s.is_empty(),
             _ => true,
         }
@@ -1891,7 +1908,7 @@ impl JsvEngine {
             JsvValue::Number(std::f64::consts::FRAC_1_SQRT_2),
         );
         math_obj.insert("MAX_VALUE".to_string(), JsvValue::Number(f64::MAX));
-        math_obj.insert("MIN_VALUE".to_string(), JsvValue::Number(f64::MIN));
+        math_obj.insert("MIN_VALUE".to_string(), JsvValue::Number(f64::from_bits(1)));
         for name in [
             "abs", "ceil", "floor", "round", "sqrt", "random", "max", "min", "pow", "exp", "expm1",
             "log", "log2", "log10", "log1p", "sign", "trunc", "cbrt", "hypot", "sin", "cos", "tan",
@@ -2240,7 +2257,11 @@ impl JsvEngine {
             .define("performance", JsvValue::HostObject(HOST_PERFORMANCE));
         self.global_env
             .define("CSS", JsvValue::HostObject(HOST_CSS));
-        for name in ["requestAnimationFrame", "cancelAnimationFrame", "matchMedia"] {
+        for name in [
+            "requestAnimationFrame",
+            "cancelAnimationFrame",
+            "matchMedia",
+        ] {
             self.global_env
                 .define(name, JsvValue::HostFunction(HOST_WINDOW, name.to_string()));
         }
@@ -3742,19 +3763,11 @@ fn apply_binary_op(
             OpKind::Sub => Ok(JsvValue::Number(ln - rn)),
             OpKind::Mul => Ok(JsvValue::Number(ln * rn)),
             OpKind::Div => {
-                if rn == 0.0 {
-                    Err("Division by zero".to_string())
-                } else {
-                    Ok(JsvValue::Number(ln / rn))
-                }
+                // ECMAScript division follows IEEE 754: x/0 is ±Infinity
+                // and 0/0 is NaN rather than a script error.
+                Ok(JsvValue::Number(ln / rn))
             }
-            OpKind::Mod => {
-                if rn == 0.0 {
-                    Err("Modulo by zero".to_string())
-                } else {
-                    Ok(JsvValue::Number(ln % rn))
-                }
-            }
+            OpKind::Mod => Ok(JsvValue::Number(ln % rn)),
             OpKind::Eq => Ok(JsvValue::Boolean(ln == rn)),
             OpKind::Neq => Ok(JsvValue::Boolean(ln != rn)),
             OpKind::Lt => Ok(JsvValue::Boolean(ln < rn)),
@@ -3835,6 +3848,13 @@ fn js_strict_equal(left: &JsvValue, right: &JsvValue) -> bool {
             l_object == r_object && l_name == r_name
         }
         (JsvValue::NativeFn(l), JsvValue::NativeFn(r)) => l == r,
+        // Function values have no Rc identity, so compare declaration
+        // identity (name/params/body/captured environment record).
+        (JsvValue::Function(..), JsvValue::Function(..))
+        | (JsvValue::AsyncFunction(..), JsvValue::AsyncFunction(..))
+        | (JsvValue::GeneratorFn(..), JsvValue::GeneratorFn(..)) => {
+            left.function_identity_eq(right)
+        }
         (JsvValue::BoundNativeFn(l_name, l), JsvValue::BoundNativeFn(r_name, r)) => {
             l_name == r_name && l == r
         }
@@ -4108,7 +4128,7 @@ fn bind_pattern_impl(
                 index += 1;
             }
             if let Some(rest_pattern) = rest {
-                let rest_values = items[index..].to_vec();
+                let rest_values = items[index.min(items.len())..].to_vec();
                 bind_pattern_impl(
                     rest_pattern,
                     &JsvValue::Array(Rc::new(RefCell::new(rest_values))),
@@ -5977,30 +5997,34 @@ fn generator_next(
     console: &mut Vec<String>,
     ctx: &mut EvalCtx<'_>,
 ) -> Result<(bool, JsvValue), String> {
-    let mut state = generator.borrow_mut();
-    if state.done {
-        return Ok((true, JsvValue::Undefined));
-    }
-    if !state.started {
-        state.started = true;
-        let name = state.name.clone();
-        let params = state.params.clone();
-        let body = state.body.clone();
-        let captured = state.captured.clone();
-        let mut fn_env = JsvEnvironment::with_parent(captured.clone());
-        if !name.is_empty() {
-            fn_env.define(
-                &name,
-                JsvValue::GeneratorFn(name.clone(), params.clone(), body.clone(), captured),
-            );
+    // The setup guard must drop before the resume loop below re-borrows the
+    // generator, otherwise the second borrow_mut() panics.
+    {
+        let mut state = generator.borrow_mut();
+        if state.done {
+            return Ok((true, JsvValue::Undefined));
         }
-        state.resume = Some(GeneratorResume {
-            stmts: vec![*body],
-            index: 0,
-            env: fn_env,
-            conts: Vec::new(),
-            result: JsvValue::Undefined,
-        });
+        if !state.started {
+            state.started = true;
+            let name = state.name.clone();
+            let params = state.params.clone();
+            let body = state.body.clone();
+            let captured = state.captured.clone();
+            let mut fn_env = JsvEnvironment::with_parent(captured.clone());
+            if !name.is_empty() {
+                fn_env.define(
+                    &name,
+                    JsvValue::GeneratorFn(name.clone(), params.clone(), body.clone(), captured),
+                );
+            }
+            state.resume = Some(GeneratorResume {
+                stmts: vec![*body],
+                index: 0,
+                env: fn_env,
+                conts: Vec::new(),
+                result: JsvValue::Undefined,
+            });
+        }
     }
     // Resume: pop continuation frames, feeding each result into the next.
     let mut value = argument;
@@ -6160,10 +6184,19 @@ fn while_loop_step(
         }
         ctx.call_depth += 1;
         if ctx.call_depth > MAX_CALL_DEPTH {
+            ctx.call_depth -= 1;
             return Err("Maximum call depth exceeded in while loop".to_string());
         }
         let mut iteration_env = JsvEnvironment::with_parent(e.clone());
-        let body_result = eval_statement_list(body, &mut iteration_env, console, ctx)?;
+        // Decrement on every exit path: an error propagated out of the body
+        // (e.g. a caught property access) must not leak depth permanently.
+        let body_result = match eval_statement_list(body, &mut iteration_env, console, ctx) {
+            Ok(value) => value,
+            Err(error) => {
+                ctx.call_depth -= 1;
+                return Err(error);
+            }
+        };
         ctx.call_depth -= 1;
         match body_result {
             JsvValue::BreakSignal => return Ok(result),
@@ -7512,9 +7545,11 @@ fn call_string_method(
         }
         "includes" => {
             let needle = string_arg(0)?;
-            let start = number_arg(1).unwrap_or(0.0).max(0.0) as usize;
+            let start = (number_arg(1).unwrap_or(0.0).max(0.0) as usize).min(count);
             let found = if needle.is_empty() {
-                start <= count
+                // An empty needle is always "found" once position is clamped
+                // to the string length (matches String.prototype.includes).
+                true
             } else {
                 (start..count).any(|index| {
                     let candidate: String =
@@ -7526,7 +7561,7 @@ fn call_string_method(
         }
         "startsWith" => {
             let needle = string_arg(0)?;
-            let start = number_arg(1).unwrap_or(0.0).max(0.0) as usize;
+            let start = (number_arg(1).unwrap_or(0.0).max(0.0) as usize).min(count);
             let candidate: String = chars[start..].iter().collect();
             Ok(JsvValue::Boolean(candidate.starts_with(&needle)))
         }
@@ -7604,10 +7639,18 @@ fn call_string_method(
         "split" => {
             let separator = args.first().map(|value| value.to_display_string());
             let values = match separator.as_deref() {
-                None | Some("") => chars
-                    .iter()
-                    .map(|character| JsvValue::String(character.to_string()))
-                    .collect::<Vec<_>>(),
+                // "abc".split() with no separator yields the whole string;
+                // only an explicit empty separator splits per character.
+                None => vec![JsvValue::String(text.clone())],
+                Some("") => {
+                    if chars.len() > 100_000 {
+                        return Err("Split result budget exceeded".to_string());
+                    }
+                    chars
+                        .iter()
+                        .map(|character| JsvValue::String(character.to_string()))
+                        .collect::<Vec<_>>()
+                }
                 Some(separator) => {
                     let separator_chars: Vec<char> = separator.chars().collect();
                     let mut parts = Vec::new();
@@ -7644,7 +7687,7 @@ fn call_string_method(
             if text.len().saturating_mul(times) > MAX_STRING_LENGTH {
                 return Err("String too large".to_string());
             }
-            let repeated = text.repeat(times.min(1_000_000));
+            let repeated = text.repeat(times);
             check_string_alloc(ctx, repeated.len())?;
             Ok(JsvValue::String(repeated))
         }
@@ -7663,13 +7706,14 @@ fn call_string_method(
             if target <= current || pad.is_empty() {
                 return bounded(text);
             }
+            if target > MAX_STRING_LENGTH {
+                return Err("String too large".to_string());
+            }
             let pad_chars: Vec<char> = pad.chars().collect();
             let needed = target - current;
-            let mut padding = String::new();
-            let mut index = 0;
-            while padding.chars().count() < needed {
+            let mut padding = String::with_capacity(needed * 4);
+            for index in 0..needed {
                 padding.push(pad_chars[index % pad_chars.len()]);
-                index += 1;
             }
             if method == "padStart" {
                 bounded(format!("{}{}", padding, text))
@@ -8482,7 +8526,9 @@ fn call_native_fn(
                 let mut map = std::collections::HashMap::new();
                 map.insert("status".to_string(), JsvValue::String(status.to_string()));
                 map.insert(key.to_string(), val);
-                output.push(JsvValue::Object(Rc::new(RefCell::new(JsvObject::plain(map)))));
+                output.push(JsvValue::Object(Rc::new(RefCell::new(JsvObject::plain(
+                    map,
+                )))));
             }
             Ok(promise_value(JsvPromiseState::Fulfilled(JsvValue::Array(
                 Rc::new(RefCell::new(output)),
@@ -8527,7 +8573,8 @@ fn call_native_fn(
         }
         "Math.round" => {
             let n = first_number(&args);
-            Ok(JsvValue::Number(n.round()))
+            // JS rounds halves toward +Infinity: Math.round(-2.5) === -2.
+            Ok(JsvValue::Number((n + 0.5).floor()))
         }
         "Math.sqrt" => {
             let n = first_number(&args);
@@ -8961,6 +9008,11 @@ fn json_escape(text: &str, output: &mut String) {
             '\t' => output.push_str("\\t"),
             '\u{0008}' => output.push_str("\\b"),
             '\u{000C}' => output.push_str("\\f"),
+            // Remaining C0 controls must be escaped for valid JSON
+            // (RFC 8259 forbids raw control characters in strings).
+            other if (other as u32) < 0x20 => {
+                output.push_str(&format!("\\u{:04x}", other as u32));
+            }
             other => output.push(other),
         }
     }
@@ -9151,8 +9203,30 @@ fn json_parse_string(chars: &[char], pos: &mut usize) -> Result<String, String> 
                         let hex: String = chars[*pos..*pos + 4].iter().collect();
                         let code = u32::from_str_radix(&hex, 16)
                             .map_err(|_| "JSON parse error: invalid unicode escape".to_string())?;
-                        output.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
                         *pos += 4;
+                        // A high surrogate followed by a low surrogate forms
+                        // one astral scalar value (emoji etc.); lone halves
+                        // decode to U+FFFD.
+                        let decoded = if (0xD800..=0xDBFF).contains(&code)
+                            && chars.get(*pos) == Some(&'\\')
+                            && chars.get(*pos + 1) == Some(&'u')
+                            && *pos + 6 <= chars.len()
+                        {
+                            let low_hex: String = chars[*pos + 2..*pos + 6].iter().collect();
+                            match u32::from_str_radix(&low_hex, 16) {
+                                Ok(low) if (0xDC00..=0xDFFF).contains(&low) => {
+                                    *pos += 6;
+                                    char::from_u32(
+                                        0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00),
+                                    )
+                                    .unwrap_or('\u{FFFD}')
+                                }
+                                _ => '\u{FFFD}',
+                            }
+                        } else {
+                            char::from_u32(code).unwrap_or('\u{FFFD}')
+                        };
+                        output.push(decoded);
                     }
                     _ => return Err("JSON parse error: invalid escape".to_string()),
                 }
@@ -9195,11 +9269,13 @@ fn parse_date(s: &str) -> Option<f64> {
     None
 }
 
-/// Small deterministic non-cryptographic RNG for Math.random().
+/// Non-cryptographic RNG for Math.random(), seeded once per thread from
+/// entropy sources available in std (wall-clock nanos, ASLR address layout
+/// and the per-process RandomState keys) so sequences differ across runs.
 pub fn random_f64() -> f64 {
     use std::cell::Cell;
     thread_local! {
-        static STATE: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
+        static STATE: Cell<u64> = Cell::new(seed_rng_state());
     }
     STATE.with(|s| {
         let mut x = s.get();
@@ -9207,9 +9283,35 @@ pub fn random_f64() -> f64 {
         x ^= x >> 12;
         x ^= x << 25;
         x ^= x >> 27;
+        if x == 0 {
+            x = 0x9E37_79B9_7F4A_7C15;
+        }
         s.set(x);
         (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
     })
+}
+
+fn seed_rng_state() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // Fold in address-space layout and per-process hash keys so two
+    // processes starting within the same nanosecond still diverge.
+    let stack_addr = &seed as *const u64 as u64;
+    use std::hash::{BuildHasher, Hasher};
+    let hash_key = std::collections::hash_map::RandomState::new();
+    let mixed = {
+        let mut hasher = hash_key.build_hasher();
+        hasher.write_u64(stack_addr);
+        hasher.finish()
+    };
+    seed ^= mixed.rotate_left(32) ^ stack_addr.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if seed == 0 {
+        seed = 0x9E37_79B9_7F4A_7C15;
+    }
+    seed
 }
 
 pub fn random_u8() -> u8 {
@@ -10657,8 +10759,14 @@ mod tests {
     #[test]
     fn test_division_by_zero() {
         let mut engine = JsvEngine::new();
-        let result = engine.eval("1 / 0");
-        assert!(result.is_err());
+        // ECMAScript: division by zero yields IEEE results, not errors.
+        assert_eq!(engine.eval("1 / 0").unwrap().as_number(), Some(f64::INFINITY));
+        assert_eq!(
+            engine.eval("-1 / 0").unwrap().as_number(),
+            Some(f64::NEG_INFINITY)
+        );
+        assert!(engine.eval("0 / 0").unwrap().as_number().unwrap().is_nan());
+        assert!(engine.eval("5 % 0").unwrap().as_number().unwrap().is_nan());
     }
 
     #[test]

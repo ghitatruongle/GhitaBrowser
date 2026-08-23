@@ -490,12 +490,5 @@ fn absolute_path(path: &Path) -> Result<PathBuf, AppError> {
 }
 
 fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| AppError::StorageError(error.to_string()))?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).map_err(storage_error)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(storage_error)?;
-    }
-    fs::rename(temporary, path).map_err(storage_error)
+    crate::fs_atomic::atomic_write_json(path, value).map_err(storage_error)
 }

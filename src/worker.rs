@@ -28,6 +28,17 @@ const COMPRESSION_THRESHOLD: usize = 64 * 1024;
 #[cfg(windows)]
 const WORKER_PROCESS_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 
+/// Kill-and-reap the child on drop so no early-return path leaks a live
+/// worker process. Killing an already-exited child is a harmless no-op.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 struct WorkerContainment {
@@ -412,11 +423,15 @@ fn exchange_with_program(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| WorkerError::Io(error.to_string()))?;
+    // Kill-on-drop: every early return below (? on stdin/stdout/stderr takes,
+    // encode or write failures) previously leaked a live child process.
+    let mut guard = ChildGuard(child);
+    let child = &mut guard.0;
     #[cfg(windows)]
-    let _containment = match WorkerContainment::attach(&child) {
+    let _containment = match WorkerContainment::attach(child) {
         Ok(containment) => containment,
         Err(error) => {
             let _ = child.kill();
@@ -435,8 +450,31 @@ fn exchange_with_program(
         .take()
         .ok_or_else(|| WorkerError::Io("worker stdin is unavailable".to_string()))?;
     let wire_request = encode_wire_payload(encoded, MAX_WORKER_REQUEST_BYTES)?;
-    write_frame(&mut stdin, &wire_request)?;
-    drop(stdin);
+    // The framed request can be tens of megabytes; a worker that stops
+    // reading would otherwise block this write forever. Run it on a thread
+    // and enforce the deadline here — killing the child breaks the pipe and
+    // releases the writer.
+    let writer = std::thread::spawn(move || write_frame(&mut stdin, &wire_request));
+    let write_start = Instant::now();
+    let write_result = loop {
+        if writer.is_finished() {
+            break writer
+                .join()
+                .map_err(|_| WorkerError::Protocol("worker stdin writer panicked".to_string()))?;
+        }
+        if cancellation.is_cancelled() || write_start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.join();
+            return Err(if cancellation.is_cancelled() {
+                WorkerError::Cancelled
+            } else {
+                WorkerError::Timeout
+            });
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    write_result?;
     if cancellation.is_cancelled() {
         let _ = child.kill();
         let _ = child.wait();

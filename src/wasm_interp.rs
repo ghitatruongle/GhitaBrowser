@@ -308,10 +308,10 @@ impl WasmInstance {
                 let result_count = control.result_count.min(above.len());
                 let keep = above[above.len() - result_count..].to_vec();
                 frame.stack.extend(keep);
-                if control.kind == ControlKind::Loop {
-                    // Loop end: branch back to the loop head.
-                    frame.pc = control.else_pc;
-                }
+                // Reaching a loop's `end` by fall-through EXITS the loop per
+                // spec; branching back to the head is exclusively what `br`
+                // to a loop label does. The old re-entry here turned every
+                // naturally-exiting loop into an infinite one.
                 continue;
             }
             let action = self.exec_instruction(opcode, &code, frames)?;
@@ -330,7 +330,15 @@ impl WasmInstance {
                     } else {
                         control.end_pc
                     };
+                    // A branch keeps the target's result arity on the stack
+                    // (spec §control); truncating everything above
+                    // stack_height destroyed block result values.
+                    let keep_count = control
+                        .result_count
+                        .min(frame.stack.len().saturating_sub(control.stack_height));
+                    let keep: Vec<_> = frame.stack[frame.stack.len() - keep_count..].to_vec();
                     frame.stack.truncate(control.stack_height);
+                    frame.stack.extend(keep);
                     // Remove controls above the target; the target itself is
                     // left for the end handler to close (or returned for the
                     // function-level branch).
@@ -1710,5 +1718,80 @@ mod tests {
             .invoke(0, &[WasmValue::I32(1_000_000)])
             .unwrap_err();
         assert!(error.contains("out of range"), "got: {error}");
+    }
+}
+
+#[cfg(test)]
+mod spec_regression_tests {
+    use super::*;
+    use crate::wasm::parse_module;
+
+    fn code_section(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut section = vec![0x0A];
+        let mut content = Vec::new();
+        content.push(bodies.len() as u8);
+        for body in bodies {
+            // Body sizes here are far below 128, so a one-byte LEB suffices.
+            content.push(body.len() as u8);
+            content.extend_from_slice(body);
+        }
+        let count_len = 1;
+        section.push((content.len()) as u8);
+        section.extend(content);
+        let _ = count_len;
+        section
+    }
+
+    fn body_no_locals(instructions: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00];
+        body.extend_from_slice(instructions);
+        body.push(0x0B);
+        body
+    }
+
+    fn build_fn_module(name: &[u8], body_instructions: &[u8]) -> WasmModule {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        // type: () -> i32
+        bytes.extend([0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F]);
+        bytes.extend([0x03, 0x02, 0x01, 0x00]);
+        // export
+        let export_size = 1 + 1 + name.len() + 2;
+        bytes.push(0x07);
+        bytes.push(export_size as u8);
+        bytes.push(0x01);
+        bytes.push(name.len() as u8);
+        bytes.extend_from_slice(name);
+        bytes.extend([0x00, 0x00]);
+        let body = body_no_locals(body_instructions);
+        bytes.extend(code_section(&[body]));
+        parse_module(&bytes).expect("module must parse")
+    }
+
+    #[test]
+    fn loop_fall_through_exits_instead_of_spinning() {
+        // (func (result i32) (loop (then i32.const 42)) ...): a loop whose
+        // body falls through its `end` must EXIT; the old handler branched
+        // back to the head and spun until the step budget.
+        let module = build_fn_module(
+            b"loopexit",
+            &[0x03, 0x40, 0x0B, 0x41, 0x2A], // loop .. end; i32.const 42
+        );
+        let mut instance = WasmInstance::instantiate(module).unwrap();
+        let results = instance.invoke(0, &[]).unwrap();
+        assert_eq!(results, vec![WasmValue::I32(42)]);
+    }
+
+    #[test]
+    fn branch_keeps_block_result_values() {
+        // (block (result i32) (i32.const 7) (br 0)): the branch must keep the
+        // block's one result value; truncating it made the invoke fail its
+        // result-count check.
+        let module = build_fn_module(
+            b"brval",
+            &[0x02, 0x7F, 0x41, 0x07, 0x0C, 0x00, 0x0B], // block i32 .. br 0 .. end
+        );
+        let mut instance = WasmInstance::instantiate(module).unwrap();
+        let results = instance.invoke(0, &[]).unwrap();
+        assert_eq!(results, vec![WasmValue::I32(7)]);
     }
 }

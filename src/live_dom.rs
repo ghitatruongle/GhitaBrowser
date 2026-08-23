@@ -1727,8 +1727,10 @@ fn attr_color(element: &Element, name: &str) -> Option<crate::paint::Rgba> {
 fn parse_css_color(value: &str) -> Option<crate::paint::Rgba> {
     let value = value.trim();
     if let Some(hex) = value.strip_prefix('#') {
-        let parse = |s: &str| u8::from_str_radix(s, 16).ok();
-        if hex.len() == 6 {
+        // Only slice after validating every byte is ASCII hex: length alone
+        // does not guard char boundaries for multi-byte input.
+        if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let parse = |s: &str| u8::from_str_radix(s, 16).ok();
             let (r, g, b) = (&hex[0..2], &hex[2..4], &hex[4..6]);
             return Some(crate::paint::Rgba {
                 r: parse(r)? as f32 / 255.0,
@@ -1737,7 +1739,8 @@ fn parse_css_color(value: &str) -> Option<crate::paint::Rgba> {
                 a: 1.0,
             });
         }
-        if hex.len() == 3 {
+        if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let parse = |s: &str| u8::from_str_radix(s, 16).ok();
             let (r, g, b) = (&hex[0..1], &hex[1..2], &hex[2..3]);
             return Some(crate::paint::Rgba {
                 r: parse(r)? as f32 / 15.0,

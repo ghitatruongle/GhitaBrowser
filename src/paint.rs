@@ -565,11 +565,8 @@ pub fn paint_stacking_context(
         let content_x = (node.rect.x + node.rect.padding_left + node.rect.border_left) as f32;
         let content_y = (node.rect.y + node.rect.padding_top + node.rect.border_top) as f32;
         let inner_width = node.rect.content_width();
-        let line_h = node
-            .computed_style
-            .line_height
-            .map(|lh| (lh * font_size) as f32)
-            .unwrap_or((font_size * 1.4) as f32);
+        let line_h =
+            crate::css_parser::line_height_px(node.computed_style.line_height, font_size) as f32;
 
         let display_text = if node.rect.display == DisplayType::ListItem {
             format!("•  {}", transformed_text)

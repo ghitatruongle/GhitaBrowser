@@ -653,10 +653,22 @@ impl FetchRuntime {
         if initial_cross_origin && request.mode == RequestMode::SameOrigin {
             return Err(FetchError::SameOriginViolation);
         }
-        if request.mode == RequestMode::NoCors && !is_simple_method(&request.method) {
-            return Err(FetchError::Cors(
-                "no-cors mode only permits safelisted methods".to_string(),
-            ));
+        if request.mode == RequestMode::NoCors {
+            if !is_simple_method(&request.method) {
+                return Err(FetchError::Cors(
+                    "no-cors mode only permits safelisted methods".to_string(),
+                ));
+            }
+            // no-cors also restricts headers to the CORS-safelisted set;
+            // without this, scripts could attach arbitrary headers to
+            // cross-origin simple requests.
+            let offenders = non_safelisted_header_names(&request.headers);
+            if !offenders.is_empty() {
+                return Err(FetchError::Cors(format!(
+                    "no-cors mode does not permit header(s): {}",
+                    offenders.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
         }
 
         let mut current = request.url.inner.clone();
@@ -826,13 +838,19 @@ impl FetchRuntime {
                 &non_simple.into_iter().collect::<Vec<_>>().join(", "),
             )?;
         }
+        // A credentialed request's preflight inherits its credentials mode,
+        // so servers that authorize preflights by session cookie behave as
+        // they do in mainstream browsers.
+        let preflight_cookie = (request.credentials == CredentialsMode::Include)
+            .then(|| self.cookie_header(url.as_str()))
+            .filter(|value| !value.is_empty());
         let exchange = self.send_http(
             "OPTIONS",
             url,
             HttpRequestOptions {
                 headers: &headers,
                 body: &[],
-                cookie: None,
+                cookie: preflight_cookie.as_deref(),
                 origin: None,
                 browser_generated_headers: true,
             },

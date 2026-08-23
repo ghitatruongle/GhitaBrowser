@@ -29,9 +29,14 @@ fn render_element(element: &Element, indent: usize) -> String {
             } else {
                 output.push_str(&format!("{}🔗 [link]", space));
             }
+            // Mixed content (links inside the anchor) must not be dropped.
+            for child in &element.children {
+                output.push_str(&render_element(child, indent + 1));
+            }
         }
         "p" => {
             output.push_str(&format!("{}✎ {}", space, element.text));
+            render_children_into(&mut output, element, indent);
         }
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = element
@@ -41,6 +46,7 @@ fn render_element(element: &Element, indent: usize) -> String {
                 .unwrap_or(1);
             let marker = "#".repeat((level as usize).min(6));
             output.push_str(&format!("{}{} {}", space, marker, element.text));
+            render_children_into(&mut output, element, indent);
         }
         _ => {
             if !element.children.is_empty() {
@@ -58,6 +64,12 @@ fn render_element(element: &Element, indent: usize) -> String {
     }
 
     output
+}
+
+fn render_children_into(output: &mut String, element: &Element, indent: usize) {
+    for child in &element.children {
+        output.push_str(&render_element(child, indent + 1));
+    }
 }
 
 pub fn count_images(element: &Element) -> usize {

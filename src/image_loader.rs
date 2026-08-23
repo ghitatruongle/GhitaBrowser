@@ -88,7 +88,7 @@ pub struct ImageCache {
     decoded: HashMap<String, Arc<ImageData>>,
     /// Tracks last access time for LRU eviction.
     last_access: HashMap<String, Instant>,
-    /// Maximum cache size in bytes (default 50 MB).
+    /// Maximum cache size in bytes (default 24 MB).
     max_cache_size: usize,
     /// Maximum number of decoded images to cache (prevents memory exhaustion).
     max_decoded_images: usize,
@@ -112,9 +112,9 @@ impl ImageCache {
     /// otherwise grow this map without bound.
     const MAX_METADATA_ENTRIES: usize = 1000;
 
-    /// Create a new image cache with the default 30 MB limit.
+    /// Create a new image cache with the default 24 MB limit.
     pub fn new() -> Self {
-        Self::with_capacity(30 * 1024 * 1024)
+        Self::with_capacity(24 * 1024 * 1024)
     }
 
     /// Create a new image cache with a custom capacity in bytes.
@@ -518,6 +518,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_image_cache_budget_is_24_mb() {
+        assert_eq!(ImageCache::new().capacity(), 24 * 1024 * 1024);
+    }
+
+    #[test]
     fn test_image_creation() {
         let img = Image::new("https://example.com/img.png", 100, 200);
         assert_eq!(img.url, "https://example.com/img.png");
@@ -575,7 +580,7 @@ mod tests {
     #[test]
     fn test_cache_capacity_default() {
         let cache = ImageCache::new();
-        assert_eq!(cache.capacity(), 30 * 1024 * 1024); // 30 MB
+        assert_eq!(cache.capacity(), 24 * 1024 * 1024); // 24 MB
     }
 
     #[test]

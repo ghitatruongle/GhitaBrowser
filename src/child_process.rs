@@ -8,6 +8,13 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// How long a native round-trip may take before the child is declared
+/// wedged and killed. Without this a hung child froze the browser forever
+/// inside an unbounded blocking read.
+const NATIVE_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
@@ -30,7 +37,9 @@ pub struct ChildProcess {
 struct NativeChildProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Reply lines pushed by the dedicated reader thread so the caller can
+    /// wait with a deadline instead of blocking forever.
+    replies: mpsc::Receiver<String>,
 }
 
 #[derive(Default)]
@@ -80,7 +89,11 @@ impl ChildProcessManager {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
+            // CREATE_NO_WINDOW | CREATE_SUSPENDED: the child starts paused so
+            // it can be placed inside its job object before executing a single
+            // instruction — anything it spawned pre-assignment would escape
+            // the job's limits and kill-on-close.
+            command.creation_flags(0x0800_0000 | 0x0000_0004);
         }
         let mut child = command
             .spawn()
@@ -97,6 +110,13 @@ impl ChildProcessManager {
             self.processes.remove(&pid);
             return Err(error);
         }
+        #[cfg(windows)]
+        if let Err(error) = resume_child_main_thread(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.processes.remove(&pid);
+            return Err(error);
+        }
         let stdin = child
             .stdin
             .take()
@@ -105,14 +125,8 @@ impl ChildProcessManager {
             .stdout
             .take()
             .ok_or_else(|| "Browser child stdout is unavailable".to_string())?;
-        self.native_processes.insert(
-            pid,
-            NativeChildProcess {
-                child,
-                stdin,
-                stdout: BufReader::new(stdout),
-            },
-        );
+        let replies = spawn_reply_reader(stdout);
+        self.native_processes.insert(pid, NativeChildProcess { child, stdin, replies });
         self.processes
             .get_mut(&pid)
             .expect("logical child exists")
@@ -149,11 +163,23 @@ impl ChildProcessManager {
             .and_then(|_| native.stdin.write_all(b"\n"))
             .and_then(|_| native.stdin.flush())
             .map_err(|error| format!("Cannot write child IPC: {error}"))?;
-        let mut line = String::new();
-        native
-            .stdout
-            .read_line(&mut line)
-            .map_err(|error| format!("Cannot read child IPC: {error}"))?;
+        // The reader thread owns stdout, so a hung child surfaces here as a
+        // timeout instead of an infinite block on the calling (UI) thread.
+        let line = match native.replies.recv_timeout(NATIVE_REPLY_TIMEOUT) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let child = self.processes.get_mut(&pid);
+                if let Some(child) = child {
+                    child.state = ProcessState::Unresponsive;
+                }
+                self.kill_native_process(pid);
+                return Err("native IPC reply timed out; child was killed".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.kill_native_process(pid);
+                return Err("child IPC stream closed before reply".to_string());
+            }
+        };
         if line.len() > crate::ipc::MAX_IPC_MESSAGE_BYTES {
             return Err("IPC response exceeds its byte budget".to_string());
         }
@@ -290,6 +316,80 @@ impl ChildProcessManager {
         } else {
             false
         }
+    }
+}
+
+/// Background reader that turns child stdout lines into channel messages.
+/// The line length is bounded so a hostile child cannot balloon memory even
+/// though reading happens off the caller's thread.
+fn spawn_reply_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("native-child-ipc-reader".into())
+        .spawn(move || {
+            use std::io::Read;
+            let reader = BufReader::new(stdout);
+            let mut inner = reader.take((crate::ipc::MAX_IPC_MESSAGE_BYTES + 1) as u64);
+            loop {
+                let mut line = String::new();
+                match inner.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if sender.send(line).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .expect("spawn native IPC reader thread");
+    receiver
+}
+
+#[cfg(windows)]
+fn resume_child_main_thread(child: &Child) -> Result<(), String> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{
+        OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+    };
+
+    let os_pid = child.id();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+            .map_err(|error| format!("cannot snapshot threads: {error}"))?;
+        let resume_result = (|| {
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+            if Thread32First(snapshot, &mut entry).is_err() {
+                return Err("cannot enumerate child threads".to_string());
+            }
+            let mut resumed = false;
+            loop {
+                if entry.th32OwnerProcessID == os_pid {
+                    if let Ok(thread) =
+                        OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
+                    {
+                        // Any non-negative return means the thread is running.
+                        let _ = ResumeThread(thread);
+                        resumed = true;
+                    }
+                }
+                if Thread32Next(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+            if resumed {
+                Ok(())
+            } else {
+                Err("child main thread was not found to resume".to_string())
+            }
+        })();
+        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+        resume_result
     }
 }
 

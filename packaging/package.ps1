@@ -1,3 +1,5 @@
+param([switch]$SkipBuild)
+
 # Build reproducible GhitaBrowser Windows release artifacts.
 $ErrorActionPreference = "Stop"
 
@@ -7,18 +9,44 @@ if (-not $dist.StartsWith($projectRoot, [StringComparison]::OrdinalIgnoreCase)) 
     throw "Refusing to package outside the project directory: $dist"
 }
 
+function Assert-ProductVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedVersion
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Release executable is missing: $Path"
+    }
+    $actual = (Get-Item -LiteralPath $Path).VersionInfo.ProductVersion
+    if (-not ([string]$actual).StartsWith($ExpectedVersion, [StringComparison]::Ordinal)) {
+        throw "Executable '$Path' reports '$actual', expected '$ExpectedVersion'."
+    }
+}
+
 Push-Location $projectRoot
 try {
-    $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+    $metadata = cargo metadata --no-deps --locked --format-version 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
     $package = $metadata.packages | Where-Object { $_.name -eq "ghitabrowser" } | Select-Object -First 1
     if (-not $package) {
         throw "Unable to read package metadata."
     }
     $version = $package.version
 
-    cargo build --release --locked
-    if ($LASTEXITCODE -ne 0) {
-        throw "Release build failed."
+    if (-not $SkipBuild) {
+        cargo build --release --locked -j 1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Release build failed."
+        }
+    }
+
+    $releaseBinaries = @(
+        (Join-Path $projectRoot "target\release\ghitabrowser.exe"),
+        (Join-Path $projectRoot "target\release\ghita-renderer-worker.exe"),
+        (Join-Path $projectRoot "target\release\ghita-browser-child.exe")
+    )
+    foreach ($binary in $releaseBinaries) {
+        Assert-ProductVersion -Path $binary -ExpectedVersion $version
     }
 
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -36,6 +64,10 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY_NOTICES.md") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $stage
     Copy-Item -LiteralPath (Join-Path $projectRoot "packaging\Run-Portable.bat") -Destination $stage
+
+    foreach ($stagedName in "GhitaBrowser.exe", "ghita-renderer-worker.exe", "ghita-browser-child.exe") {
+        Assert-ProductVersion -Path (Join-Path $stage $stagedName) -ExpectedVersion $version
+    }
 
     $archive = Join-Path $dist "GhitaBrowser-v$version-windows-x64.zip"
     if (Test-Path -LiteralPath $archive) {

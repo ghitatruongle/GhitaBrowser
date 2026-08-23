@@ -37,7 +37,7 @@ impl Default for MediaRuntimeLimits {
             max_events: 2_048,
             max_video_frames: 1_200,
             max_audio_frames: 16_384,
-            max_decoded_bytes: 256 * 1024 * 1024,
+            max_decoded_bytes: 64 * 1024 * 1024,
             sync_tolerance_us: 40_000,
         }
     }
@@ -458,6 +458,25 @@ impl PageMediaRuntime {
             .get_mut(&element_id)
             .ok_or_else(|| "Media element binding is stale".to_string())?;
         let was_paused = element.element.paused();
+        // Validate fallible output operations BEFORE mutating the element;
+        // mutating first left the UI showing the new time while the pipeline
+        // kept playing from the old position on rejected (backward) seeks.
+        let seek_target_us = match action {
+            MediaControlAction::SeekTo(seconds) => Some((seconds * 1_000_000.0) as i64),
+            MediaControlAction::SeekBy(delta) => Some(
+                (element.element.current_time_seconds() * 1_000_000.0) as i64
+                    + (delta * 1_000_000.0) as i64,
+            ),
+            _ => None,
+        };
+        if let (Some(target), Some(output)) = (seek_target_us, element.output.as_ref()) {
+            if target < output.clock.position_us() {
+                return Err(
+                    "NotSupportedError: backward seeking is not supported by the decoded pipeline"
+                        .to_string(),
+                );
+            }
+        }
         element.element.apply_control(action)?;
         if let Some(output) = element.output.as_mut() {
             match action {
@@ -650,6 +669,14 @@ mod tests {
                 interleaved_samples: vec![0; 1_920],
             }],
         }
+    }
+
+    #[test]
+    fn default_media_budget_is_64_mb() {
+        assert_eq!(
+            MediaRuntimeLimits::default().max_decoded_bytes,
+            64 * 1024 * 1024
+        );
     }
 
     #[test]

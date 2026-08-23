@@ -79,7 +79,20 @@ impl Element {
             result.push_str(&self.text);
         }
         for child in &self.children {
-            result.push_str(&child.text_content());
+            let child_text = child.text_content();
+            if child_text.is_empty() {
+                continue;
+            }
+            // Text runs are stored trimmed, so adjacent runs would fuse
+            // words ("Hello <b>World</b>" -> "HelloWorld") without a
+            // separating space at element boundaries.
+            let needs_space = !result.is_empty()
+                && !result.ends_with(char::is_whitespace)
+                && !child_text.starts_with(char::is_whitespace);
+            if needs_space {
+                result.push(' ');
+            }
+            result.push_str(&child_text);
         }
         result
     }
@@ -322,13 +335,22 @@ pub fn parse_html(html: &str) -> Element {
                     pos += 1;
                 }
                 let close_tag: String = chars[start..pos].iter().collect();
-                let close_tag = close_tag.trim().to_lowercase();
+                // End tags may carry stray attributes (`</div class="x">`);
+                // only the name participates in matching.
+                let close_tag = close_tag
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_lowercase();
                 pos += 1; // skip '>'
 
-                // Pop stack until we find matching tag (error recovery)
+                // Pop stack until we find matching tag (error recovery).
+                // Depth starts at 1: the synthetic root must never be closed,
+                // otherwise the whole accumulated document is discarded.
                 if stack.len() > 1 {
                     let mut found = false;
-                    for depth in (0..stack.len()).rev() {
+                    for depth in (1..stack.len()).rev() {
                         if stack[depth].tag == close_tag {
                             // Pop elements down to and including the match
                             while stack.len() > depth + 1 {
@@ -378,6 +400,16 @@ pub fn parse_html(html: &str) -> Element {
                         pos += 1;
                     }
                 }
+            } else if pos + 1 >= len || !chars[pos + 1].is_ascii_alphabetic() {
+                // HTML5 tokenizer rule: a '<' not followed by an ASCII letter
+                // (e.g. "5 < 6") is literal text, not a tag opener.
+                if let Some(current) = stack.last_mut() {
+                    if !current.text.is_empty() {
+                        current.text.push(' ');
+                    }
+                    current.text.push('<');
+                }
+                pos += 1;
             } else {
                 // Opening tag or self-closing
                 pos += 1; // skip '<'

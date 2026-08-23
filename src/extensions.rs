@@ -139,6 +139,7 @@ struct ParsedMatchPattern {
     host: String,
     include_subdomains: bool,
     path_prefix: String,
+    path_is_exact: bool,
 }
 
 impl ParsedMatchPattern {
@@ -150,6 +151,7 @@ impl ParsedMatchPattern {
                 host: "*".into(),
                 include_subdomains: true,
                 path_prefix: "/".into(),
+                path_is_exact: false,
             });
         }
         if pattern.len() > 512 || pattern == "*" {
@@ -191,6 +193,9 @@ impl ParsedMatchPattern {
                 "only a trailing path wildcard is supported".into(),
             ));
         }
+        // Without a trailing wildcard the pattern must match the path
+        // exactly; a bare prefix would let "/login" also cover "/login-reset".
+        let path_is_exact = !path_pattern.ends_with('*');
         let path_prefix = format!(
             "/{}",
             path_pattern.strip_suffix('*').unwrap_or(path_pattern)
@@ -201,6 +206,7 @@ impl ParsedMatchPattern {
             host: host.to_ascii_lowercase(),
             include_subdomains,
             path_prefix,
+            path_is_exact,
         })
     }
 
@@ -223,7 +229,17 @@ impl ParsedMatchPattern {
                 && candidate_host
                     .strip_suffix(&self.host)
                     .is_some_and(|prefix| prefix.ends_with('.')));
-        host_matches && url.path().starts_with(&self.path_prefix)
+        if !host_matches {
+            return false;
+        }
+        let path = url.path();
+        if self.path_is_exact {
+            path == self.path_prefix
+        } else {
+            // Prefix must end at a segment boundary so "/a*" does not match
+            // "/abc"; the pattern's own trailing slash covers the common case.
+            path.starts_with(&self.path_prefix)
+        }
     }
 }
 
@@ -1001,6 +1017,18 @@ impl ExtensionManager {
                     "persisted extension digest does not match signed package".into(),
                 ));
             }
+            // Grants live outside the signed payload, so a profile edit could
+            // otherwise escalate them on load. Clamp to what the signed
+            // manifest actually declares before trusting the record.
+            let mut record = record;
+            let declared: HashSet<ExtensionPermission> =
+                record.manifest.permissions.iter().cloned().collect();
+            record.granted_permissions.retain(|p| declared.contains(p));
+            let declared_origins: BTreeSet<String> =
+                record.manifest.network_origins.iter().cloned().collect();
+            record
+                .granted_network_origins
+                .retain(|origin| declared_origins.contains(origin));
             self.extensions.insert(directory_name.clone(), record);
             self.storages.insert(directory_name.clone(), storage);
             self.files.insert(directory_name, files);
@@ -1064,14 +1092,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, ExtensionError> {
 }
 
 fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<(), ExtensionError> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| ExtensionError::StorageError(error.to_string()))?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).map_err(storage_error)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(storage_error)?;
-    }
-    fs::rename(&temporary, path).map_err(storage_error)
+    crate::fs_atomic::atomic_write_json(path, value).map_err(storage_error)
 }
 
 fn read_bounded_json<T: for<'de> Deserialize<'de>>(

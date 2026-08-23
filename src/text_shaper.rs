@@ -35,12 +35,57 @@ struct TextRasterizer {
     cache: SwashCache,
 }
 
+fn text_attrs(monospace: bool, bold: bool) -> Attrs<'static> {
+    Attrs::new()
+        .family(if monospace {
+            Family::Monospace
+        } else {
+            Family::SansSerif
+        })
+        .weight(if bold { Weight::BOLD } else { Weight::NORMAL })
+        .style(Style::Normal)
+}
+
 impl TextRasterizer {
     fn new() -> Self {
         Self {
             fonts: FontSystem::new(),
             cache: SwashCache::new(),
         }
+    }
+
+    /// Measure the advance width of a single un-wrapped line of text in
+    /// device pixels using the real shaping engine. No rasterization is
+    /// performed, so this is cheap enough to call from layout for inline box
+    /// sizing. Returns an error when the request violates the shaping budget
+    /// (callers should then fall back to the heuristic estimator).
+    fn measure(
+        &mut self,
+        content: &str,
+        font_size: f32,
+        bold: bool,
+        monospace: bool,
+    ) -> Result<f64, String> {
+        validate_request(content, 1, 1, font_size)?;
+        if content.is_empty() {
+            return Ok(0.0);
+        }
+        let metrics = Metrics::new(font_size, (font_size * 1.3).max(1.0));
+        let mut buffer = Buffer::new(&mut self.fonts, metrics);
+        let mut borrowed = buffer.borrow_with(&mut self.fonts);
+        // Effectively unbounded single line: no wrapping, no raster surface.
+        borrowed.set_size(1_000_000.0, 1_000.0);
+        borrowed.set_wrap(Wrap::None);
+        borrowed.set_text(content, text_attrs(monospace, bold), Shaping::Advanced);
+        borrowed.shape_until_scroll();
+        // line_w is the shaped line width in logical pixels (cosmic-text
+        // 0.10 LayoutRun field), covering kerning and complex shaping for
+        // the whole line; taking the max over runs is correct for BiDi.
+        let mut width = 0.0_f32;
+        for run in borrowed.layout_runs() {
+            width = width.max(run.line_w);
+        }
+        Ok(f64::from(width))
     }
 
     fn rasterize(
@@ -56,23 +101,11 @@ impl TextRasterizer {
         let mut borrowed = buffer.borrow_with(&mut self.fonts);
         borrowed.set_size(width as f32, height as f32);
         borrowed.set_wrap(Wrap::Word);
-        let attrs = Attrs::new()
-            .family(if style.monospace {
-                Family::Monospace
-            } else {
-                Family::SansSerif
-            })
-            .weight(if style.bold {
-                Weight::BOLD
-            } else {
-                Weight::NORMAL
-            })
-            .style(if style.italic {
-                Style::Italic
-            } else {
-                Style::Normal
-            });
-        borrowed.set_text(content, attrs, Shaping::Advanced);
+        borrowed.set_text(
+            content,
+            text_attrs(style.monospace, style.bold),
+            Shaping::Advanced,
+        );
         borrowed.shape_until_scroll();
 
         let mut fonts = BTreeSet::new();
@@ -144,6 +177,26 @@ pub fn rasterize_text(
         .rasterize(content, width, height, style)
 }
 
+/// Real glyph-advance width of a single line of text, measured by the
+/// cosmic-text shaping engine shared with [`rasterize_text`]. Used by layout
+/// for inline box sizing so boxes reflect true proportional advances instead
+/// of the heuristic estimator. Returns an error (rather than panicking or
+/// blocking) when the request violates the shaping budget; callers should
+/// fall back to the heuristic in that case.
+pub fn measure_text_width(
+    content: &str,
+    font_size: f32,
+    bold: bool,
+    monospace: bool,
+) -> Result<f64, String> {
+    static RASTERIZER: OnceLock<Mutex<TextRasterizer>> = OnceLock::new();
+    let rasterizer = RASTERIZER.get_or_init(|| Mutex::new(TextRasterizer::new()));
+    let mut guard = rasterizer
+        .lock()
+        .map_err(|_| "Text rasterizer lock was poisoned".to_string())?;
+    guard.measure(content, font_size, bold, monospace)
+}
+
 fn validate_request(content: &str, width: u32, height: u32, size: f32) -> Result<(), String> {
     if content.len() > MAX_TEXT_BYTES {
         return Err("Text shaping input exceeds the 1 MB budget".to_string());
@@ -192,6 +245,32 @@ mod tests {
         assert_eq!(output.missing_glyphs, 0);
         assert!(output.contains_rtl_run);
         assert!(output.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn measure_text_width_returns_real_advances() {
+        let width = measure_text_width("Hello", 16.0, false, false).unwrap();
+        assert!(width > 0.0, "shaped line must have positive width");
+        // Real metrics: "Hello" at 16px is ~35-45px, far from the 50.0+ the
+        // old per-char heuristic (0.55-0.85 em) would give.
+        assert!((30.0..=55.0).contains(&width), "measured {width}px");
+    }
+
+    #[test]
+    fn measure_text_width_scales_with_font_size() {
+        let small = measure_text_width("mmmmmm", 12.0, false, false).unwrap();
+        let large = measure_text_width("mmmmmm", 24.0, false, false).unwrap();
+        assert!(
+            (large - small * 2.0).abs() < 2.0,
+            "width must scale ~linearly with size: {small} vs {large}"
+        );
+    }
+
+    #[test]
+    fn measure_text_width_empty_and_budget_limits() {
+        assert_eq!(measure_text_width("", 16.0, false, false).unwrap(), 0.0);
+        let too_big = "x".repeat(1024 * 1024 + 1);
+        assert!(measure_text_width(&too_big, 16.0, false, false).is_err());
     }
 
     #[test]

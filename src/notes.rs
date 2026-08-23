@@ -14,11 +14,21 @@ pub struct QuickNote {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NoteStore {
     pub notes: Vec<QuickNote>,
+    /// Monotonic counter so two notes created in the same millisecond still
+    /// get distinct ids (timestamp-only ids collide and delete/pin would
+    /// act on the wrong note).
+    #[serde(default)]
+    next_id: u64,
 }
 
 impl NoteStore {
     pub fn add_note(&mut self, title: String, content: String) -> String {
-        let id = format!("note-{}", chrono::Utc::now().timestamp_millis());
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = format!(
+            "note-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            self.next_id
+        );
         let created_at = chrono::Utc::now().to_rfc3339();
         self.notes.push(QuickNote {
             id: id.clone(),

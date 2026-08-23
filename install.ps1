@@ -2,23 +2,38 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = $PSScriptRoot
-$metadata = cargo metadata --no-deps --format-version 1 --manifest-path (Join-Path $projectRoot "Cargo.toml") | ConvertFrom-Json
+$metadata = cargo metadata --no-deps --locked --format-version 1 --manifest-path (Join-Path $projectRoot "Cargo.toml") | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
 $package = $metadata.packages | Where-Object { $_.name -eq "ghitabrowser" } | Select-Object -First 1
 if (-not $package) {
     throw "Unable to read the GhitaBrowser package version."
 }
 
 $version = $package.version
-$sourceExe = Join-Path $projectRoot "target\release\ghitabrowser.exe"
 $sourceIcon = Join-Path $projectRoot "icon.ico"
 $destination = Join-Path $env:LOCALAPPDATA "Programs\GhitaBrowser"
+$releaseDirectory = Join-Path $projectRoot "target\release"
+$binaries = [ordered]@{
+    "ghitabrowser.exe" = "GhitaBrowser.exe"
+    "ghita-renderer-worker.exe" = "ghita-renderer-worker.exe"
+    "ghita-browser-child.exe" = "ghita-browser-child.exe"
+}
 
-if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
-    throw "Release build not found: $sourceExe`nRun 'cargo build --release --locked' first."
+foreach ($sourceName in $binaries.Keys) {
+    $source = Join-Path $releaseDirectory $sourceName
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Release build file not found: $source`nRun 'cargo build --release --locked -j 1' first."
+    }
+    $productVersion = (Get-Item -LiteralPath $source).VersionInfo.ProductVersion
+    if (-not ([string]$productVersion).StartsWith($version, [StringComparison]::Ordinal)) {
+        throw "Binary '$source' has ProductVersion '$productVersion', expected '$version'."
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
-Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $destination "GhitaBrowser.exe") -Force
+foreach ($sourceName in $binaries.Keys) {
+    Copy-Item -LiteralPath (Join-Path $releaseDirectory $sourceName) -Destination (Join-Path $destination $binaries[$sourceName]) -Force
+}
 Copy-Item -LiteralPath $sourceIcon -Destination (Join-Path $destination "icon.ico") -Force
 
 $installedExe = Join-Path $destination "GhitaBrowser.exe"

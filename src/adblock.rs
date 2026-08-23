@@ -9,6 +9,11 @@ use std::collections::{BTreeMap, HashSet};
 
 const MAX_CUSTOM_RULES: usize = 4_096;
 const MAX_RULE_BYTES: usize = 2_048;
+const SAFE_COSMETIC_SELECTORS: [&str; 3] = [
+    "[data-ghita-ad]",
+    "[aria-label='Advertisement']",
+    ".sponsored-content",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ResourceType {
@@ -52,6 +57,39 @@ pub struct AdBlockStats {
     pub blocked_by_resource: BTreeMap<ResourceType, usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdBlockReason {
+    Disabled,
+    SiteException,
+    SafetyBypass,
+    AllowRule(String),
+    NoMatch,
+    BuiltInRule(String),
+    CustomRule(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdBlockDecision {
+    pub blocked: bool,
+    pub reason: AdBlockReason,
+}
+
+impl AdBlockDecision {
+    fn allow(reason: AdBlockReason) -> Self {
+        Self {
+            blocked: false,
+            reason,
+        }
+    }
+
+    fn block(reason: AdBlockReason) -> Self {
+        Self {
+            blocked: true,
+            reason,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuleAction {
     Allow,
@@ -69,7 +107,8 @@ enum RuleMatcher {
 
 #[derive(Debug, Clone)]
 struct NetworkRule {
-    _id: String,
+    id: String,
+    built_in: bool,
     action: RuleAction,
     matcher: RuleMatcher,
     resource_types: HashSet<ResourceType>,
@@ -98,7 +137,7 @@ impl AdBlocker {
         let mut rules = built_in_rules();
         let mut rejected_rule_count = 0;
         for (index, source) in config.custom_rules.iter().enumerate() {
-            match parse_rule(source, format!("custom-{index}")) {
+            match parse_rule(source, format!("custom-{index}"), false) {
                 Ok(rule) => rules.push(rule),
                 Err(_) => rejected_rule_count += 1,
             }
@@ -124,30 +163,53 @@ impl AdBlocker {
         page_url_or_domain: Option<&str>,
         resource_type: ResourceType,
     ) -> bool {
+        self.evaluate_resource(url, page_url_or_domain, resource_type)
+            .blocked
+    }
+
+    pub fn evaluate_resource(
+        &mut self,
+        url: &str,
+        page_url_or_domain: Option<&str>,
+        resource_type: ResourceType,
+    ) -> AdBlockDecision {
         if !self.config.enabled {
-            return false;
+            return AdBlockDecision::allow(AdBlockReason::Disabled);
         }
 
         let page_host = page_url_or_domain.map(normalize_host).unwrap_or_default();
         if !page_host.is_empty() && self.is_disabled_for_host(&page_host) {
-            return false;
+            self.stats.allowed_by_exception_count =
+                self.stats.allowed_by_exception_count.saturating_add(1);
+            return AdBlockDecision::allow(AdBlockReason::SiteException);
+        }
+
+        // Without a trustworthy top-level context there is no safe way to
+        // establish third-party status. Top-level documents and local URLs
+        // are always allowed, including explicit custom BLOCK rules.
+        if resource_type == ResourceType::Document || page_host.is_empty() {
+            return AdBlockDecision::allow(AdBlockReason::SafetyBypass);
         }
 
         let Some(request) = RequestParts::parse(url) else {
-            return false;
+            return AdBlockDecision::allow(AdBlockReason::SafetyBypass);
         };
         self.stats.evaluated_count = self.stats.evaluated_count.saturating_add(1);
-        let third_party = !page_host.is_empty() && !same_site(&request.host, &page_host);
+        if is_local_or_loopback(&request.host) || same_site(&request.host, &page_host) {
+            return AdBlockDecision::allow(AdBlockReason::SafetyBypass);
+        }
+        let third_party = true;
 
         // Explicit ALLOW rules have priority so users can recover a site from
         // a false positive without disabling protection for the whole site.
-        if self.rules.iter().any(|rule| {
+        if let Some(rule) = self.rules.iter().find(|rule| {
             rule.action == RuleAction::Allow
                 && rule_matches(rule, &request, &page_host, resource_type, third_party)
         }) {
+            let id = rule.id.clone();
             self.stats.allowed_by_exception_count =
                 self.stats.allowed_by_exception_count.saturating_add(1);
-            return false;
+            return AdBlockDecision::allow(AdBlockReason::AllowRule(id));
         }
 
         let matched = self.rules.iter().find(|rule| {
@@ -156,20 +218,30 @@ impl AdBlocker {
                 && rule_matches(rule, &request, &page_host, resource_type, third_party)
         });
         let Some(rule) = matched else {
-            return false;
+            return AdBlockDecision::allow(AdBlockReason::NoMatch);
         };
 
-        if rule.tracker {
+        let rule_id = rule.id.clone();
+        let built_in = rule.built_in;
+        let tracker = rule.tracker;
+
+        if tracker {
             self.stats.blocked_trackers_count = self.stats.blocked_trackers_count.saturating_add(1);
         } else {
             self.stats.blocked_ads_count = self.stats.blocked_ads_count.saturating_add(1);
         }
-        *self
+        let count = self
             .stats
             .blocked_by_resource
             .entry(resource_type)
-            .or_default() += 1;
-        true
+            .or_default();
+        *count = count.saturating_add(1);
+        let reason = if built_in {
+            AdBlockReason::BuiltInRule(rule_id)
+        } else {
+            AdBlockReason::CustomRule(rule_id)
+        };
+        AdBlockDecision::block(reason)
     }
 
     pub fn cosmetic_selectors(&self, page_url_or_domain: &str) -> Vec<&'static str> {
@@ -180,11 +252,7 @@ impl AdBlocker {
         {
             return Vec::new();
         }
-        vec![
-            "[data-ghita-ad]",
-            "[aria-label='Advertisement']",
-            ".sponsored-content",
-        ]
+        SAFE_COSMETIC_SELECTORS.to_vec()
     }
 
     pub fn stats(&self) -> &AdBlockStats {
@@ -196,16 +264,25 @@ impl AdBlocker {
     }
 
     pub fn toggle_domain(&mut self, domain: String) -> bool {
-        let domain = normalize_host(&domain);
+        let enabled = !self.is_domain_enabled(&domain);
+        let _ = self.set_domain_enabled(&domain, enabled);
+        enabled
+    }
+
+    /// Idempotently enable or disable request filtering for a site.
+    /// Returns true only when the configuration changed.
+    pub fn set_domain_enabled(&mut self, domain: &str, enabled: bool) -> bool {
+        let domain = normalize_host(domain);
         if domain.is_empty() {
-            return true;
+            return false;
         }
-        if self.config.disabled_domains.remove(&domain) {
-            true
+        let was_enabled = self.is_domain_enabled(&domain);
+        if enabled {
+            self.config.disabled_domains.remove(&domain);
         } else {
             self.config.disabled_domains.insert(domain);
-            false
         }
+        was_enabled != enabled
     }
 
     pub fn is_domain_enabled(&self, domain: &str) -> bool {
@@ -269,10 +346,7 @@ impl RequestParts {
 fn built_in_rules() -> Vec<NetworkRule> {
     let subresources: HashSet<ResourceType> = [
         ResourceType::Script,
-        ResourceType::Style,
         ResourceType::Image,
-        ResourceType::Font,
-        ResourceType::Media,
         ResourceType::Fetch,
         ResourceType::Other,
     ]
@@ -282,7 +356,8 @@ fn built_in_rules() -> Vec<NetworkRule> {
 
     for label in ["ads", "adserver", "sponsor"] {
         rules.push(NetworkRule {
-            _id: format!("builtin-ad-host-{label}"),
+            id: format!("builtin-ad-host-{label}"),
+            built_in: true,
             action: RuleAction::Block,
             matcher: RuleMatcher::HostLabel(label.to_string()),
             resource_types: subresources.clone(),
@@ -293,7 +368,8 @@ fn built_in_rules() -> Vec<NetworkRule> {
     }
     for label in ["tracker", "telemetry"] {
         rules.push(NetworkRule {
-            _id: format!("builtin-tracker-host-{label}"),
+            id: format!("builtin-tracker-host-{label}"),
+            built_in: true,
             action: RuleAction::Block,
             matcher: RuleMatcher::HostLabel(label.to_string()),
             resource_types: subresources.clone(),
@@ -304,7 +380,8 @@ fn built_in_rules() -> Vec<NetworkRule> {
     }
     for segment in ["ads", "adserver", "sponsored"] {
         rules.push(NetworkRule {
-            _id: format!("builtin-ad-path-{segment}"),
+            id: format!("builtin-ad-path-{segment}"),
+            built_in: true,
             action: RuleAction::Block,
             matcher: RuleMatcher::PathSegment(segment.to_string()),
             resource_types: subresources.clone(),
@@ -315,7 +392,8 @@ fn built_in_rules() -> Vec<NetworkRule> {
     }
     for segment in ["tracking", "telemetry"] {
         rules.push(NetworkRule {
-            _id: format!("builtin-tracker-path-{segment}"),
+            id: format!("builtin-tracker-path-{segment}"),
+            built_in: true,
             action: RuleAction::Block,
             matcher: RuleMatcher::PathSegment(segment.to_string()),
             resource_types: subresources.clone(),
@@ -326,7 +404,8 @@ fn built_in_rules() -> Vec<NetworkRule> {
     }
     for file_name in ["ads.js", "adframe.js"] {
         rules.push(NetworkRule {
-            _id: format!("builtin-ad-file-{file_name}"),
+            id: format!("builtin-ad-file-{file_name}"),
+            built_in: true,
             action: RuleAction::Block,
             matcher: RuleMatcher::FileName(file_name.to_string()),
             resource_types: subresources.clone(),
@@ -337,7 +416,8 @@ fn built_in_rules() -> Vec<NetworkRule> {
     }
     for file_name in ["tracking.js", "pixel.gif"] {
         rules.push(NetworkRule {
-            _id: format!("builtin-tracker-file-{file_name}"),
+            id: format!("builtin-tracker-file-{file_name}"),
+            built_in: true,
             action: RuleAction::Block,
             matcher: RuleMatcher::FileName(file_name.to_string()),
             resource_types: subresources.clone(),
@@ -349,7 +429,7 @@ fn built_in_rules() -> Vec<NetworkRule> {
     rules
 }
 
-fn parse_rule(source: &str, id: String) -> Result<NetworkRule, &'static str> {
+fn parse_rule(source: &str, id: String, built_in: bool) -> Result<NetworkRule, &'static str> {
     if source.len() > MAX_RULE_BYTES {
         return Err("rule is too long");
     }
@@ -398,7 +478,8 @@ fn parse_rule(source: &str, id: String) -> Result<NetworkRule, &'static str> {
         }
     }
     Ok(NetworkRule {
-        _id: id,
+        id,
+        built_in,
         action,
         matcher: matcher.ok_or("rule has no matcher")?,
         resource_types,
@@ -489,7 +570,26 @@ fn host_matches(host: &str, pattern: &str) -> bool {
 }
 
 fn same_site(left: &str, right: &str) -> bool {
-    host_matches(left, right) || host_matches(right, left)
+    if host_matches(left, right) || host_matches(right, left) {
+        return true;
+    }
+    registrable_domain(left) == registrable_domain(right)
+}
+
+fn registrable_domain(host: &str) -> String {
+    // eTLD+1 via the bundled Public Suffix List so distinct tenants on
+    // shared suffixes (user1.github.io vs user2.github.io) are NOT same-site.
+    // Falls back to the host itself when no registrable part exists.
+    crate::public_suffix::registrable_domain(host)
+        .unwrap_or_else(|| host.to_ascii_lowercase())
+}
+
+fn is_local_or_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 #[cfg(test)]
@@ -555,5 +655,98 @@ mod tests {
         };
         let blocker = AdBlocker::new(config);
         assert_eq!(blocker.rejected_rule_count(), 1);
+    }
+
+    #[test]
+    fn safety_bypass_never_blocks_documents_local_or_same_site_requests() {
+        let mut blocker = AdBlocker::new(AdBlockConfig {
+            custom_rules: vec![
+                "BLOCK host-label=ads types=document,script,style,font,media,image,fetch,other"
+                    .into(),
+            ],
+            ..AdBlockConfig::default()
+        });
+
+        for (url, page, kind) in [
+            (
+                "https://ads.test/page",
+                Some("https://site.test"),
+                ResourceType::Document,
+            ),
+            (
+                "http://127.0.0.1/ads.js",
+                Some("http://127.0.0.1"),
+                ResourceType::Script,
+            ),
+            (
+                "file:///C:/tmp/ads.js",
+                Some("file:///C:/tmp/index.html"),
+                ResourceType::Script,
+            ),
+            (
+                "https://cdn.site.test/ads.js",
+                Some("https://www.site.test"),
+                ResourceType::Script,
+            ),
+            ("https://ads.test/ads.js", None, ResourceType::Script),
+        ] {
+            assert!(!blocker.evaluate_resource(url, page, kind).blocked, "{url}");
+        }
+    }
+
+    #[test]
+    fn built_in_tracker_rules_only_block_safe_third_party_resource_types() {
+        for kind in [
+            ResourceType::Script,
+            ResourceType::Image,
+            ResourceType::Fetch,
+            ResourceType::Other,
+        ] {
+            let mut blocker = AdBlocker::new(AdBlockConfig::default());
+            assert!(blocker.should_block_resource(
+                "https://tracker.other.test/collect",
+                Some("https://site.test"),
+                kind,
+            ));
+        }
+        for kind in [
+            ResourceType::Document,
+            ResourceType::Style,
+            ResourceType::Font,
+            ResourceType::Media,
+        ] {
+            let mut blocker = AdBlocker::new(AdBlockConfig::default());
+            assert!(!blocker.should_block_resource(
+                "https://tracker.other.test/collect",
+                Some("https://site.test"),
+                kind,
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_words_that_contain_ad_are_not_ads() {
+        let mut blocker = AdBlocker::new(AdBlockConfig::default());
+        for url in [
+            "https://cdn.other.test/download/adapter.js",
+            "https://not-ads.test/assets/gradient.png",
+            "https://cdn.other.test/assets/header.js",
+        ] {
+            assert!(!blocker.should_block_resource(
+                url,
+                Some("https://site.test"),
+                ResourceType::Script,
+            ));
+        }
+    }
+
+    #[test]
+    fn site_enabled_setter_is_idempotent_and_reversible() {
+        let mut blocker = AdBlocker::new(AdBlockConfig::default());
+        assert!(blocker.set_domain_enabled("example.test", false));
+        assert!(!blocker.set_domain_enabled("example.test", false));
+        assert!(!blocker.is_domain_enabled("www.example.test"));
+        assert!(blocker.set_domain_enabled("example.test", true));
+        assert!(blocker.is_domain_enabled("www.example.test"));
     }
 }

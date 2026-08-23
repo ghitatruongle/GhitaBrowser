@@ -542,3 +542,129 @@ fn test_wikipedia_sample_layout_and_paint() {
     assert!(!metrics.has_major_blank_region);
     assert!(metrics.completeness_score > 0.5);
 }
+
+#[test]
+fn test_flex_container_grows_to_content_height() {
+    let html = r#"
+        <div class="row">
+            <div class="item">alpha</div>
+            <div class="item">beta</div>
+            <div class="item">gamma</div>
+        </div>
+        <div class="after">following</div>
+    "#;
+    let css = r#"
+        .row { display: flex; }
+        .item { font-size: 16px; padding: 10px; }
+    "#;
+    let dom = parse_html(html);
+    let rules = parse_css(css);
+    let mut tree = create_layout_tree(&dom, &rules, 800).expect("layout tree");
+    perform_layout(&mut tree, 800.0);
+
+    let row = find_by_class(&tree, "row").expect("flex container present");
+    let after = find_by_class(&tree, "after").expect("following block present");
+    // The flex container must be at least as tall as its padded children
+    // (10+16+10 = 36px each), not collapse to a single default line.
+    assert!(
+        row.rect.height >= 36.0,
+        "flex container height {} must cover padded children",
+        row.rect.height
+    );
+    assert!(
+        after.rect.y >= row.rect.y + row.rect.height,
+        "content after the flex box must start below it (after.y={} row bottom={})",
+        after.rect.y,
+        row.rect.y + row.rect.height
+    );
+}
+
+#[test]
+fn test_grid_and_table_containers_cover_their_rows() {
+    let html = r#"
+        <div class="grid"><div>c0</div><div>c1</div><div>c2</div><div>c3</div></div>
+        <table class="tbl"><tr><td>r0</td></tr><tr><td>r1</td></tr></table>
+    "#;
+    let css = ".grid { display: grid; }";
+    let dom = parse_html(html);
+    let rules = parse_css(css);
+    let mut tree = create_layout_tree(&dom, &rules, 800).expect("layout tree");
+    perform_layout(&mut tree, 800.0);
+
+    let grid = find_by_class(&tree, "grid").unwrap();
+    // Two rows of one-line cells (~22.4px) plus inter-row gap.
+    assert!(
+        grid.rect.height >= 40.0,
+        "grid height {} must span both rows",
+        grid.rect.height
+    );
+
+    let table = find_by_class(&tree, "tbl").unwrap();
+    assert!(
+        table.rect.height >= 44.8,
+        "table height {} must span both rows",
+        table.rect.height
+    );
+}
+
+#[test]
+fn test_percentage_height_resolves_against_parent_height() {
+    let html = r#"<div class="outer"><div class="inner">x</div></div>"#;
+    let css = r#"
+        .outer { height: 200px; width: 400px; }
+        .inner { height: 50%; }
+    "#;
+    let dom = parse_html(html);
+    let rules = parse_css(css);
+    let mut tree = create_layout_tree(&dom, &rules, 800).expect("layout tree");
+    perform_layout(&mut tree, 800.0);
+
+    let inner = find_by_class(&tree, "inner").unwrap();
+    assert!(
+        (inner.rect.height - 100.0).abs() < 0.5,
+        "50% of a 200px parent must be 100px, got {}",
+        inner.rect.height
+    );
+}
+
+#[test]
+fn test_absolute_bottom_anchors_to_parent_bottom_edge() {
+    let html = r#"<div class="parent"><div class="badge">b</div></div>"#;
+    let css = r#"
+        .parent { position: relative; height: 300px; width: 300px; }
+        .badge { position: absolute; bottom: 20px; left: 0; height: 40px; }
+    "#;
+    let dom = parse_html(html);
+    let rules = parse_css(css);
+    let mut tree = create_layout_tree(&dom, &rules, 800).expect("layout tree");
+    perform_layout(&mut tree, 800.0);
+
+    let parent = find_by_class(&tree, "parent").unwrap();
+    let badge = find_by_class(&tree, "badge").unwrap();
+    let badge_bottom = badge.rect.y + badge.rect.height + badge.rect.margin_bottom;
+    let parent_bottom = parent.rect.y + parent.rect.height;
+    assert!(
+        (parent_bottom - 20.0 - badge_bottom).abs() < 0.5,
+        "bottom:20px pins the badge 20px above the parent's bottom edge \
+         (parent_bottom={parent_bottom}, badge_bottom={badge_bottom})"
+    );
+}
+
+#[test]
+fn test_pixel_line_height_is_absolute_not_scaled() {
+    let html = "<h1 class=\"t\">Heading</h1>";
+    let css = ".t { font-size: 32px; line-height: 24px; }";
+    let dom = parse_html(html);
+    let rules = parse_css(css);
+    let mut tree = create_layout_tree(&dom, &rules, 800).expect("layout tree");
+    perform_layout(&mut tree, 800.0);
+
+    let node = find_by_class(&tree, "t").unwrap();
+    // One line of text with an absolute 24px line-height must be 24px tall
+    // (previously 24/16 was treated as a multiplier and produced 48px).
+    assert!(
+        (node.rect.height - 24.0).abs() < 0.5,
+        "absolute line-height 24px on a 32px font must give a 24px box, got {}",
+        node.rect.height
+    );
+}

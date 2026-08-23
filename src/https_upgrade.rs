@@ -11,6 +11,9 @@ pub enum HttpsMode {
 pub enum HttpsUpgradeResult {
     Upgraded { new_url: String },
     AlreadySecure { url: String },
+    /// Schemes that are neither http nor https (file:, ghita:, about:...).
+    /// They are not "secure web origins" and must not be labeled as such.
+    NonHttpScheme { url: String },
     ExemptLocal { url: String },
     InsecureAllowed { url: String },
 }
@@ -41,8 +44,13 @@ impl HttpsUpgradeEngine {
                 }
             }
         };
-        if parsed.scheme() != "http" {
+        if parsed.scheme() == "https" {
             return HttpsUpgradeResult::AlreadySecure {
+                url: url.to_string(),
+            };
+        }
+        if parsed.scheme() != "http" {
+            return HttpsUpgradeResult::NonHttpScheme {
                 url: url.to_string(),
             };
         }

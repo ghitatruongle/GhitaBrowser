@@ -446,12 +446,7 @@ fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
     if bytes.len() as u64 > MAX_PERSISTED_STATE_BYTES {
         return Err("Windows integration state exceeds 1 MiB".into());
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| error.to_string())?;
-    }
-    fs::rename(temporary, path).map_err(|error| error.to_string())
+    crate::fs_atomic::atomic_write_bytes(path, &bytes).map_err(|error| error.to_string())
 }
 
 fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
@@ -774,7 +769,11 @@ fn signed_executable_signer(path: &Path) -> Result<SignerIdentity, String> {
     if length == 0 {
         return Err("cannot read the signer certificate subject".into());
     }
-    let subject = String::from_utf16_lossy(&subject_buffer[..(length as usize - 1)]);
+    // CertGetNameStringW reports the required character count (including the
+    // terminator) and leaves the buffer untouched when it is too small, so
+    // clamp instead of indexing past 512 entries.
+    let subject_len = (length as usize - 1).min(subject_buffer.len());
+    let subject = String::from_utf16_lossy(&subject_buffer[..subject_len]);
 
     let mut thumbprint = [0u8; 64];
     let mut thumbprint_size = thumbprint.len() as u32;

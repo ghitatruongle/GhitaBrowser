@@ -42,6 +42,14 @@ impl HistoryEntry {
         self.has_dom
     }
 
+    /// Bytes directly retained by this compressed history snapshot.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.url.capacity())
+            .saturating_add(self.title.capacity())
+            .saturating_add(self.compressed_dom.as_ref().map_or(0, Vec::capacity))
+    }
+
     /// Compress a DOM tree into a compact binary representation
     fn compress_dom(dom: &Element) -> Option<Vec<u8>> {
         // Don't compress trivial DOMs
@@ -445,6 +453,12 @@ impl Tab {
         self.history.len()
     }
 
+    pub fn history_retained_bytes(&self) -> usize {
+        self.history.iter().fold(0usize, |total, entry| {
+            total.saturating_add(entry.retained_bytes())
+        })
+    }
+
     /// Bytes retained by the sleeping-tab DOM snapshot (if any). Used by the
     /// memory estimator so the estimate for a sleeping tab reflects the
     /// snapshot it actually keeps alive, not just the empty root DOM.
@@ -556,6 +570,16 @@ impl Tab {
             return false;
         }
         true
+    }
+
+    /// Absolute protection used before any relative discard score.
+    pub fn is_memory_relief_protected(&self, active_tab_id: Option<usize>) -> bool {
+        Some(self.id) == active_tab_id
+            || self.is_pinned
+            || self.is_audible
+            || self.is_error
+            || self.url.starts_with("ghita://")
+            || self.is_discarded
     }
 
     /// Returns how long ago the tab was last active, in seconds.
@@ -821,6 +845,11 @@ impl TabManager {
             .unwrap_or(0);
         let next = (pos + 1) % self.tab_order.len();
         self.active_tab_id = Some(self.tab_order[next]);
+        // Refresh the activity timestamp so a briefly-cycled tab is not
+        // immediately picked as the top memory-saver sleep candidate.
+        if let Some(tab) = self.get_tab_mut(self.tab_order[next]) {
+            tab.mark_active();
+        }
     }
 
     /// Cycle to the previous tab (Ctrl+Shift+Tab)
@@ -834,6 +863,9 @@ impl TabManager {
             .unwrap_or(0);
         let prev = (pos + self.tab_order.len() - 1) % self.tab_order.len();
         self.active_tab_id = Some(self.tab_order[prev]);
+        if let Some(tab) = self.get_tab_mut(self.tab_order[prev]) {
+            tab.mark_active();
+        }
     }
 
     pub fn remove_tab(&mut self, id: usize) -> Option<Tab> {

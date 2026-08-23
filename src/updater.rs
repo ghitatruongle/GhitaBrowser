@@ -21,6 +21,40 @@ const MAX_UPDATE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_UPDATE_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Release publisher keys pinned into the binary at build time. The profile
+/// copy of `trusted_publishers.json` can no longer introduce trust on its
+/// own — a user-writable file must never be the root of a code-installation
+/// signature chain. Rotate by adding a new `(key_id, hex)` entry and signing
+/// with `ghita-release-tool` (see tools/).
+pub const PINNED_RELEASE_KEYS: &[(&str, &str)] = &[
+    (
+        "ghita-release-2026-08",
+        "612897ca9842a77ddb162a138e62900cc4d7685570b289ba47af34a78aacaa0c",
+    ),
+];
+
+/// Build the runtime trust store from the pinned keys only.
+fn pinned_trust_store() -> PublisherTrustStore {
+    let mut trust = PublisherTrustStore::new();
+    for (key_id, key_hex) in PINNED_RELEASE_KEYS {
+        match crate::package_crypto::decode_hex_exact::<32>(key_hex) {
+            Ok(key) => {
+                // A malformed pin is a build-time bug; skip rather than fail
+                // the whole browser startup, but leave a loud trace.
+                if let Err(error) = trust.insert_ed25519(*key_id, key) {
+                    log::error!("pinned release key {key_id} rejected: {error:?}");
+                }
+            }
+            Err(error) => log::error!("pinned release key {key_id} has bad hex: {error:?}"),
+        }
+    }
+    trust
+}
+
+fn is_pinned_key_id(key_id: &str) -> bool {
+    PINNED_RELEASE_KEYS.iter().any(|(id, _)| *id == key_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateError {
     InvalidManifest(String),
@@ -458,7 +492,17 @@ impl UpdateManager {
             let persisted: BTreeMap<String, [u8; 32]> = read_bounded_json(&trust_path, 64 * 1024)?;
             let persisted = PublisherTrustStore::import_ed25519(persisted)?;
             for (key_id, key) in persisted.export_ed25519() {
-                trust.insert_ed25519(key_id, key)?;
+                // The profile file is user-writable, so it can only re-state
+                // keys that are already pinned — it can never introduce a
+                // new trust root.
+                if is_pinned_key_id(&key_id) {
+                    trust.insert_ed25519(key_id, key)?;
+                } else {
+                    log::warn!(
+                        "ignoring non-pinned publisher key {:?} from profile",
+                        key_id
+                    );
+                }
             }
         }
         let mut manager = Self {
@@ -485,13 +529,36 @@ impl UpdateManager {
         let install_dir = executable.parent().ok_or_else(|| {
             UpdateError::UnsafePath("current executable has no parent directory".into())
         })?;
-        Self::new_with_paths(
+        let mut manager = Self::new_with_paths(
             current_version,
             install_dir,
             &profile_dir.join("updater"),
             profile_dir,
-            PublisherTrustStore::new(),
-        )
+            pinned_trust_store(),
+        )?;
+        manager.enforce_version_floor();
+        Ok(manager)
+    }
+
+    /// The persisted `current_version` baseline lives in user-writable
+    /// storage; rewinding it would let an attacker replay old (genuinely
+    /// signed) manifests to downgrade the browser. The running binary's own
+    /// compile-time version is a floor that cannot be edited from disk.
+    fn enforce_version_floor(&mut self) {
+        let running = crate::VERSION;
+        let Ok(running_version) = VersionComparer::parse_version(running) else {
+            return;
+        };
+        match VersionComparer::parse_version(&self.current_version) {
+            Ok(persisted) if persisted < running_version => {
+                log::warn!(
+                    "updater baseline {} was below this build ({running}); lifting",
+                    self.current_version
+                );
+                self.current_version = running.to_string();
+            }
+            _ => {}
+        }
     }
 
     pub fn trust_publisher(
@@ -926,12 +993,8 @@ fn absolute_path(path: &Path) -> Result<PathBuf, UpdateError> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
-    let temporary = path.with_extension("ghita-tmp");
-    fs::write(&temporary, bytes).map_err(storage_error)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(storage_error)?;
-    }
-    fs::rename(temporary, path).map_err(storage_error)
+    fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).map_err(storage_error)?;
+    crate::fs_atomic::atomic_write_bytes(path, bytes).map_err(storage_error)
 }
 
 fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<(), UpdateError> {

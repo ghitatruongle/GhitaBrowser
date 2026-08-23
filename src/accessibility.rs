@@ -180,11 +180,16 @@ fn accessible_text(element: &Element) -> String {
 }
 
 fn is_hidden(element: &Element) -> bool {
+    // Inline styles are commonly written as "display: none" with spaces;
+    // normalize before matching and treat visibility:hidden as hidden too.
+    let style = element
+        .get_attr("style")
+        .map(|style| style.to_ascii_lowercase().replace(' ', ""))
+        .unwrap_or_default();
     element.get_attr("aria-hidden").map(String::as_str) == Some("true")
         || element.attrs.contains_key("hidden")
-        || element
-            .get_attr("style")
-            .is_some_and(|style| style.to_ascii_lowercase().contains("display:none"))
+        || style.contains("display:none")
+        || style.contains("visibility:hidden")
 }
 
 fn explicit_role(element: &Element) -> Option<AccessibleRole> {

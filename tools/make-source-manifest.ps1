@@ -8,13 +8,21 @@
 #   .\tools\make-source-manifest.ps1 -OutputPath .\phase29-freeze.json
 param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
-    [string]$ReleaseVersion = "2.0.0",
+    [string]$ReleaseVersion,
     [string]$PublisherDisplayName = "GhitaBrowser"
 )
 
 $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+if ([string]::IsNullOrWhiteSpace($ReleaseVersion)) {
+    $cargoManifest = Join-Path $root "Cargo.toml"
+    $metadata = cargo metadata --manifest-path $cargoManifest --no-deps --locked --format-version 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+    $package = $metadata.packages | Where-Object name -eq "ghitabrowser" | Select-Object -First 1
+    if (-not $package) { throw "ghitabrowser package metadata is missing" }
+    $ReleaseVersion = [string]$package.version
+}
 $excludedTopLevel = @(".git", "target", "dist", ".freebuff", ".zcode", "user_data", "cache", "downloads")
 # Generated Phase 29 freeze outputs are not frozen build inputs.
 $excludedFiles = @("phase29-freeze.json", "phase29-freeze.json.sha256.txt")
@@ -53,6 +61,7 @@ $headShort = $head.Substring(0, 7)
 $branch = (git -C $root branch --show-current).Trim()
 $porcelain = git -C $root status --porcelain
 $dirtyCount = ($porcelain | Measure-Object).Count
+$worktreeState = if ($dirtyCount -gt 0) { "dirty ($dirtyCount uncommitted files)" } else { "clean" }
 $rustcVersion = (rustc --version).Trim()
 $cargoVersion = (cargo --version).Trim()
 $toolchainFile = (Get-Content (Join-Path $root "rust-toolchain.toml") -Raw).Trim()
@@ -67,7 +76,7 @@ $manifest = [ordered]@{
         head_commit   = $head
         head_short    = $headShort
         branch        = $branch
-        worktree_state = "dirty (uncommitted 2.0 work preserved)"
+        worktree_state = $worktreeState
         dirty_file_count = $dirtyCount
     }
     toolchain = [ordered]@{

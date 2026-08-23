@@ -509,6 +509,10 @@ pub struct IDBDatabase {
     pub name: String,
     pub version: u64,
     pub object_stores: HashMap<String, IDBObjectStore>,
+    /// Bumped on every schema mutation so transactions can detect that the
+    /// database diverged since their snapshot was taken (a stale snapshot
+    /// restore would destroy concurrent commits).
+    pub mutation_epoch: u64,
 }
 
 impl IDBDatabase {
@@ -517,6 +521,7 @@ impl IDBDatabase {
             name: name.into(),
             version,
             object_stores: HashMap::new(),
+            mutation_epoch: 0,
         }
     }
 
@@ -535,11 +540,16 @@ impl IDBDatabase {
         }
         let store = IDBObjectStore::new(store_name.clone(), key_path, auto_increment);
         self.object_stores.insert(store_name.clone(), store);
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
         Ok(self.object_stores.get_mut(&store_name).expect("inserted"))
     }
 
     pub fn delete_object_store(&mut self, name: &str) -> bool {
-        self.object_stores.remove(name).is_some()
+        let removed = self.object_stores.remove(name).is_some();
+        if removed {
+            self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
+        }
+        removed
     }
 }
 
@@ -556,6 +566,10 @@ pub struct IDBTransaction {
     pub scope: Vec<String>,
     pub db_name: String,
     pub rollback_snapshot: Option<IDBDatabase>,
+    /// Database mutation epoch observed at open time; a mismatch at rollback
+    /// means the database diverged and restoring the snapshot would destroy
+    /// concurrent commits.
+    pub epoch_at_open: u64,
     pub aborted: bool,
     pub committed: bool,
 }
@@ -590,15 +604,22 @@ impl IndexedDBEngine {
             return Err("Max databases per origin budget exceeded".to_string());
         }
 
-        let target_version = version.unwrap_or(1);
-        let is_new_or_upgrade = match self.databases.get(name) {
-            None => true,
-            Some(db) => target_version > db.version,
+        // Opening without an explicit version must open the CURRENT version
+        // of an existing database (spec behaviour); a lower explicit request
+        // still fails closed.
+        let (target_version, is_new_or_upgrade) = match self.databases.get(name) {
+            Some(db) => match version {
+                Some(requested) if requested > db.version => (requested, true),
+                _ => (db.version, false),
+            },
+            None => (version.unwrap_or(1), true),
         };
 
         if let Some(db) = self.databases.get(name) {
-            if target_version < db.version {
-                return Err("VersionRequestedBelowCurrent".to_string());
+            if let Some(requested) = version {
+                if requested < db.version {
+                    return Err("VersionRequestedBelowCurrent".to_string());
+                }
             }
         }
 
@@ -608,8 +629,9 @@ impl IndexedDBEngine {
         }
 
         let db = self.databases.get_mut(name).expect("db exists");
-        if is_new_or_upgrade {
+        if is_new_or_upgrade && db.version != target_version {
             db.version = target_version;
+            db.mutation_epoch = db.mutation_epoch.wrapping_add(1);
         }
 
         let mode = if is_new_or_upgrade {
@@ -627,11 +649,34 @@ impl IndexedDBEngine {
             scope: db.object_stores.keys().cloned().collect(),
             db_name: name.to_string(),
             rollback_snapshot: Some(db.clone()),
+            epoch_at_open: db.mutation_epoch,
             aborted: false,
             committed: false,
         };
 
         Ok((tx, db))
+    }
+
+    /// Restore the transaction's snapshot only when the database has not
+    /// diverged since the transaction opened. Restoring a stale snapshot
+    /// would wipe commits from other transactions or resurrect a deleted
+    /// database.
+    fn restore_snapshot_if_safe(&mut self, tx: &mut IDBTransaction) {
+        let Some(snapshot) = tx.rollback_snapshot.take() else {
+            return;
+        };
+        let safe = self
+            .databases
+            .get(&tx.db_name)
+            .is_some_and(|db| db.mutation_epoch == tx.epoch_at_open);
+        if safe {
+            self.databases.insert(tx.db_name.clone(), snapshot);
+        } else {
+            log::warn!(
+                "IndexedDB rollback skipped for {:?}: database diverged since open",
+                tx.db_name
+            );
+        }
     }
 
     pub fn commit_transaction(&mut self, mut tx: IDBTransaction) -> Result<(), String> {
@@ -647,9 +692,7 @@ impl IndexedDBEngine {
             .sum::<usize>();
         if self.total_records() > MAX_RECORDS_PER_ORIGIN || retained_bytes > MAX_ORIGIN_VALUE_BYTES
         {
-            if let Some(snapshot) = tx.rollback_snapshot.take() {
-                self.databases.insert(tx.db_name.clone(), snapshot);
-            }
+            self.restore_snapshot_if_safe(&mut tx);
             return Err("IndexedDB origin storage budget exceeded".to_string());
         }
         tx.committed = true;
@@ -663,9 +706,7 @@ impl IndexedDBEngine {
             return Err("Transaction was already committed".to_string());
         }
         tx.aborted = true;
-        if let Some(snapshot) = tx.rollback_snapshot.take() {
-            self.databases.insert(tx.db_name.clone(), snapshot);
-        }
+        self.restore_snapshot_if_safe(&mut tx);
         Ok(())
     }
 
@@ -811,6 +852,51 @@ mod tests {
         let db_after = engine.databases.get("test_db").unwrap();
         let store_after = db_after.object_stores.get("users").unwrap();
         assert_eq!(store_after.count(), 0);
+    }
+
+    #[test]
+    fn aborting_after_database_delete_does_not_resurrect_it() {
+        let mut engine = IndexedDBEngine::new("https://example.com", None);
+        let (tx, db) = engine.open_db("doomed", Some(1)).unwrap();
+        db.create_object_store("s", None, true).unwrap();
+        engine.commit_transaction(tx).unwrap();
+
+        // A second transaction opens a snapshot, then the database is deleted.
+        let (_tx2, _db2) = engine.open_db("doomed", None).unwrap();
+        assert!(engine.delete_database("doomed"));
+
+        // Reopen creates a fresh database with a bumped epoch; aborting the
+        // stale transaction must not resurrect the deleted state.
+        let (stale_tx, _) = {
+            let (tx, db) = engine.open_db("doomed", None).unwrap();
+            db.create_object_store("fresh", None, true).unwrap();
+            (tx, db)
+        };
+        let (stale, _) = engine.open_db("doomed", None).unwrap();
+        let _ = stale;
+        engine.abort_transaction(stale_tx).unwrap();
+        assert!(
+            engine.databases.contains_key("doomed"),
+            "the live reopened database stays"
+        );
+        assert!(
+            engine.databases["doomed"].object_stores.contains_key("fresh"),
+            "stale rollback must not clobber newer schema"
+        );
+    }
+
+    #[test]
+    fn open_without_version_opens_current_version() {
+        let mut engine = IndexedDBEngine::new("https://example.com", None);
+        let (tx, _) = engine.open_db("app", Some(3)).unwrap();
+        engine.commit_transaction(tx).unwrap();
+        assert_eq!(engine.databases["app"].version, 3);
+
+        // Version-less open of an upgraded database must succeed at v3,
+        // not fail with VersionRequestedBelowCurrent against 1.
+        let (tx2, db) = engine.open_db("app", None).unwrap();
+        assert_eq!(db.version, 3);
+        engine.commit_transaction(tx2).unwrap();
     }
 
     #[test]

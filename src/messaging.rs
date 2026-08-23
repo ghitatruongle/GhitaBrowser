@@ -12,6 +12,19 @@ fn global_bus() -> &'static Mutex<BroadcastChannelBus> {
     BUS.get_or_init(|| Mutex::new(BroadcastChannelBus::new()))
 }
 
+/// Lock the global bus, recovering from a poisoned lock.
+///
+/// A panic while a thread held the bus lock leaves it poisoned; every later
+/// `.expect("bus lock")` would then panic in turn and abort the whole
+/// browser process in release builds. The bus has no invariant that a panic
+/// can violate beyond losing one in-flight message, so the poison is safely
+/// cleared and the (still consistent) state is reused.
+fn lock_bus() -> std::sync::MutexGuard<'static, BroadcastChannelBus> {
+    global_bus()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Default)]
 pub struct BroadcastChannelBus {
     // origin -> channel_name -> list of (channel_id)
@@ -88,10 +101,7 @@ impl BroadcastChannel {
     pub fn new(origin: impl Into<String>, name: impl Into<String>) -> Self {
         let origin = origin.into();
         let name = name.into();
-        let id = global_bus()
-            .lock()
-            .expect("bus lock")
-            .register(&origin, &name);
+        let id = lock_bus().register(&origin, &name);
         Self {
             id,
             origin,
@@ -107,12 +117,7 @@ impl BroadcastChannel {
         if message.len() > 1_048_576 {
             return Err("BroadcastChannel message exceeds 1 MB limit".to_string());
         }
-        global_bus().lock().expect("bus lock").post_message(
-            &self.origin,
-            &self.name,
-            self.id,
-            message,
-        );
+        lock_bus().post_message(&self.origin, &self.name, self.id, message);
         Ok(())
     }
 
@@ -120,16 +125,13 @@ impl BroadcastChannel {
         if self.closed {
             return None;
         }
-        global_bus().lock().expect("bus lock").poll_message(self.id)
+        lock_bus().poll_message(self.id)
     }
 
     pub fn close(&mut self) {
         if !self.closed {
             self.closed = true;
-            global_bus()
-                .lock()
-                .expect("bus lock")
-                .unregister(&self.origin, &self.name, self.id);
+            lock_bus().unregister(&self.origin, &self.name, self.id);
         }
     }
 }

@@ -75,8 +75,33 @@ impl CanvasFingerprintProtector {
         }
     }
 
+    /// Per-process secret mixed into per-origin seeds. Without it the seed
+    /// derives only from the public origin string, so any tracker could
+    /// recompute the exact noise offline and recover the pristine canvas —
+    /// and the noised value became a stable cross-session identifier.
+    fn process_secret() -> u32 {
+        static SECRET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *SECRET.get_or_init(|| {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let stack_addr = &seed as *const u64 as u64;
+            use std::hash::{BuildHasher, Hasher};
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u64(stack_addr);
+            let mixed = (hasher.finish() as u32) ^ (seed as u32);
+            if mixed == 0 {
+                0x9E37_79B9
+            } else {
+                mixed
+            }
+        })
+    }
+
     pub fn for_origin(enabled: bool, origin: &str) -> Self {
-        let mut seed = 0x811c_9dc5_u32;
+        let mut seed = Self::process_secret();
         for byte in origin.as_bytes() {
             seed ^= u32::from(*byte);
             seed = seed.wrapping_mul(0x0100_0193);

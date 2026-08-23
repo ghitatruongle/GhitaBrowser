@@ -298,10 +298,15 @@ impl CompoundSelector {
                 },
                 AttributeMatch::DashMatch => match attr.case_sensitivity {
                     CaseSensitivity::CaseInsensitive => {
-                        actual.eq_ignore_ascii_case(&attr.value)
-                            || (actual.len() > attr.value.len()
-                                && actual[..attr.value.len()].eq_ignore_ascii_case(&attr.value)
-                                && actual.as_bytes()[attr.value.len()] == b'-')
+                        // Fold to lowercase and compare on bytes; direct
+                        // slicing by another string's byte length can split
+                        // a multi-byte character and panic.
+                        let actual_folded = actual.to_ascii_lowercase();
+                        let value_folded = attr.value.to_ascii_lowercase();
+                        actual_folded == value_folded
+                            || actual_folded
+                                .strip_prefix(value_folded.as_str())
+                                .is_some_and(|rest| rest.starts_with('-'))
                     }
                     _ => {
                         actual == attr.value
@@ -314,10 +319,9 @@ impl CompoundSelector {
                         false
                     } else {
                         match attr.case_sensitivity {
-                            CaseSensitivity::CaseInsensitive => {
-                                actual.len() >= attr.value.len()
-                                    && actual[..attr.value.len()].eq_ignore_ascii_case(&attr.value)
-                            }
+                            CaseSensitivity::CaseInsensitive => actual
+                                .get(..attr.value.len())
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&attr.value)),
                             _ => actual.starts_with(&attr.value),
                         }
                     }
@@ -329,8 +333,11 @@ impl CompoundSelector {
                         match attr.case_sensitivity {
                             CaseSensitivity::CaseInsensitive => {
                                 actual.len() >= attr.value.len()
-                                    && actual[actual.len() - attr.value.len()..]
-                                        .eq_ignore_ascii_case(&attr.value)
+                                    && actual
+                                        .get(actual.len() - attr.value.len()..)
+                                        .is_some_and(|suffix| {
+                                            suffix.eq_ignore_ascii_case(&attr.value)
+                                        })
                             }
                             _ => actual.ends_with(&attr.value),
                         }
@@ -420,10 +427,14 @@ fn match_pseudo_class(pc: &PseudoClass, ctx: &ElementMatchingContext) -> bool {
         PseudoClass::Has(_) => true,
         PseudoClass::Lang(target_lang) => {
             if let Some(lang) = ctx.attrs.get("lang") {
-                lang.eq_ignore_ascii_case(target_lang)
-                    || (lang.len() > target_lang.len()
-                        && lang[..target_lang.len()].eq_ignore_ascii_case(target_lang)
-                        && lang.as_bytes()[target_lang.len()] == b'-')
+                let lang_folded = lang.to_ascii_lowercase();
+                let target_folded = target_lang.to_ascii_lowercase();
+                // Compare without slicing so multi-byte attributes cannot
+                // produce a non-char-boundary panic.
+                lang_folded == target_folded
+                    || lang_folded
+                        .strip_prefix(target_folded.as_str())
+                        .is_some_and(|rest| rest.starts_with('-'))
             } else {
                 false
             }
@@ -516,6 +527,8 @@ pub struct ElementMatchingContext<'a> {
     pub is_empty: bool,
     pub is_target: bool,
     pub is_visited: bool,
+    /// Prior siblings, nearest first, for `+` / `~` combinators.
+    pub previous_siblings: &'a [ElementAncestry],
 }
 
 impl<'a> ElementMatchingContext<'a> {
@@ -549,6 +562,44 @@ impl<'a> ElementMatchingContext<'a> {
             is_empty: false,
             is_target: false,
             is_visited: false,
+            // Empty slice literals are 'static, so no sibling data needed.
+            previous_siblings: &[],
+        }
+    }
+
+    /// Full constructor carrying real sibling-position facts.
+    pub fn with_siblings(
+        tag: &'a str,
+        classes: &'a [String],
+        id: Option<&'a str>,
+        attrs: &'a HashMap<String, String>,
+        is_root: bool,
+        ancestors: &'a [ElementAncestry],
+        siblings: &'a SiblingContext,
+    ) -> Self {
+        let is_disabled = attrs.contains_key("disabled");
+        let is_checked = attrs.contains_key("checked");
+        Self {
+            tag,
+            classes,
+            id,
+            attrs,
+            is_root,
+            ancestors,
+            index_in_parent: siblings.index_in_parent.max(1),
+            siblings_after: siblings.siblings_after,
+            total_siblings: siblings.total_siblings,
+            type_index_in_parent: siblings.type_index_in_parent.max(1),
+            total_type_siblings: siblings.total_type_siblings,
+            is_hovered: false,
+            is_focused: false,
+            is_active: false,
+            is_checked,
+            is_disabled,
+            is_empty: false,
+            is_target: false,
+            is_visited: false,
+            previous_siblings: siblings.previous_siblings,
         }
     }
 }
@@ -668,9 +719,22 @@ impl Selector {
             return true;
         }
 
-        if ctx.ancestors.is_empty() {
-            return false;
-        }
+        let ancestor_matches = |anc: &ElementAncestry,
+                                idx: usize,
+                                comp: &CompoundSelector,
+                                ctx: &ElementMatchingContext| {
+            // Ancestor contexts now carry the real attribute map so
+            // selectors like `form[action] input` match correctly.
+            let anc_ctx = ElementMatchingContext::simple(
+                &anc.tag,
+                &anc.classes,
+                anc.id.as_deref(),
+                &anc.attrs,
+                idx + 1 == ctx.ancestors.len(),
+                &ctx.ancestors[idx + 1..],
+            );
+            comp.matches_element_context(&anc_ctx)
+        };
 
         let mut ancestor_cursor = 0usize;
         for i in (0..self.components.len() - 1).rev() {
@@ -686,16 +750,7 @@ impl Selector {
                     let Some(parent) = ctx.ancestors.get(ancestor_cursor) else {
                         return false;
                     };
-                    let parent_attrs = HashMap::new();
-                    let parent_ctx = ElementMatchingContext::simple(
-                        &parent.tag,
-                        &parent.classes,
-                        parent.id.as_deref(),
-                        &parent_attrs,
-                        ancestor_cursor + 1 == ctx.ancestors.len(),
-                        &ctx.ancestors[ancestor_cursor + 1..],
-                    );
-                    if !comp.matches_element_context(&parent_ctx) {
+                    if !ancestor_matches(parent, ancestor_cursor, comp, ctx) {
                         return false;
                     }
                     ancestor_cursor += 1;
@@ -704,16 +759,7 @@ impl Selector {
                     let mut found = None;
                     for idx in ancestor_cursor..ctx.ancestors.len() {
                         let anc = &ctx.ancestors[idx];
-                        let anc_attrs = HashMap::new();
-                        let anc_ctx = ElementMatchingContext::simple(
-                            &anc.tag,
-                            &anc.classes,
-                            anc.id.as_deref(),
-                            &anc_attrs,
-                            idx + 1 == ctx.ancestors.len(),
-                            &ctx.ancestors[idx + 1..],
-                        );
-                        if comp.matches_element_context(&anc_ctx) {
+                        if ancestor_matches(anc, idx, comp, ctx) {
                             found = Some(idx);
                             break;
                         }
@@ -723,8 +769,42 @@ impl Selector {
                     };
                     ancestor_cursor = matched_idx + 1;
                 }
-                Combinator::AdjacentSibling | Combinator::GeneralSibling => {
-                    return true;
+                Combinator::AdjacentSibling => {
+                    // The left compound must match the immediately preceding
+                    // sibling; siblings share the same ancestor chain.
+                    // previous_siblings is document-ordered, so the nearest
+                    // prior sibling is the last entry.
+                    let Some(prev) = ctx.previous_siblings.last() else {
+                        return false;
+                    };
+                    let prev_ctx = ElementMatchingContext::simple(
+                        &prev.tag,
+                        &prev.classes,
+                        prev.id.as_deref(),
+                        &prev.attrs,
+                        false,
+                        ctx.ancestors,
+                    );
+                    if !comp.matches_element_context(&prev_ctx) {
+                        return false;
+                    }
+                }
+                Combinator::GeneralSibling => {
+                    // Any preceding sibling may satisfy the compound.
+                    let matched = ctx.previous_siblings.iter().any(|prev| {
+                        let prev_ctx = ElementMatchingContext::simple(
+                            &prev.tag,
+                            &prev.classes,
+                            prev.id.as_deref(),
+                            &prev.attrs,
+                            false,
+                            ctx.ancestors,
+                        );
+                        comp.matches_element_context(&prev_ctx)
+                    });
+                    if !matched {
+                        return false;
+                    }
                 }
             }
         }
@@ -1280,7 +1360,41 @@ fn parse_an_plus_b(expr: &str) -> (i32, i32) {
     }
 }
 
+/// Nesting budget for functional pseudo-classes (:not/:is/:where/:has).
+/// The parse cycle parse_selector_list -> Selector::parse ->
+/// parse_selector_chain -> parse_single_compound -> parse_pseudo_class
+/// re-enters this function once per nesting level, so an attacker
+/// stylesheet with thousands of nested pseudo-classes would otherwise
+/// overflow the stack.
+const MAX_SELECTOR_NESTING_DEPTH: usize = 32;
+
 fn parse_selector_list(input: &str) -> Vec<Selector> {
+    use std::cell::Cell;
+    thread_local! {
+        static NESTING: Cell<usize> = const { Cell::new(0) };
+    }
+    struct NestingGuard;
+    impl Drop for NestingGuard {
+        fn drop(&mut self) {
+            NESTING.with(|n| n.set(n.get().saturating_sub(1)));
+        }
+    }
+    let allowed = NESTING.with(|n| {
+        let current = n.get();
+        if current >= MAX_SELECTOR_NESTING_DEPTH {
+            false
+        } else {
+            n.set(current + 1);
+            true
+        }
+    });
+    if !allowed {
+        // Depth budget exhausted: fail closed by yielding no selectors so
+        // the rule simply does not match.
+        return Vec::new();
+    }
+    let _guard = NestingGuard;
+
     let mut list = Vec::new();
     let mut current = String::new();
     let mut paren_depth: usize = 0;
@@ -1327,6 +1441,30 @@ pub struct ElementAncestry {
     pub tag: String,
     pub classes: Vec<String>,
     pub id: Option<String>,
+    /// Real attribute map so selectors like `form[action] input` can match
+    /// ancestors. Empty for hand-built summaries.
+    #[serde(default)]
+    pub attrs: HashMap<String, String>,
+}
+
+/// Real sibling-position facts computed by the style traversal. Without them
+/// structural pseudo-classes (`:first-child`, `:nth-child(2)`, ...) evaluate
+/// against fabricated defaults and match every element.
+///
+/// `previous_siblings` lists PRIOR siblings in DOCUMENT ORDER (the
+/// immediately preceding sibling is the LAST entry) and borrows the
+/// traversal's buffer so hot cascades never clone per element.
+#[derive(Debug, Clone, Default)]
+pub struct SiblingContext<'a> {
+    /// 1-based position among the parent's children.
+    pub index_in_parent: usize,
+    pub siblings_after: usize,
+    pub total_siblings: usize,
+    /// Same four facts restricted to siblings sharing this tag.
+    pub type_index_in_parent: usize,
+    pub total_type_siblings: usize,
+    /// Prior siblings in document order, capped by the traversal.
+    pub previous_siblings: &'a [ElementAncestry],
 }
 
 /// A parsed CSS declaration.
@@ -1446,6 +1584,16 @@ fn parse_transform_length(value: &str) -> Option<f64> {
             .ok()
             .map(|v| v.clamp(-1_000_000.0, 1_000_000.0))
     }
+}
+
+/// `line-height` stored per CSS semantics: unitless numbers and percentages
+/// scale with the element's font size, while px/pt lengths are absolute.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum LineHeight {
+    /// Unitless number or percentage — a multiplier of the font size.
+    Multiplier(f64),
+    /// Absolute length already normalized to CSS pixels.
+    Absolute(f64),
 }
 
 /// Typed CSS Units supporting pixels, percentages, font-relative, viewport-relative, and calc expressions.
@@ -1570,7 +1718,7 @@ pub struct ComputedStyle {
     pub text_align: Option<String>,
     pub text_decoration: Option<String>,
     pub text_transform: Option<String>,
-    pub line_height: Option<f64>,
+    pub line_height: Option<LineHeight>,
     pub letter_spacing: Option<CssUnit>,
     pub word_spacing: Option<CssUnit>,
     pub white_space: Option<String>,
@@ -1676,7 +1824,7 @@ impl Default for ComputedStyle {
             text_align: Some("left".to_string()),
             text_decoration: None,
             text_transform: None,
-            line_height: Some(1.4),
+            line_height: Some(LineHeight::Multiplier(1.4)),
             letter_spacing: None,
             word_spacing: None,
             white_space: None,
@@ -2094,17 +2242,43 @@ fn is_property_inherited(property: &str) -> bool {
     )
 }
 
-fn parse_line_height(val: &str) -> Option<f64> {
+fn parse_line_height(val: &str) -> Option<LineHeight> {
     if let Ok(num) = val.parse::<f64>() {
-        return Some(num);
+        return Some(LineHeight::Multiplier(num));
     }
     if let Some(px) = val.strip_suffix("px") {
-        return px.trim().parse::<f64>().ok().map(|p| p / 16.0);
+        return px.trim().parse::<f64>().ok().map(LineHeight::Absolute);
+    }
+    if let Some(pt) = val.strip_suffix("pt") {
+        return pt
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|p| LineHeight::Absolute(p * 96.0 / 72.0));
+    }
+    if let Some(em) = val.strip_suffix("em") {
+        // em resolves against the element's font size, like a multiplier.
+        return em.trim().parse::<f64>().ok().map(LineHeight::Multiplier);
     }
     if let Some(pct) = val.strip_suffix('%') {
-        return pct.trim().parse::<f64>().ok().map(|p| p / 100.0);
+        return pct
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|p| LineHeight::Multiplier(p / 100.0));
     }
     None
+}
+
+/// Resolve a computed `line-height` to pixels for a given font size.
+/// Unitless numbers and percentages scale with the font; px/pt lengths are
+/// absolute and must NOT be multiplied by the element's font size.
+pub fn line_height_px(line_height: Option<LineHeight>, font_size: f64) -> f64 {
+    match line_height {
+        Some(LineHeight::Multiplier(m)) => (m * font_size).max(0.0),
+        Some(LineHeight::Absolute(px)) => px.max(0.0),
+        None => font_size * 1.4,
+    }
 }
 
 fn apply_four_sided_shorthand(
@@ -2418,6 +2592,10 @@ fn find_var_close(after: &str) -> Option<usize> {
     None
 }
 
+/// Nesting budget for calc()/min()/max()/clamp() and parenthesised terms.
+/// Hostile stylesheets can otherwise recurse the evaluator to stack overflow.
+const MAX_MATH_DEPTH: usize = 64;
+
 pub fn eval_math_expression(
     expr: &str,
     parent_size: f64,
@@ -2426,6 +2604,21 @@ pub fn eval_math_expression(
     vh: f64,
     customs: &HashMap<String, String>,
 ) -> Option<f64> {
+    eval_math_expression_bounded(expr, parent_size, root_size, vw, vh, customs, 0)
+}
+
+fn eval_math_expression_bounded(
+    expr: &str,
+    parent_size: f64,
+    root_size: f64,
+    vw: f64,
+    vh: f64,
+    customs: &HashMap<String, String>,
+    depth: usize,
+) -> Option<f64> {
+    if depth > MAX_MATH_DEPTH {
+        return None;
+    }
     let resolved = resolve_var_value(expr, customs).unwrap_or_else(|| expr.to_string());
     let trimmed = resolved.trim();
 
@@ -2433,7 +2626,7 @@ pub fn eval_math_expression(
         .strip_prefix("calc(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        return eval_calc_terms(inner.trim(), parent_size, root_size, vw, vh);
+        return eval_calc_terms(inner.trim(), parent_size, root_size, vw, vh, depth + 1);
     }
     if let Some(inner) = trimmed
         .strip_prefix("min(")
@@ -2442,7 +2635,9 @@ pub fn eval_math_expression(
         let args = split_math_args(inner);
         let mut min_val = f64::INFINITY;
         for arg in args {
-            if let Some(v) = eval_math_expression(&arg, parent_size, root_size, vw, vh, customs) {
+            if let Some(v) =
+                eval_math_expression_bounded(&arg, parent_size, root_size, vw, vh, customs, depth + 1)
+            {
                 if v < min_val {
                     min_val = v;
                 }
@@ -2461,7 +2656,9 @@ pub fn eval_math_expression(
         let args = split_math_args(inner);
         let mut max_val = f64::NEG_INFINITY;
         for arg in args {
-            if let Some(v) = eval_math_expression(&arg, parent_size, root_size, vw, vh, customs) {
+            if let Some(v) =
+                eval_math_expression_bounded(&arg, parent_size, root_size, vw, vh, customs, depth + 1)
+            {
                 if v > max_val {
                     max_val = v;
                 }
@@ -2479,10 +2676,13 @@ pub fn eval_math_expression(
     {
         let args = split_math_args(inner);
         if args.len() == 3 {
-            let min = eval_math_expression(&args[0], parent_size, root_size, vw, vh, customs)?;
-            let val = eval_math_expression(&args[1], parent_size, root_size, vw, vh, customs)?;
-            let max = eval_math_expression(&args[2], parent_size, root_size, vw, vh, customs)?;
-            return Some(val.clamp(min, max));
+            let min = eval_math_expression_bounded(&args[0], parent_size, root_size, vw, vh, customs, depth + 1)?;
+            let val = eval_math_expression_bounded(&args[1], parent_size, root_size, vw, vh, customs, depth + 1)?;
+            let max = eval_math_expression_bounded(&args[2], parent_size, root_size, vw, vh, customs, depth + 1)?;
+            // CSS clamp(MIN, VAL, MAX) is max(MIN, min(VAL, MAX)): when MIN
+            // exceeds MAX the spec resolves to MIN. f64::clamp panics on
+            // inverted bounds, so compose min/max instead.
+            return Some(val.min(max).max(min));
         }
     }
 
@@ -2516,25 +2716,35 @@ fn split_math_args(s: &str) -> Vec<String> {
     args
 }
 
-fn eval_calc_terms(inner: &str, parent_size: f64, root_size: f64, vw: f64, vh: f64) -> Option<f64> {
+fn eval_calc_terms(
+    inner: &str,
+    parent_size: f64,
+    root_size: f64,
+    vw: f64,
+    vh: f64,
+    depth: usize,
+) -> Option<f64> {
+    if depth > MAX_MATH_DEPTH {
+        return None;
+    }
     let mut total = 0.0;
     let mut current_op = '+';
     let mut current_term = String::new();
-    let mut depth: usize = 0;
+    let mut paren_depth: usize = 0;
 
     for c in inner.chars() {
         match c {
             '(' => {
-                depth += 1;
+                paren_depth += 1;
                 current_term.push(c);
             }
             ')' => {
-                depth = depth.saturating_sub(1);
+                paren_depth = paren_depth.saturating_sub(1);
                 current_term.push(c);
             }
-            '+' | '-' if depth == 0 => {
+            '+' | '-' if paren_depth == 0 => {
                 let term_val =
-                    eval_single_calc_term(current_term.trim(), parent_size, root_size, vw, vh)?;
+                    eval_single_calc_term(current_term.trim(), parent_size, root_size, vw, vh, depth)?;
                 if current_op == '+' {
                     total += term_val;
                 } else {
@@ -2548,7 +2758,7 @@ fn eval_calc_terms(inner: &str, parent_size: f64, root_size: f64, vw: f64, vh: f
     }
 
     if !current_term.trim().is_empty() {
-        let term_val = eval_single_calc_term(current_term.trim(), parent_size, root_size, vw, vh)?;
+        let term_val = eval_single_calc_term(current_term.trim(), parent_size, root_size, vw, vh, depth)?;
         if current_op == '+' {
             total += term_val;
         } else {
@@ -2565,26 +2775,30 @@ fn eval_single_calc_term(
     root_size: f64,
     vw: f64,
     vh: f64,
+    depth: usize,
 ) -> Option<f64> {
+    if depth > MAX_MATH_DEPTH {
+        return None;
+    }
     let term = term.trim();
     if term.is_empty() {
         return Some(0.0);
     }
     if let Some((left, right)) = term.split_once('*') {
-        let lv = eval_single_calc_term(left.trim(), parent_size, root_size, vw, vh)?;
-        let rv = eval_single_calc_term(right.trim(), parent_size, root_size, vw, vh)?;
+        let lv = eval_single_calc_term(left.trim(), parent_size, root_size, vw, vh, depth + 1)?;
+        let rv = eval_single_calc_term(right.trim(), parent_size, root_size, vw, vh, depth + 1)?;
         return Some(lv * rv);
     }
     if let Some((left, right)) = term.split_once('/') {
-        let lv = eval_single_calc_term(left.trim(), parent_size, root_size, vw, vh)?;
-        let rv = eval_single_calc_term(right.trim(), parent_size, root_size, vw, vh)?;
+        let lv = eval_single_calc_term(left.trim(), parent_size, root_size, vw, vh, depth + 1)?;
+        let rv = eval_single_calc_term(right.trim(), parent_size, root_size, vw, vh, depth + 1)?;
         if rv != 0.0 {
             return Some(lv / rv);
         }
         return None;
     }
     if let Some(inner) = term.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        return eval_calc_terms(inner, parent_size, root_size, vw, vh);
+        return eval_calc_terms(inner, parent_size, root_size, vw, vh, depth + 1);
     }
     CssUnit::parse(term).map(|u| u.to_pixels_with_viewport(parent_size, root_size, vw, vh))
 }
@@ -3262,19 +3476,78 @@ fn parse_import_url(stmt: &str) -> Option<String> {
     None
 }
 
+/// Split at top-level occurrences of a keyword such as " and " / " or ",
+/// ignoring matches inside parentheses.
+fn split_supports_top_level<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {
+    let lowered = input.to_ascii_lowercase();
+    let bytes = input.as_bytes();
+    let lower_bytes = lowered.as_bytes();
+    let kw = keyword.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+            }
+            b' ' if paren_depth == 0 && lower_bytes[i..].starts_with(kw) => {
+                parts.push(&input[start..i]);
+                i += kw.len();
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
 pub fn supports_query_matches(condition: &str) -> bool {
+    supports_query_matches_bounded(condition.trim(), 0)
+}
+
+fn supports_query_matches_bounded(condition: &str, depth: usize) -> bool {
+    if depth > MAX_MATH_DEPTH {
+        return false;
+    }
     let trimmed = condition.trim();
     if trimmed.is_empty() {
         return true;
     }
-    if let Some(rest) = trimmed.strip_prefix("not ") {
-        return !supports_query_matches(rest);
+    // Count leading `not` prefixes iteratively so a hostile condition
+    // cannot recurse once per token to stack overflow.
+    let mut negations = 0usize;
+    let mut rest = trimmed;
+    loop {
+        let has_not = matches!(rest.get(..4), Some(prefix) if prefix.eq_ignore_ascii_case("not "));
+        if !has_not {
+            break;
+        }
+        negations += 1;
+        rest = rest[4..].trim_start();
     }
-    if trimmed.contains(" and ") {
-        return trimmed.split(" and ").all(supports_query_matches);
+    if negations > 0 && !rest.is_empty() {
+        let inner = supports_query_matches_bounded(rest, depth + 1);
+        return if negations % 2 == 1 { !inner } else { inner };
     }
-    if trimmed.contains(" or ") {
-        return trimmed.split(" or ").any(supports_query_matches);
+    // CSS precedence: `or` binds looser than `and`, so split on `or`
+    // first and evaluate each disjunct as an `and` conjunction.
+    if trimmed.contains(" or ") || trimmed.contains(" OR ") {
+        return split_supports_top_level(trimmed, " or ")
+            .into_iter()
+            .any(|clause| supports_query_matches_bounded(clause, depth + 1));
+    }
+    if trimmed.contains(" and ") || trimmed.contains(" AND ") {
+        return split_supports_top_level(trimmed, " and ")
+            .into_iter()
+            .all(|clause| supports_query_matches_bounded(clause, depth + 1));
     }
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = trimmed[1..trimmed.len() - 1].trim();
@@ -3352,17 +3625,46 @@ pub fn compute_computed_style_with_ancestors(
     is_root: bool,
     ancestry: &[ElementAncestry],
 ) -> ComputedStyle {
+    compute_computed_style_full(
+        element_tag,
+        element_classes,
+        element_id,
+        rules,
+        parent_style,
+        element_attrs,
+        is_root,
+        ancestry,
+        &SiblingContext::default(),
+    )
+}
+
+/// Full entry point: like [`compute_computed_style_with_ancestors`] but with
+/// real sibling-position facts so structural pseudo-classes and `+`/`~`
+/// combinators evaluate against the actual document instead of defaults.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_computed_style_full(
+    element_tag: &str,
+    element_classes: &[String],
+    element_id: Option<&str>,
+    rules: &[CssRule],
+    parent_style: Option<&ComputedStyle>,
+    element_attrs: &HashMap<String, String>,
+    is_root: bool,
+    ancestry: &[ElementAncestry],
+    siblings: &SiblingContext,
+) -> ComputedStyle {
     let is_root_elem = is_root
         || element_tag.eq_ignore_ascii_case("html")
         || element_tag.eq_ignore_ascii_case(":root");
 
-    let matching_ctx = ElementMatchingContext::simple(
+    let matching_ctx = ElementMatchingContext::with_siblings(
         element_tag,
         element_classes,
         element_id,
         element_attrs,
         is_root_elem,
         ancestry,
+        siblings,
     );
 
     let mut style = if let Some(parent) = parent_style {
@@ -3423,20 +3725,27 @@ pub fn compute_computed_style_with_ancestors(
     let mut matched_declarations: Vec<MatchedDecl> = Vec::new();
 
     for (rule_idx, rule) in rules.iter().enumerate() {
+        // A grouped rule matches once; the cascade uses the HIGHEST
+        // specificity among its matching selectors, not the first match.
+        let mut best_specificity: Option<(u32, u32, u32)> = None;
         for selector in &rule.selectors {
             if selector.matches_context(&matching_ctx) {
                 let spec = selector.specificity();
-                for decl in &rule.declarations {
-                    matched_declarations.push(MatchedDecl {
-                        decl,
-                        origin: rule.origin,
-                        layer_order: rule.layer_order,
-                        specificity: spec,
-                        source_order: rule_idx * 1000 + decl.source_order,
-                        is_inline: false,
-                    });
+                if best_specificity.is_none_or(|best| spec > best) {
+                    best_specificity = Some(spec);
                 }
-                break;
+            }
+        }
+        if let Some(spec) = best_specificity {
+            for decl in &rule.declarations {
+                matched_declarations.push(MatchedDecl {
+                    decl,
+                    origin: rule.origin,
+                    layer_order: rule.layer_order,
+                    specificity: spec,
+                    source_order: rule_idx * 1000 + decl.source_order,
+                    is_inline: false,
+                });
             }
         }
     }
@@ -4092,6 +4401,7 @@ mod tests {
             is_empty: false,
             is_target: false,
             is_visited: false,
+            previous_siblings: &[],
         };
         assert!(sel.matches_context(&ctx));
 
@@ -4118,6 +4428,7 @@ mod tests {
             is_empty: false,
             is_target: false,
             is_visited: false,
+            previous_siblings: &[],
         };
         assert!(!sel.matches_context(&disabled_ctx));
     }

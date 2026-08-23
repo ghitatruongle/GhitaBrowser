@@ -16,6 +16,7 @@ pub mod bookmarks;
 pub mod cache_api;
 pub mod child_process;
 pub mod compatibility_diagnostics;
+pub mod compatibility_probe;
 pub mod content_control;
 pub mod crash_recovery;
 pub mod css_parser;
@@ -24,6 +25,7 @@ pub mod dom;
 pub mod downloads;
 pub mod dynamic_render;
 pub mod extensions;
+pub mod fs_atomic;
 #[cfg(windows)]
 pub mod gpu_compositor;
 pub mod history_manager;
@@ -61,10 +63,12 @@ pub mod pip;
 pub mod process_architecture;
 pub mod process_coordinator;
 pub mod promise_runtime;
+pub mod public_suffix;
 pub mod protected_media;
 pub mod push;
 pub mod reader_mode;
 pub mod realtime;
+pub mod release_metrics;
 pub mod release_smoke;
 pub mod renderer;
 pub mod runtime_core;
@@ -103,7 +107,9 @@ pub use acceptance::{
     PerformanceSummary, ScenarioCapability, ScenarioCategory, ScenarioDefinition, ScenarioEvidence,
     ScenarioMatrix, ScenarioResult, SoakSample,
 };
-pub use adblock::{AdBlockConfig, AdBlockStats, AdBlocker, ResourceType};
+pub use adblock::{
+    AdBlockConfig, AdBlockDecision, AdBlockReason, AdBlockStats, AdBlocker, ResourceType,
+};
 pub use extensions::{
     ContentScriptConfig, ExtensionApproval, ExtensionError, ExtensionManager, ExtensionPackage,
     ExtensionPermission, ExtensionPermissionReview, ExtensionRecord, ExtensionStatus,
@@ -156,7 +162,10 @@ pub use live_dom::{
     LiveNodeKind, LiveRenderState, MutationInvalidation, NodeId,
 };
 /// Re-export memory tracker
-pub use memory_tracker::{BrowserMemoryEstimate, MemoryTracker, TabMemoryEstimate};
+pub use memory_tracker::{
+    BrowserMemoryEstimate, MemoryBudget, MemoryPressureLevel, MemoryReliefReport, MemoryTracker,
+    TabMemoryEstimate,
+};
 /// Re-export network functions and cache
 pub use network::{fetch_url, fetch_with_cache, CacheStats, FetchResult, ResourceCache};
 /// Re-export the pixel painter
@@ -268,6 +277,11 @@ impl Browser {
     }
 
     fn with_storage(storage: StorageManager) -> Self {
+        let image_cache_capacity_mb = if storage.settings.image_cache_capacity_mb == 0 {
+            24
+        } else {
+            storage.settings.image_cache_capacity_mb.clamp(8, 128)
+        };
         let adblocker = AdBlocker::new(AdBlockConfig {
             enabled: storage.settings.adblock_enabled,
             cosmetic_filtering: storage.settings.adblock_cosmetic_filtering,
@@ -282,8 +296,21 @@ impl Browser {
                     .unwrap_or_else(|_| extensions::ExtensionManager::new_in_memory()),
                 installed_app::InstalledAppManager::new_with_profile(dir)
                     .unwrap_or_else(|_| installed_app::InstalledAppManager::new_in_memory()),
-                updater::UpdateManager::new_for_application(VERSION, dir)
-                    .unwrap_or_else(|_| updater::UpdateManager::new_in_memory(VERSION)),
+                updater::UpdateManager::new_for_application(VERSION, dir).unwrap_or_else(|error| {
+                    // A failed constructor can mean an interrupted update with
+                    // a missing backup — never silently continue as if the
+                    // install tree were healthy.
+                    log::error!(
+                        "updater initialization failed (possible interrupted update \
+                         needing manual repair): {error:?}"
+                    );
+                    eprintln!(
+                        "Warning: update system could not start ({error:?}). \
+                         If updates were recently applied, the installation may \
+                         need repair."
+                    );
+                    updater::UpdateManager::new_in_memory(VERSION)
+                }),
                 windows_integration::WindowsIntegration::new_with_profile(dir)
                     .unwrap_or_else(|_| windows_integration::WindowsIntegration::new_in_memory()),
             ),
@@ -305,7 +332,9 @@ impl Browser {
             profiler: Profiler::new(),
             css_rules: Vec::new(),
             last_render_stats: None,
-            image_cache: ImageCache::new(),
+            image_cache: ImageCache::with_capacity(
+                (image_cache_capacity_mb as usize).saturating_mul(1024 * 1024),
+            ),
             memory_tracker: memory_tracker::MemoryTracker::new(),
             adblocker,
             content_control: content_control::ContentControlEngine::new(),
@@ -396,6 +425,7 @@ impl Browser {
         match self.https_upgrade.evaluate_url(url) {
             https_upgrade::HttpsUpgradeResult::Upgraded { new_url } => new_url,
             https_upgrade::HttpsUpgradeResult::AlreadySecure { url }
+            | https_upgrade::HttpsUpgradeResult::NonHttpScheme { url }
             | https_upgrade::HttpsUpgradeResult::ExemptLocal { url }
             | https_upgrade::HttpsUpgradeResult::InsecureAllowed { url } => url,
         }
@@ -817,42 +847,129 @@ impl Browser {
         memory_threshold_mb: u32,
         min_tabs_to_keep: usize,
     ) -> Option<usize> {
-        if self.tabs.tab_count() <= min_tabs_to_keep {
-            return None;
+        self.relieve_memory_pressure(
+            memory_tracker::MemoryBudget::from_mb(memory_threshold_mb, memory_threshold_mb),
+            min_tabs_to_keep,
+        )
+        .discarded_tabs
+        .first()
+        .copied()
+    }
+
+    /// Apply the tiered managed-memory policy and report every action.
+    pub fn relieve_memory_pressure(
+        &mut self,
+        budget: memory_tracker::MemoryBudget,
+        min_tabs_to_keep: usize,
+    ) -> memory_tracker::MemoryReliefReport {
+        const RESOURCE_CACHE_LIMIT: usize = 32 * 1024 * 1024;
+        const MB: usize = 1024 * 1024;
+
+        let before_bytes = self.estimate_memory().total_bytes;
+        let level = budget.level_for(before_bytes);
+        let mut report = memory_tracker::MemoryReliefReport {
+            level,
+            before_bytes,
+            after_bytes: before_bytes,
+            ..memory_tracker::MemoryReliefReport::default()
+        };
+        if matches!(
+            level,
+            memory_tracker::MemoryPressureLevel::Disabled
+                | memory_tracker::MemoryPressureLevel::Normal
+        ) {
+            return report;
         }
 
-        // Check if we're over the memory threshold
-        let estimate = self.estimate_memory();
-        let total_mb = memory_tracker::MemoryTracker::bytes_to_mb(estimate.total_bytes);
+        let cache_before = self
+            .cache
+            .total_bytes()
+            .saturating_add(self.image_cache.memory_usage());
+        self.cache.evict_expired();
+        self.image_cache
+            .evict_stale(std::time::Duration::from_secs(60));
+        self.cache.set_max_size(RESOURCE_CACHE_LIMIT);
+        let image_limit_mb = if self.storage.settings.image_cache_capacity_mb == 0 {
+            24
+        } else {
+            self.storage.settings.image_cache_capacity_mb.clamp(8, 128)
+        };
+        self.image_cache
+            .set_capacity((image_limit_mb as usize).saturating_mul(MB));
+        let cache_after = self
+            .cache
+            .total_bytes()
+            .saturating_add(self.image_cache.memory_usage());
+        report.cache_bytes_freed = cache_before.saturating_sub(cache_after);
+        report.after_bytes = self.estimate_memory().total_bytes;
 
-        if total_mb < memory_threshold_mb as f32 {
-            return None;
+        let active_id = self.tabs.active_tab_id();
+        let mut sleep_candidates: Vec<(usize, i64)> = self
+            .tabs
+            .iter()
+            .filter(|tab| !tab.is_memory_relief_protected(active_id) && tab.can_sleep())
+            .map(|tab| (tab.id, tab.seconds_since_active()))
+            .collect();
+        sleep_candidates.sort_by_key(|(_, inactive)| std::cmp::Reverse(*inactive));
+        let sleep_limit = if level == memory_tracker::MemoryPressureLevel::Moderate {
+            1
+        } else {
+            usize::MAX
+        };
+        for (tab_id, _) in sleep_candidates.into_iter().take(sleep_limit) {
+            let target = if level == memory_tracker::MemoryPressureLevel::Moderate {
+                budget.soft_limit_bytes
+            } else {
+                budget.hard_limit_bytes
+            };
+            if report.after_bytes < target {
+                break;
+            }
+            if let Some(tab) = self.tabs.get_tab_mut(tab_id) {
+                tab.sleep();
+                report.slept_tabs.push(tab_id);
+            }
+            report.after_bytes = self.estimate_memory().total_bytes;
         }
 
-        // Find the tab with the highest discard score (most discardable)
-        let scores = self.tab_discard_scores();
-        for (tab_id, score) in scores {
-            // A zero score is a normal, newly inactive tab and is eligible
-            // under actual memory pressure; negative scores remain protected.
-            if score >= 0 {
+        if level == memory_tracker::MemoryPressureLevel::Critical
+            && report.after_bytes >= budget.hard_limit_bytes
+        {
+            let mut discard_candidates: Vec<(usize, i64)> = self
+                .tabs
+                .iter()
+                .filter(|tab| !tab.is_memory_relief_protected(active_id))
+                .map(|tab| (tab.id, tab.discard_score(active_id)))
+                .collect();
+            discard_candidates.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+            for (tab_id, _) in discard_candidates.into_iter().take(3) {
+                let live_tabs = self.tabs.iter().filter(|tab| !tab.is_discarded).count();
+                if report.after_bytes < budget.hard_limit_bytes || live_tabs <= min_tabs_to_keep {
+                    break;
+                }
                 if let Some(tab) = self.tabs.get_tab_mut(tab_id) {
                     tab.discard();
-                    return Some(tab_id);
+                    report.discarded_tabs.push(tab_id);
                 }
+                report.after_bytes = self.estimate_memory().total_bytes;
             }
         }
 
-        None
+        report
     }
 
     /// Discard the least important tab regardless of memory threshold.
     /// Used as a forced memory relief action.
     /// Returns the ID of the tab that was discarded, or None if no tab was discardable.
     pub fn discard_least_important_tab(&mut self) -> Option<usize> {
+        let active_id = self.tabs.active_tab_id();
         let scores = self.tab_discard_scores();
         for (tab_id, score) in scores {
             if score >= 0 {
                 if let Some(tab) = self.tabs.get_tab_mut(tab_id) {
+                    if tab.is_memory_relief_protected(active_id) {
+                        continue;
+                    }
                     tab.discard();
                     return Some(tab_id);
                 }
@@ -1266,7 +1383,72 @@ mod tests {
         let browser = Browser::new();
         assert!(browser.storage.settings.tab_memory_saver);
         assert_eq!(browser.storage.settings.memory_saver_threshold_minutes, 5);
+        assert_eq!(browser.storage.settings.memory_soft_limit_mb, 400);
         assert_eq!(browser.storage.settings.memory_pressure_threshold_mb, 500);
+        assert_eq!(browser.storage.settings.image_cache_capacity_mb, 24);
+        assert_eq!(browser.image_cache.capacity(), 24 * 1024 * 1024);
+        assert_eq!(browser.cache.max_size, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn moderate_pressure_sleeps_but_does_not_discard() {
+        let mut browser = Browser::new_in_memory();
+        let html = format!(
+            "<main>{}</main>",
+            (0..1_000)
+                .map(|index| format!("<p>paragraph {index} with retained content</p>"))
+                .collect::<String>()
+        );
+        for index in 0..4 {
+            browser
+                .load_html(&format!("https://site{index}.test"), &html)
+                .unwrap();
+            if let Some(tab) = browser.active_tab_mut() {
+                tab.last_active_timestamp -= 3_600 + index as i64;
+            }
+        }
+        let before = browser.estimate_memory().total_bytes;
+        let report = browser.relieve_memory_pressure(
+            memory_tracker::MemoryBudget::from_bytes(before.saturating_sub(1), before + 1),
+            2,
+        );
+        assert_eq!(report.level, memory_tracker::MemoryPressureLevel::Moderate);
+        assert!(report.slept_tabs.len() <= 1);
+        assert!(report.discarded_tabs.is_empty());
+    }
+
+    #[test]
+    fn critical_pressure_never_discards_protected_tabs() {
+        let mut browser = Browser::new_in_memory();
+        let html = format!("<main>{}</main>", "<p>large tab content</p>".repeat(2_000));
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            let id = browser.add_tab(
+                &format!("https://site{index}.test"),
+                parser::parse_html(&html),
+                "Memory",
+            );
+            if let Some(tab) = browser.active_tab_mut() {
+                tab.last_active_timestamp -= 7_200 + index as i64;
+            }
+            ids.push(id);
+        }
+        let pinned = ids[0];
+        let audible = ids[1];
+        browser.tabs.get_tab_mut(pinned).unwrap().is_pinned = true;
+        browser.tabs.get_tab_mut(audible).unwrap().is_audible = true;
+        let active = browser.tabs.active_tab_id().unwrap();
+
+        let report =
+            browser.relieve_memory_pressure(memory_tracker::MemoryBudget::from_bytes(1, 2), 2);
+        for id in report.discarded_tabs {
+            assert_ne!(id, active);
+            assert_ne!(id, pinned);
+            assert_ne!(id, audible);
+        }
+        assert!(!browser.is_tab_discarded(active));
+        assert!(!browser.is_tab_discarded(pinned));
+        assert!(!browser.is_tab_discarded(audible));
     }
 
     // Integration test: verify the full image rendering pipeline.

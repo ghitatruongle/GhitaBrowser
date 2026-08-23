@@ -74,6 +74,30 @@ pub struct FetchResult {
     pub set_cookie_headers: Vec<String>,
 }
 
+impl FetchResult {
+    /// Bytes owned directly by a cached response, including binary payloads
+    /// and metadata strings. This deliberately excludes the cache map key,
+    /// which is counted by `ResourceCache` exactly once.
+    pub fn retained_bytes(&self) -> usize {
+        let binary = self.binary_body.as_ref().map_or(0, Vec::capacity);
+        let headers = self.headers.iter().fold(0usize, |total, (name, value)| {
+            total
+                .saturating_add(name.capacity())
+                .saturating_add(value.capacity())
+        });
+        let cookies = self.set_cookie_headers.iter().fold(0usize, |total, value| {
+            total.saturating_add(value.capacity())
+        });
+        std::mem::size_of::<Self>()
+            .saturating_add(self.body.capacity())
+            .saturating_add(binary)
+            .saturating_add(self.url.capacity())
+            .saturating_add(self.content_type.capacity())
+            .saturating_add(headers)
+            .saturating_add(cookies)
+    }
+}
+
 /// Fetch content from a URL using real HTTP/HTTPS via ureq
 pub fn fetch_url(url_str: &str) -> Result<FetchResult, Box<dyn std::error::Error>> {
     // Build request agent
@@ -327,6 +351,9 @@ fn execute_fetch(
 
     // Validate and parse URL
     let mut current = url_str.to_string();
+    // Cookies were built for the original URL's origin; they must not be
+    // replayed on cross-origin redirect hops (or scheme downgrades).
+    let cookie_origin = url::Url::parse(url_str).ok();
     let mut set_cookie_headers: Vec<String> = Vec::new();
     let mut final_response: Option<ureq::Response> = None;
 
@@ -337,13 +364,24 @@ fn execute_fetch(
             return Err(format!("Unsupported URL scheme: {}", scheme).into());
         }
 
-        // Build request with optional cookie header + extra headers
+        // Build request with optional cookie header + extra headers.
+        // The cookie jar is origin-scoped, so attach it only while the hop
+        // stays same-origin with the URL the cookies came from; the same
+        // guard applies to caller-supplied conditional-request headers,
+        // which are meaningless (and leaky) on unrelated hosts.
+        let same_origin = cookie_origin.as_ref().is_some_and(|origin| {
+            origin.scheme() == parsed.scheme()
+                && origin.host_str() == parsed.host_str()
+                && origin.port_or_known_default() == parsed.port_or_known_default()
+        });
         let mut request = agent.get(&current);
-        if let Some(cookie_val) = cookie_header {
+        if let Some(cookie_val) = cookie_header.filter(|_| same_origin) {
             request = request.set("Cookie", cookie_val);
         }
-        for (k, v) in extra_headers {
-            request = request.set(k, v);
+        if same_origin {
+            for (k, v) in extra_headers {
+                request = request.set(k, v);
+            }
         }
         let response = request.call()?;
 
@@ -411,17 +449,7 @@ fn execute_fetch(
     if bytes.len() as u64 > MAX_PAGE_BODY {
         return Err("Page exceeds the 50MB body limit".into());
     }
-    let is_pdf = content_type
-        .split(';')
-        .next()
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/pdf"))
-        || final_url.to_ascii_lowercase().ends_with(".pdf");
     let body_len = bytes.len();
-    let (body, binary_body) = if is_pdf {
-        (String::new(), Some(bytes))
-    } else {
-        (decode_text_response(&bytes, &content_type)?, None)
-    };
     let fetch_time_ms = start.elapsed().as_millis() as u64;
 
     // Log warning if response body is very large
@@ -437,12 +465,52 @@ fn execute_fetch(
         final_url, body_len, fetch_time_ms, status_code
     );
 
+    // Shared finalization: content-type / PDF / charset policy is identical
+    // to the async scheduler path so the two transports can never drift.
+    Ok(finalize_fetch_response(
+        &final_url,
+        status_code,
+        &content_type,
+        headers,
+        bytes,
+        set_cookie_headers,
+        fetch_time_ms,
+        false,
+    )?)
+}
+
+/// Shared response-finalization policy used by BOTH the blocking ureq path
+/// (`execute_fetch`) and the async reqwest scheduler path
+/// (`ReqwestTransport::execute_once`). Keeping the content-type / PDF /
+/// charset split in one place means the two transports can never drift on
+/// how a raw response body becomes a [`FetchResult`].
+#[allow(clippy::too_many_arguments)] // shared by both transports; a struct would churn both call sites
+pub(crate) fn finalize_fetch_response(
+    final_url: &str,
+    status_code: u16,
+    content_type: &str,
+    headers: HashMap<String, String>,
+    bytes: Vec<u8>,
+    set_cookie_headers: Vec<String>,
+    fetch_time_ms: u64,
+    binary_mode: bool,
+) -> Result<FetchResult, String> {
+    let is_pdf = content_type
+        .split(';')
+        .next()
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/pdf"))
+        || final_url.to_ascii_lowercase().ends_with(".pdf");
+    let (body, binary_body) = if binary_mode || is_pdf {
+        (String::new(), Some(bytes))
+    } else {
+        (decode_text_response(&bytes, content_type)?, None)
+    };
     Ok(FetchResult {
         body,
         binary_body,
-        url: final_url,
+        url: final_url.to_string(),
         status_code,
-        content_type,
+        content_type: content_type.to_string(),
         headers,
         fetch_time_ms,
         set_cookie_headers,
@@ -737,7 +805,7 @@ impl ResourceCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            max_size: 1024 * 1024 * 50, // 50MB default
+            max_size: 32 * 1024 * 1024,
             max_entries: 100,
             hits: 0,
             misses: 0,
@@ -746,39 +814,37 @@ impl ResourceCache {
 
     /// Calculate total bytes used by all cached entries
     pub fn total_bytes(&self) -> usize {
-        self.entries.values().map(|e| e.result.body.len()).sum()
+        self.entries.iter().fold(0usize, |total, (key, entry)| {
+            total
+                .saturating_add(key.capacity())
+                .saturating_add(std::mem::size_of::<CacheEntry>())
+                .saturating_add(entry.result.retained_bytes())
+        })
     }
 
     pub fn insert(&mut self, url: &str, result: FetchResult, ttl_secs: u64) {
-        let entry_size = result.body.len();
+        let entry_size = url
+            .len()
+            .saturating_add(std::mem::size_of::<CacheEntry>())
+            .saturating_add(result.retained_bytes());
+        if entry_size > self.max_size || self.max_entries == 0 {
+            return;
+        }
 
         // Evict expired entries first
         self.evict_expired();
+        self.entries.remove(url);
 
         // Enforce max_entries limit - remove oldest if at capacity
         while self.entries.len() >= self.max_entries {
-            if let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.cached_at)
-                .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
-            } else {
+            if !self.remove_oldest() {
                 break;
             }
         }
 
         // Enforce max_size byte limit - remove oldest entries until under limit
         while self.total_bytes() + entry_size > self.max_size && !self.entries.is_empty() {
-            if let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.cached_at)
-                .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
-            } else {
+            if !self.remove_oldest() {
                 break;
             }
         }
@@ -815,6 +881,27 @@ impl ResourceCache {
         self.entries.clear();
         self.hits = 0;
         self.misses = 0;
+    }
+
+    /// Apply a new byte budget and evict oldest entries immediately.
+    pub fn set_max_size(&mut self, bytes: usize) -> usize {
+        let before = self.total_bytes();
+        self.max_size = bytes;
+        while self.total_bytes() > self.max_size && !self.entries.is_empty() {
+            if !self.remove_oldest() {
+                break;
+            }
+        }
+        before.saturating_sub(self.total_bytes())
+    }
+
+    fn remove_oldest(&mut self) -> bool {
+        let oldest = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.cached_at)
+            .map(|(key, _)| key.clone());
+        oldest.is_some_and(|key| self.entries.remove(&key).is_some())
     }
 
     /// Remove expired entries
@@ -956,6 +1043,51 @@ mod tests {
     }
 
     #[test]
+    fn cache_total_bytes_counts_binary_headers_keys_and_cookies() {
+        let mut cache = ResourceCache::new();
+        cache.insert(
+            "https://example.test/file.pdf",
+            FetchResult {
+                body: String::new(),
+                binary_body: Some(vec![7; 1024]),
+                url: "https://example.test/file.pdf".to_string(),
+                status_code: 200,
+                content_type: "application/pdf".to_string(),
+                headers: HashMap::from([("etag".to_string(), "abc".repeat(100))]),
+                fetch_time_ms: 1,
+                set_cookie_headers: vec!["session=value".to_string()],
+            },
+            60,
+        );
+        assert!(cache.total_bytes() > 1024);
+    }
+
+    #[test]
+    fn cache_size_setter_evicts_immediately() {
+        let mut cache = ResourceCache::new();
+        for index in 0..3 {
+            let url = format!("https://example.test/{index}");
+            cache.insert(
+                &url,
+                FetchResult {
+                    body: "x".repeat(1024),
+                    binary_body: None,
+                    url: url.clone(),
+                    status_code: 200,
+                    content_type: "text/plain".to_string(),
+                    headers: HashMap::new(),
+                    fetch_time_ms: 1,
+                    set_cookie_headers: vec![],
+                },
+                60,
+            );
+        }
+        let freed = cache.set_max_size(1_500);
+        assert!(freed > 0);
+        assert!(cache.total_bytes() <= 1_500);
+    }
+
+    #[test]
     fn test_cache_ttl_respects_no_store() {
         let mut headers = HashMap::new();
         headers.insert(
@@ -1064,5 +1196,99 @@ mod tests {
     fn test_is_retryable_error_ureq_format() {
         // ureq status 5xx errors format as "http: server error"
         assert!(is_retryable_error("http: server error"));
+    }
+
+    #[test]
+    fn test_finalize_fetch_response_transport_conformance() {
+        // R7: both transports must apply IDENTICAL response-finalization
+        // policy. The blocking ureq path passes binary_mode=false and the
+        // async reqwest scheduler path passes binary_mode=(ResponseMode::
+        // Binary). Feeding the same raw response through the shared helper
+        // with both flags proves the two transports cannot drift.
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/html".to_string());
+        let bytes = b"<html><body>h\xC3\xA9llo</body></html>".to_vec();
+
+        // Text mode (ureq path): body decoded as UTF-8, no binary payload.
+        let text = finalize_fetch_response(
+            "https://a.example/page",
+            200,
+            "text/html",
+            headers.clone(),
+            bytes.clone(),
+            vec![],
+            12,
+            false,
+        )
+        .unwrap();
+        assert_eq!(text.body, "<html><body>h\u{e9}llo</body></html>");
+        assert!(text.binary_body.is_none());
+
+        // Binary mode (reqwest path with ResponseMode::Binary): raw bytes
+        // preserved, body empty.
+        let binary = finalize_fetch_response(
+            "https://a.example/page",
+            200,
+            "text/html",
+            headers,
+            bytes.clone(),
+            vec![],
+            12,
+            true,
+        )
+        .unwrap();
+        assert_eq!(binary.body, "");
+        assert_eq!(binary.binary_body.as_deref(), Some(bytes.as_slice()));
+        // The two transport paths share every other field verbatim.
+        assert_eq!(text.url, binary.url);
+        assert_eq!(text.status_code, binary.status_code);
+        assert_eq!(text.content_type, binary.content_type);
+        assert_eq!(text.headers, binary.headers);
+        assert_eq!(text.set_cookie_headers, binary.set_cookie_headers);
+    }
+
+    #[test]
+    fn test_finalize_fetch_response_pdf_policy_is_transport_independent() {
+        // PDF detection (mime OR extension) must behave identically no
+        // matter which transport produced the response.
+        let pdf_bytes = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        for (content_type, url, label) in [
+            ("application/pdf", "https://a.example/doc", "mime"),
+            (
+                "application/octet-stream",
+                "https://a.example/doc.pdf",
+                "extension",
+            ),
+        ] {
+            let result = finalize_fetch_response(
+                url,
+                200,
+                content_type,
+                HashMap::new(),
+                pdf_bytes.clone(),
+                vec![],
+                1,
+                false,
+            )
+            .unwrap();
+            assert!(
+                result.binary_body.is_some(),
+                "{label}: PDF must be routed to the binary download path"
+            );
+            assert_eq!(result.body, "");
+        }
+        // Non-PDF content with the same bytes stays text.
+        let text_result = finalize_fetch_response(
+            "https://a.example/doc",
+            200,
+            "text/plain",
+            HashMap::new(),
+            pdf_bytes,
+            vec![],
+            1,
+            false,
+        )
+        .unwrap();
+        assert!(text_result.binary_body.is_none());
     }
 }

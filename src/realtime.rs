@@ -61,6 +61,16 @@ impl WebSocketClient {
     /// never blocks the page/script thread; readiness is observed by polling
     /// `ready_state` or calling `poll_incoming`/`pump_transport`.
     pub fn new(url: impl Into<String>, protocol: Option<&str>) -> Result<Self, String> {
+        Self::with_origin(url, protocol, None)
+    }
+
+    /// Like [`WebSocketClient::new`] but also sends the page origin on the
+    /// handshake so Origin-based server protections work (RFC 6455 SHOULD).
+    pub fn with_origin(
+        url: impl Into<String>,
+        protocol: Option<&str>,
+        origin: Option<String>,
+    ) -> Result<Self, String> {
         let url = url.into();
         let parsed = url::Url::parse(&url).map_err(|_| "Invalid WebSocket URL".to_string())?;
         if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
@@ -81,7 +91,9 @@ impl WebSocketClient {
         let worker_protocol = protocol.clone();
         std::thread::Builder::new()
             .name("ghita-websocket".to_string())
-            .spawn(move || websocket_transport(worker_url, worker_protocol, command_rx, event_tx))
+            .spawn(move || {
+                websocket_transport(worker_url, worker_protocol, origin, command_rx, event_tx)
+            })
             .map_err(|error| format!("Cannot start WebSocket transport: {error}"))?;
 
         Ok(Self {
@@ -121,6 +133,12 @@ impl WebSocketClient {
                 }
                 WebSocketTransportEvent::Sent(bytes) => {
                     self.buffered_amount = self.buffered_amount.saturating_sub(bytes);
+                    // Retire the corresponding queued message; otherwise the
+                    // queue grows forever and every send fails once
+                    // MAX_REALTIME_QUEUE is reached on a healthy socket.
+                    if !self.sent_queue.is_empty() {
+                        self.sent_queue.remove(0);
+                    }
                 }
                 WebSocketTransportEvent::Closed => {
                     self.ready_state = WebSocketReadyState::Closed;
@@ -196,6 +214,7 @@ impl WebSocketClient {
 fn websocket_transport(
     url: String,
     protocol: String,
+    origin: Option<String>,
     commands: Receiver<WebSocketCommand>,
     events: SyncSender<WebSocketTransportEvent>,
 ) {
@@ -212,7 +231,12 @@ fn websocket_transport(
     };
     let mut request = ClientRequestBuilder::new(uri);
     if !protocol.is_empty() {
-        request = request.with_sub_protocol(protocol);
+        request = request.with_sub_protocol(&protocol);
+    }
+    // Servers relying on Origin-based cross-site protections need the page
+    // origin on the handshake (RFC 6455 SHOULD).
+    if let Some(origin) = origin {
+        request = request.with_header("Origin", origin);
     }
     let config = WebSocketConfig::default()
         .read_buffer_size(8 * 1024)
@@ -234,6 +258,14 @@ fn websocket_transport(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // A non-conforming echo silently changing the subprotocol is a protocol
+    // violation; fail instead of adopting it.
+    if !protocol.is_empty() && selected_protocol != protocol {
+        let _ = events.try_send(WebSocketTransportEvent::Error(format!(
+            "server selected unexpected subprotocol {selected_protocol:?}"
+        )));
+        return;
+    }
     let _ = events.try_send(WebSocketTransportEvent::Open(selected_protocol));
 
     loop {
@@ -460,6 +492,10 @@ impl EventSourceClient {
     }
 }
 
+/// Default delay before an EventSource reconnect attempt (spec default 3s),
+/// overridable by the server's `retry:` field.
+const SSE_RECONNECT_DEFAULT_MS: u64 = 3000;
+
 fn eventsource_transport(
     url: String,
     close_rx: Receiver<()>,
@@ -470,81 +506,142 @@ fn eventsource_transport(
         .timeout_read(Duration::from_millis(500))
         .redirects(3)
         .build();
-    let response = match agent
-        .get(&url)
-        .set("Accept", "text/event-stream")
-        .set("Cache-Control", "no-cache")
-        .call()
-    {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = events.try_send(EventSourceTransportEvent::Error(error.to_string()));
-            return;
-        }
-    };
-    let content_type = response.header("Content-Type").unwrap_or("");
-    if !content_type
-        .split(';')
-        .next()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-    {
-        let _ = events.try_send(EventSourceTransportEvent::Error(
-            "EventSource response is not text/event-stream".to_string(),
-        ));
-        return;
-    }
-    let _ = events.try_send(EventSourceTransportEvent::Open);
-    let mut reader = response.into_reader();
-    let mut chunk = [0_u8; 8192];
-    let mut pending = String::new();
+    let mut reconnect_ms = SSE_RECONNECT_DEFAULT_MS;
     let mut last_id = String::new();
+    // WHATWG EventSource: the stream reconnects on any network end or error,
+    // sending Last-Event-ID so the server can resume where it left off.
     loop {
         if close_rx.try_recv().is_ok() {
             let _ = events.try_send(EventSourceTransportEvent::Closed);
             return;
         }
-        match reader.read(&mut chunk) {
-            Ok(0) => {
-                if !pending.trim().is_empty() {
-                    for event in parse_sse_events(&pending, &mut last_id) {
-                        let _ = events.try_send(event);
-                    }
+        let mut request = agent
+            .get(&url)
+            .set("Accept", "text/event-stream")
+            .set("Cache-Control", "no-cache");
+        if !last_id.is_empty() {
+            request = request.set("Last-Event-ID", &last_id);
+        }
+        let response = match request.call() {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = events.try_send(EventSourceTransportEvent::Error(error.to_string()));
+                if !sse_backoff_wait(&close_rx, reconnect_ms) {
+                    let _ = events.try_send(EventSourceTransportEvent::Closed);
+                    return;
                 }
+                continue;
+            }
+        };
+        let content_type = response.header("Content-Type").unwrap_or("");
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
+            let _ = events.try_send(EventSourceTransportEvent::Error(
+                "EventSource response is not text/event-stream".to_string(),
+            ));
+            if !sse_backoff_wait(&close_rx, reconnect_ms) {
                 let _ = events.try_send(EventSourceTransportEvent::Closed);
                 return;
             }
-            Ok(read) => {
-                pending.push_str(&String::from_utf8_lossy(&chunk[..read]));
-                if pending.len() > MAX_SSE_BUFFER_BYTES {
-                    let _ = events.try_send(EventSourceTransportEvent::Error(
-                        "EventSource buffer exceeds 1 MB".to_string(),
-                    ));
-                    return;
-                }
-                while let Some(boundary) = sse_event_boundary(&pending) {
-                    let payload = pending[..boundary].to_string();
-                    let consumed = if pending[boundary..].starts_with("\r\n\r\n") {
-                        boundary + 4
-                    } else {
-                        boundary + 2
-                    };
-                    pending.drain(..consumed);
-                    for event in parse_sse_events(&payload, &mut last_id) {
-                        let _ = events.try_send(event);
-                    }
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => {
-                let _ = events.try_send(EventSourceTransportEvent::Error(error.to_string()));
+            continue;
+        }
+        let _ = events.try_send(EventSourceTransportEvent::Open);
+        let mut reader = response.into_reader();
+        let mut chunk = [0_u8; 8192];
+        // Incremental UTF-8 decoder: multi-byte characters split across read
+        // boundaries used to become U+FFFD in both chunks.
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut pending = String::new();
+        loop {
+            if close_rx.try_recv().is_ok() {
+                let _ = events.try_send(EventSourceTransportEvent::Closed);
                 return;
             }
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    // Flush any buffered partial character, dispatch what is
+                    // queued, then reconnect per spec.
+                    let mut flushed = String::new();
+                    let _ = decoder.decode_to_string(b"", &mut flushed, true);
+                    pending.push_str(&flushed);
+                    if !pending.trim().is_empty() {
+                        for event in parse_sse_events(&pending, &mut last_id) {
+                            sse_dispatch(event, &events, &mut reconnect_ms);
+                        }
+                    }
+                    pending.clear();
+                    let _ = events.try_send(EventSourceTransportEvent::Closed);
+                    break;
+                }
+                Ok(read) => {
+                    pending.reserve(read);
+                    let (_, _, _) =
+                        decoder.decode_to_string(&chunk[..read], &mut pending, false);
+                    if pending.len() > MAX_SSE_BUFFER_BYTES {
+                        let _ = events.try_send(EventSourceTransportEvent::Error(
+                            "EventSource buffer exceeds 1 MB".to_string(),
+                        ));
+                        return;
+                    }
+                    while let Some(boundary) = sse_event_boundary(&pending) {
+                        let payload = pending[..boundary].to_string();
+                        let consumed = if pending[boundary..].starts_with("\r\n\r\n") {
+                            boundary + 4
+                        } else {
+                            boundary + 2
+                        };
+                        pending.drain(..consumed);
+                        for event in parse_sse_events(&payload, &mut last_id) {
+                            sse_dispatch(event, &events, &mut reconnect_ms);
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => {
+                    let _ = events.try_send(EventSourceTransportEvent::Error(error.to_string()));
+                    break;
+                }
+            }
+        }
+        if !sse_backoff_wait(&close_rx, reconnect_ms) {
+            let _ = events.try_send(EventSourceTransportEvent::Closed);
+            return;
         }
     }
+}
+
+/// Forward a parsed transport event, learning `retry:` intervals locally so
+/// reconnections honor the server-requested pacing.
+fn sse_dispatch(
+    event: EventSourceTransportEvent,
+    events: &SyncSender<EventSourceTransportEvent>,
+    reconnect_ms: &mut u64,
+) {
+    if let EventSourceTransportEvent::Retry(milliseconds) = event {
+        *reconnect_ms = milliseconds.clamp(100, 60_000);
+    }
+    let _ = events.try_send(event);
+}
+
+/// Wait out the reconnect delay, aborting early when the stream is closed.
+/// Returns false when the caller should shut down.
+fn sse_backoff_wait(close_rx: &Receiver<()>, delay_ms: u64) -> bool {
+    let waited_for = Duration::from_millis(delay_ms.min(60_000));
+    let deadline = std::time::Instant::now() + waited_for;
+    while std::time::Instant::now() < deadline {
+        if close_rx.try_recv().is_ok() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
 }
 
 fn sse_event_boundary(buffer: &str) -> Option<usize> {

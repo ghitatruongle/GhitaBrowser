@@ -402,12 +402,42 @@ fn cascade_element(
     ancestry: &[crate::css_parser::ElementAncestry],
     is_root: bool,
 ) {
+    cascade_element_with_siblings(
+        element,
+        parent_style,
+        rules,
+        rules_fingerprint,
+        cache,
+        snapshot,
+        ancestry,
+        is_root,
+        &crate::css_parser::SiblingContext::default(),
+    );
+}
+
+/// Real sibling position facts are capped so hostile fan-out cannot make the
+/// traversal quadratic; `+`/`~` rarely need more than a handful of siblings.
+const MAX_PREVIOUS_SIBLING_SUMMARIES: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
+fn cascade_element_with_siblings(
+    element: &Element,
+    parent_style: Option<&ComputedStyle>,
+    rules: &[CssRule],
+    rules_fingerprint: u64,
+    cache: &mut BTreeMap<NodeId, CachedStyle>,
+    snapshot: &mut StyleSnapshot,
+    ancestry: &[crate::css_parser::ElementAncestry],
+    is_root: bool,
+    siblings: &crate::css_parser::SiblingContext,
+) {
     let classes = parse_class_attr(element.get_attr("class").map(String::as_str));
     let element_id = element.get_attr("id").map(String::as_str);
     let parent_fingerprint = parent_style
         .map(inherited_style_fingerprint)
         .unwrap_or_default();
-    let input_fingerprint = fingerprint_element(element, rules_fingerprint, parent_fingerprint);
+    let input_fingerprint =
+        fingerprint_element(element, rules_fingerprint, parent_fingerprint, siblings);
     let style = if let Some(node) = element.node_id {
         if let Some(cached) = cache
             .get(&node)
@@ -416,7 +446,7 @@ fn cascade_element(
             snapshot.hits = snapshot.hits.saturating_add(1);
             cached.style.clone()
         } else {
-            let style = crate::css_parser::compute_computed_style_with_ancestors(
+            let style = crate::css_parser::compute_computed_style_full(
                 &element.tag,
                 &classes,
                 element_id,
@@ -425,6 +455,7 @@ fn cascade_element(
                 &element.attrs,
                 is_root,
                 ancestry,
+                siblings,
             );
             if cache.len() < MAX_STYLE_CACHE_ENTRIES || cache.contains_key(&node) {
                 cache.insert(
@@ -440,7 +471,7 @@ fn cascade_element(
         }
     } else {
         snapshot.misses = snapshot.misses.saturating_add(1);
-        crate::css_parser::compute_computed_style_with_ancestors(
+        crate::css_parser::compute_computed_style_full(
             &element.tag,
             &classes,
             element_id,
@@ -449,6 +480,7 @@ fn cascade_element(
             &element.attrs,
             is_root,
             ancestry,
+            siblings,
         )
     };
     snapshot.nodes = snapshot.nodes.saturating_add(1);
@@ -463,20 +495,52 @@ fn cascade_element(
             },
         );
     }
-    // Extend the ancestry chain for descendants (nearest ancestor first).
+    // Extend the ancestry chain for descendants (nearest ancestor first),
+    // now carrying the real attribute map for ancestor-attr selectors.
     let mut child_ancestry: Vec<crate::css_parser::ElementAncestry> =
         Vec::with_capacity(ancestry.len() + 1);
     child_ancestry.push(crate::css_parser::ElementAncestry {
         tag: element.tag.clone(),
         classes,
         id: element_id.map(str::to_string),
+        attrs: element.attrs.clone(),
     });
     child_ancestry.extend_from_slice(ancestry);
     if child_ancestry.len() > 32 {
         child_ancestry.truncate(32);
     }
+
+    // Compute real sibling facts for each child in one pass. Summaries are
+    // built forward once and borrowed as slices, so the loop stays linear.
+    let total_siblings = element.children.len();
+    let mut type_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
     for child in &element.children {
-        cascade_element(
+        *type_counts.entry(child.tag.as_str()).or_insert(0) += 1;
+    }
+    let mut type_seen: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    // Forward document-order summaries; a child borrows the sub-slice before
+    // its own entry is pushed (the last entry is its nearest prior sibling).
+    let mut forward_summaries: Vec<crate::css_parser::ElementAncestry> = Vec::new();
+    for (index, child) in element.children.iter().enumerate() {
+        let type_index = {
+            let seen = type_seen.entry(child.tag.as_str()).or_insert(0);
+            *seen += 1;
+            *seen
+        };
+        let window_start = forward_summaries
+            .len()
+            .saturating_sub(MAX_PREVIOUS_SIBLING_SUMMARIES);
+        let child_siblings = crate::css_parser::SiblingContext {
+            index_in_parent: index + 1,
+            siblings_after: total_siblings - index - 1,
+            total_siblings,
+            type_index_in_parent: type_index,
+            total_type_siblings: type_counts.get(child.tag.as_str()).copied().unwrap_or(1),
+            previous_siblings: &forward_summaries[window_start..],
+        };
+        cascade_element_with_siblings(
             child,
             Some(&style),
             rules,
@@ -485,7 +549,14 @@ fn cascade_element(
             snapshot,
             &child_ancestry,
             false,
+            &child_siblings,
         );
+        forward_summaries.push(crate::css_parser::ElementAncestry {
+            tag: child.tag.clone(),
+            classes: parse_class_attr(child.get_attr("class").map(String::as_str)),
+            id: child.get_attr("id").map(|value| value.to_string()),
+            attrs: child.attrs.clone(),
+        });
     }
 }
 
@@ -596,7 +667,12 @@ fn fingerprint_rules(rules: &[CssRule]) -> u64 {
     hasher.finish()
 }
 
-fn fingerprint_element(element: &Element, rules: u64, parent: u64) -> u64 {
+fn fingerprint_element(
+    element: &Element,
+    rules: u64,
+    parent: u64,
+    siblings: &crate::css_parser::SiblingContext,
+) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     rules.hash(&mut hasher);
     parent.hash(&mut hasher);
@@ -607,6 +683,16 @@ fn fingerprint_element(element: &Element, rules: u64, parent: u64) -> u64 {
     for (name, value) in attrs {
         name.hash(&mut hasher);
         value.hash(&mut hasher);
+    }
+    // Sibling position participates in style (nth-child etc.), so moving a
+    // node must invalidate its cached computed style.
+    siblings.index_in_parent.hash(&mut hasher);
+    siblings.total_siblings.hash(&mut hasher);
+    siblings.type_index_in_parent.hash(&mut hasher);
+    siblings.total_type_siblings.hash(&mut hasher);
+    for prev in siblings.previous_siblings {
+        prev.tag.hash(&mut hasher);
+        prev.classes.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -619,7 +705,15 @@ fn inherited_style_fingerprint(style: &ComputedStyle) -> u64 {
     style.font_weight.hash(&mut hasher);
     style.font_style.hash(&mut hasher);
     style.text_align.hash(&mut hasher);
-    style.line_height.map(f64::to_bits).hash(&mut hasher);
+    match style.line_height {
+        // Hash the discriminant so a Multiplier and an Absolute with equal
+        // bits never collide.
+        Some(line_height) => {
+            std::mem::discriminant(&line_height).hash(&mut hasher);
+            format!("{:?}", line_height).hash(&mut hasher);
+        }
+        None => 0u8.hash(&mut hasher),
+    };
     hasher.finish()
 }
 

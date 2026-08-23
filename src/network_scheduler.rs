@@ -268,29 +268,19 @@ impl ReqwestTransport {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let is_pdf = content_type
-                .split(';')
-                .next()
-                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/pdf"))
-                || final_url.to_ascii_lowercase().ends_with(".pdf");
-            let (body, binary_body) = if request.response_mode == ResponseMode::Binary || is_pdf {
-                (String::new(), Some(bytes))
-            } else {
-                (
-                    crate::network::decode_text_response(&bytes, &content_type)?,
-                    None,
-                )
-            };
-            return Ok(FetchResult {
-                body,
-                binary_body,
-                url: final_url,
+            // Shared finalization: content-type / PDF / charset policy is
+            // identical to the blocking ureq path so the two transports can
+            // never drift on how a body becomes a FetchResult.
+            return crate::network::finalize_fetch_response(
+                &final_url,
                 status_code,
-                content_type,
+                &content_type,
                 headers,
-                fetch_time_ms: started.elapsed().as_millis() as u64,
+                bytes,
                 set_cookie_headers,
-            });
+                started.elapsed().as_millis() as u64,
+                request.response_mode == ResponseMode::Binary,
+            );
         }
         Err(format!("too many redirects for {}", request.url))
     }

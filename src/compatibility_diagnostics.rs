@@ -84,6 +84,112 @@ pub struct CompatibilityReport {
     pub generated_at_unix: u64,
 }
 
+/// Release-gate outcome shared by offline fixtures, live probes, and the UI.
+/// A readable fallback is an explicit success mode for sites that exceed the
+/// browser's bounded Web Platform profile; it must never be reported as full
+/// compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompatibilityOutcome {
+    Usable,
+    ReadableFallback,
+    Broken,
+    TimedOut,
+}
+
+/// Redacted live-probe error category. Reports never persist the transport's
+/// raw error string because it can contain a sensitive URL or query value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompatibilityProbeSafeError {
+    TimedOut,
+    NavigationFailed,
+    RenderFailed,
+}
+
+impl CompatibilityProbeSafeError {
+    pub fn from_internal_error(error: &str) -> Self {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("timeout") || lower.contains("timed out") {
+            Self::TimedOut
+        } else if lower.contains("layout") || lower.contains("render") {
+            Self::RenderFailed
+        } else {
+            Self::NavigationFailed
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompatibilitySummary {
+    pub total: usize,
+    pub usable: usize,
+    pub readable_fallback: usize,
+    pub broken: usize,
+    pub timed_out: usize,
+    pub usable_percent: f64,
+    pub passed: bool,
+}
+
+/// Classify a compatibility report using the personal-release budgets.
+pub fn evaluate_compatibility_outcome(
+    report: &CompatibilityReport,
+    rendered_text: &str,
+    elapsed_ms: u64,
+) -> CompatibilityOutcome {
+    if elapsed_ms > 45_000 {
+        return CompatibilityOutcome::TimedOut;
+    }
+
+    let text_bytes = rendered_text.trim().len();
+    match &report.status {
+        CompatibilityStatus::FullyCompatible
+            if text_bytes >= 256
+                && report.layout.layout_boxes >= 5
+                && report.layout.blank_content_ratio <= 0.98 =>
+        {
+            CompatibilityOutcome::Usable
+        }
+        CompatibilityStatus::DegradedShell { .. } if text_bytes >= 128 => {
+            CompatibilityOutcome::ReadableFallback
+        }
+        _ => CompatibilityOutcome::Broken,
+    }
+}
+
+pub fn summarize_compatibility(outcomes: &[CompatibilityOutcome]) -> CompatibilitySummary {
+    let total = outcomes.len();
+    let usable = outcomes
+        .iter()
+        .filter(|outcome| **outcome == CompatibilityOutcome::Usable)
+        .count();
+    let readable_fallback = outcomes
+        .iter()
+        .filter(|outcome| **outcome == CompatibilityOutcome::ReadableFallback)
+        .count();
+    let broken = outcomes
+        .iter()
+        .filter(|outcome| **outcome == CompatibilityOutcome::Broken)
+        .count();
+    let timed_out = outcomes
+        .iter()
+        .filter(|outcome| **outcome == CompatibilityOutcome::TimedOut)
+        .count();
+    let usable_percent = if total == 0 {
+        0.0
+    } else {
+        ((usable + readable_fallback) as f64 / total as f64) * 100.0
+    };
+
+    CompatibilitySummary {
+        total,
+        usable,
+        readable_fallback,
+        broken,
+        timed_out,
+        usable_percent,
+        passed: total > 0 && timed_out == 0 && usable_percent >= 90.0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestFixtureEntry {
     pub path: String,
@@ -390,4 +496,68 @@ pub fn verify_acceptance_manifest(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_report(status: CompatibilityStatus) -> CompatibilityReport {
+        CompatibilityReport {
+            url: "https://example.test/".to_string(),
+            status,
+            css: CssTelemetry::default(),
+            runtime: RuntimeTelemetry::default(),
+            layout: LayoutTelemetry {
+                layout_boxes: 8,
+                blank_content_ratio: 0.7,
+                ..LayoutTelemetry::default()
+            },
+            media: None,
+            generated_at_unix: 0,
+        }
+    }
+
+    #[test]
+    fn compatibility_outcome_accepts_render_or_readable_fallback() {
+        let usable = sample_report(CompatibilityStatus::FullyCompatible);
+        assert_eq!(
+            evaluate_compatibility_outcome(&usable, &"x".repeat(256), 50),
+            CompatibilityOutcome::Usable
+        );
+
+        let fallback = sample_report(CompatibilityStatus::DegradedShell {
+            reason: "unsupported hydration".to_string(),
+        });
+        assert_eq!(
+            evaluate_compatibility_outcome(&fallback, &"x".repeat(128), 50),
+            CompatibilityOutcome::ReadableFallback
+        );
+    }
+
+    #[test]
+    fn compatibility_summary_enforces_timeout_and_ninety_percent() {
+        let passing = summarize_compatibility(&[
+            CompatibilityOutcome::Usable,
+            CompatibilityOutcome::Usable,
+            CompatibilityOutcome::ReadableFallback,
+        ]);
+        assert!(passing.passed);
+
+        let timed_out = summarize_compatibility(&[
+            CompatibilityOutcome::Usable,
+            CompatibilityOutcome::TimedOut,
+        ]);
+        assert!(!timed_out.passed);
+    }
+
+    #[test]
+    fn probe_errors_are_reduced_to_safe_categories() {
+        assert_eq!(
+            CompatibilityProbeSafeError::from_internal_error(
+                "request Timeout for https://example.test/?token=secret"
+            ),
+            CompatibilityProbeSafeError::TimedOut
+        );
+    }
 }

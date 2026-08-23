@@ -1,7 +1,8 @@
 use ghitabrowser::css_parser::{
-    compute_computed_style, eval_math_expression, get_css_diagnostics, parse_css, parse_css_color,
-    parse_css_with_media, record_unsupported_property, reset_css_diagnostics,
-    supports_query_matches, CssUnit, ElementAncestry, ElementMatchingContext, Selector,
+    compute_computed_style, compute_computed_style_full, compute_computed_style_with_ancestors,
+    eval_math_expression, get_css_diagnostics, parse_css, parse_css_color, parse_css_with_media,
+    record_unsupported_property, reset_css_diagnostics, supports_query_matches, CssUnit,
+    ElementAncestry, ElementMatchingContext, Selector,
 };
 use std::collections::HashMap;
 
@@ -98,11 +99,13 @@ fn test_combinators_child_and_descendant() {
             tag: "ul".to_string(),
             classes: vec![],
             id: None,
+            attrs: Default::default(),
         },
         ElementAncestry {
             tag: "nav".to_string(),
             classes: vec![],
             id: None,
+            attrs: Default::default(),
         },
     ];
     let attrs = HashMap::new();
@@ -114,16 +117,19 @@ fn test_combinators_child_and_descendant() {
             tag: "div".to_string(),
             classes: vec!["wrapper".to_string()],
             id: None,
+            attrs: Default::default(),
         },
         ElementAncestry {
             tag: "section".to_string(),
             classes: vec![],
             id: None,
+            attrs: Default::default(),
         },
         ElementAncestry {
             tag: "article".to_string(),
             classes: vec![],
             id: None,
+            attrs: Default::default(),
         },
     ];
     let p_ctx = ElementMatchingContext::simple("p", &[], None, &attrs, false, &deep_ancestry);
@@ -370,4 +376,128 @@ fn test_wikipedia_sample_stylesheet() {
     );
     assert_eq!(button_style.background_color.as_deref(), Some("#3366cc"));
     assert_eq!(button_style.color.as_deref(), Some("#ffffff"));
+}
+
+#[test]
+fn nth_child_matches_real_sibling_position() {
+    let rules = parse_css("li:nth-child(2) { color: red; }");
+    let classes: Vec<String> = Vec::new();
+    let attrs = HashMap::new();
+
+    let second = ghitabrowser::css_parser::SiblingContext {
+        index_in_parent: 2,
+        siblings_after: 1,
+        total_siblings: 3,
+        type_index_in_parent: 2,
+        total_type_siblings: 3,
+        ..Default::default()
+    };
+
+    let matched =
+        compute_computed_style_full("li", &classes, None, &rules, None, &attrs, false, &[], &second);
+    assert_eq!(
+        matched.color.as_deref(),
+        Some("red"),
+        ":nth-child(2) must match the actual second child"
+    );
+
+    let first = compute_computed_style_full(
+        "li",
+        &classes,
+        None,
+        &rules,
+        None,
+        &attrs,
+        false,
+        &[],
+        &Default::default(),
+    );
+    assert_ne!(
+        first.color.as_deref(),
+        Some("red"),
+        "defaults must no longer make every element match :nth-child(2)"
+    );
+}
+
+#[test]
+fn adjacent_sibling_combinator_requires_matching_previous_sibling() {
+    let rules = parse_css("h2 + p { color: red; }");
+    let classes: Vec<String> = Vec::new();
+    let attrs = HashMap::new();
+
+    let after_h2 = ghitabrowser::css_parser::SiblingContext {
+        previous_siblings: &[ElementAncestry {
+            tag: "h2".into(),
+            classes: Vec::new(),
+            id: None,
+            attrs: Default::default(),
+        }],
+        ..Default::default()
+    };
+    let matched = compute_computed_style_full(
+        "p", &classes, None, &rules, None, &attrs, false, &[], &after_h2,
+    );
+    assert_eq!(matched.color.as_deref(), Some("red"), "p after h2 must match");
+
+    let after_div = ghitabrowser::css_parser::SiblingContext {
+        previous_siblings: &[ElementAncestry {
+            tag: "div".into(),
+            classes: Vec::new(),
+            id: None,
+            attrs: Default::default(),
+        }],
+        ..Default::default()
+    };
+    let unmatched = compute_computed_style_full(
+        "p", &classes, None, &rules, None, &attrs, false, &[], &after_div,
+    );
+    assert_ne!(
+        unmatched.color.as_deref(),
+        Some("red"),
+        "p after a div must not match h2 + p"
+    );
+}
+
+#[test]
+fn grouped_rule_cascades_with_highest_matching_specificity() {
+    // Both selectors of rule 1 match; the cascade must use #i p (1,0,1),
+    // not .a (0,1,0), so it beats the two-class competitor.
+    let rules = parse_css(".a, #i p { color: red; } p.a.b { color: blue; }");
+    let classes: Vec<String> = vec!["a".into(), "b".into()];
+    let attrs = HashMap::new();
+    let ancestry = [ElementAncestry {
+        tag: "body".into(),
+        classes: Vec::new(),
+        id: Some("i".into()),
+        attrs: Default::default(),
+    }];
+    let style = compute_computed_style_with_ancestors(
+        "p", &classes, None, &rules, None, &attrs, false, &ancestry,
+    );
+    assert_eq!(
+        style.color.as_deref(),
+        Some("red"),
+        "#i p (1,0,1) must win over p.a.b (0,2,0) via grouped max-specificity"
+    );
+}
+
+#[test]
+fn ancestor_attribute_selectors_match_against_real_attrs() {
+    let rules = parse_css("form[action] input { color: red; }");
+    let classes: Vec<String> = Vec::new();
+    let attrs = HashMap::new();
+    let ancestry = [ElementAncestry {
+        tag: "form".into(),
+        classes: Vec::new(),
+        id: None,
+        attrs: [("action".to_string(), "/submit".to_string())].into_iter().collect(),
+    }];
+    let style = compute_computed_style_with_ancestors(
+        "input", &classes, None, &rules, None, &attrs, false, &ancestry,
+    );
+    assert_eq!(
+        style.color.as_deref(),
+        Some("red"),
+        "ancestor attribute maps are now real, so form[action] matches"
+    );
 }

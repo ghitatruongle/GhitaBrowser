@@ -108,8 +108,10 @@ windows = { version = "0.52", features = [
     "Win32_Security_WinTrust",
     "Win32_Security_Credentials",
     "Win32_Networking_WindowsWebServices",
+    "Win32_Storage",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_System_Registry",
     "Win32_System_ProcessStatus",
@@ -127,10 +129,22 @@ winres = "0.1"
 criterion = "0.5"
 rstest = "0.18"
 
+[profile.dev]
+debug = 0
+incremental = false
+split-debuginfo = "off"
+
+[profile.test]
+debug = 0
+incremental = false
+split-debuginfo = "off"
+
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# Temporary for this machine: full LTO exhausts the paging file during the
+# final link (rustc-LLVM out of memory). Thin LTO keeps most of the benefit.
+lto = "thin"
+codegen-units = 16
 strip = true
 
 [[bench]]

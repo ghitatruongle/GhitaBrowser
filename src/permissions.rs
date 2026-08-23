@@ -102,7 +102,11 @@ fn canonical_permission_origin(input: &str) -> Option<String> {
     let parsed = url::Url::parse(input).ok()?;
     let trustworthy = parsed.scheme() == "https"
         || (parsed.scheme() == "http"
-            && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1")));
+            // The url crate returns IPv6 hosts with brackets.
+            && matches!(
+                parsed.host_str(),
+                Some("localhost" | "127.0.0.1" | "[::1]")
+            ));
     trustworthy
         .then(|| parsed.origin().ascii_serialization())
         .filter(|origin| origin.len() <= 4096)

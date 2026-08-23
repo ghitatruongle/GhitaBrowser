@@ -3158,7 +3158,12 @@ impl JsvHost for RuntimeHost<'_> {
                 );
             }
             let protocol = arguments.get(1).map(|value| value.to_display_string());
-            let socket = crate::realtime::WebSocketClient::new(target, protocol.as_deref())?;
+            let origin = runtime_origin(&self.state.current_url);
+            let socket = crate::realtime::WebSocketClient::with_origin(
+                target,
+                protocol.as_deref(),
+                (origin != "null").then_some(origin),
+            )?;
             let handle = self.allocate_platform_handle()?;
             self.state.web_sockets.insert(handle, socket);
             self.record_platform_operation(format!("WebSocket.open {}", parsed));
@@ -4417,11 +4422,12 @@ impl JsvHost for RuntimeHost<'_> {
                 self.record_platform_operation(format!("window.alert: {msg}"));
                 Ok(JsvValue::Undefined)
             }
-            (HOST_WINDOW, "confirm") => {
-                Ok(JsvValue::Boolean(true))
-            }
+            (HOST_WINDOW, "confirm") => Ok(JsvValue::Boolean(true)),
             (HOST_WINDOW, "prompt") => {
-                let default_val = arguments.get(1).map(|a| a.to_display_string()).unwrap_or_default();
+                let default_val = arguments
+                    .get(1)
+                    .map(|a| a.to_display_string())
+                    .unwrap_or_default();
                 Ok(JsvValue::String(default_val))
             }
             (HOST_WINDOW, "atob") => {
@@ -4429,12 +4435,8 @@ impl JsvHost for RuntimeHost<'_> {
                     .first()
                     .map(|a| a.to_display_string())
                     .unwrap_or_default();
-                let decoded = String::from_utf8(
-                    input
-                        .bytes()
-                        .collect::<Vec<u8>>(),
-                )
-                .unwrap_or(input);
+                let decoded =
+                    String::from_utf8(input.bytes().collect::<Vec<u8>>()).unwrap_or(input);
                 Ok(JsvValue::String(decoded))
             }
             (HOST_WINDOW, "btoa") => {
@@ -4456,8 +4458,18 @@ impl JsvHost for RuntimeHost<'_> {
                         }
                     }
                     JsvValue::TypedArray(arr) => {
-                        let borrowed = arr.borrow();
-                        for byte in borrowed.buffer.borrow_mut().bytes.iter_mut() {
+                        let view = arr.borrow();
+                        // Only the view's own region may be written: a small
+                        // subarray view used to randomize the WHOLE backing
+                        // buffer, corrupting sibling views.
+                        let start = view.byte_offset;
+                        let end = start.saturating_add(view.length);
+                        let mut buffer = view.buffer.borrow_mut();
+                        let region = buffer
+                            .bytes
+                            .get_mut(start..end)
+                            .ok_or_else(|| "RangeError: invalid typed array view".to_string())?;
+                        for byte in region.iter_mut() {
                             *byte = random_u8();
                         }
                     }
@@ -4465,9 +4477,7 @@ impl JsvHost for RuntimeHost<'_> {
                 }
                 Ok(arg.clone())
             }
-            (HOST_CRYPTO, "randomUUID") => {
-                Ok(JsvValue::String(random_uuid_v4()))
-            }
+            (HOST_CRYPTO, "randomUUID") => Ok(JsvValue::String(random_uuid_v4())),
             (HOST_PERFORMANCE, "now") => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -5798,7 +5808,17 @@ impl PageRuntime {
         let _ = self.dispatch_custom_event(doc_root, "DOMContentLoaded", None, true);
 
         // 4. Dispatch load on window
-        let _ = self.dispatch_custom_event(LISTENER_WINDOW, "load", None, false);
+        // Route through the pending queue: the sentinel needs the
+        // special-case in flush, same as popstate/hashchange.
+        if self.state.pending_dispatches.len() >= MAX_PENDING_TASKS {
+            self.report.truncated = true;
+        } else {
+            self.state.pending_dispatches.push(PendingDispatch {
+                node: LISTENER_WINDOW,
+                event_type: "load".to_string(),
+                detail: None,
+            });
+        }
 
         Ok(())
     }
@@ -6513,9 +6533,16 @@ impl PageRuntime {
 
     /// Drain all pending timers and dispatches and return the current DOM.
     pub fn settle(mut self) -> Element {
-        while !self.state.timers.is_empty() && self.pump_timers(MAX_TIMER_DELAY_MS).unwrap_or(0) > 0
-        {
-            // Drain until the queue is empty or a budget error stops it.
+        // Interval timers re-arm on every pump, so the queue may never empty;
+        // a hard pump cap keeps this bounded while draining normal pages.
+        let mut pumps = 0usize;
+        const MAX_SETTLE_PUMPS: usize = 10_000;
+        while !self.state.timers.is_empty() && pumps < MAX_SETTLE_PUMPS {
+            let fired = self.pump_timers(MAX_TIMER_DELAY_MS).unwrap_or(0);
+            if fired == 0 {
+                break;
+            }
+            pumps += 1;
         }
         self.dom_element()
     }

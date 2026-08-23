@@ -701,14 +701,15 @@ fn validate_code(code: &[u8]) -> Result<usize, String> {
                 cursor.read_leb_u32()?;
             }
             0x11 => {
-                let count = cursor.read_leb_u32()?;
-                if count > 1_024 {
-                    return Err("call_indirect type budget exceeded".to_string());
+                // call_indirect: exactly two LEB u32 immediates — type index
+                // and the reserved table index (MVP requires 0). The old
+                // br_table-shaped parse consumed extra bytes, shifting every
+                // subsequent opcode boundary during validation.
+                let _type_index = cursor.read_leb_u32()?;
+                let table_index = cursor.read_leb_u32()?;
+                if table_index != 0 {
+                    return Err("call_indirect reserved table index must be zero".to_string());
                 }
-                for _ in 0..count {
-                    cursor.read_leb_u32()?;
-                }
-                cursor.read_leb_u32()?;
             }
             0x12 | 0x13 => {
                 cursor.read_leb_u32()?;

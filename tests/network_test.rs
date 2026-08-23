@@ -41,11 +41,12 @@ fn test_resource_cache_expiration() {
 #[test]
 fn test_resource_cache_size_limit() {
     let mut cache = ResourceCache::new();
-    cache.max_size = 100;
+    cache.set_max_size(100);
 
     let large_body = "x".repeat(200);
     let result = make_fetch_result(&large_body, "https://large.com");
     cache.insert("https://large.com", result, 3600);
 
-    assert!(cache.get("https://large.com").is_some());
+    assert!(cache.get("https://large.com").is_none());
+    assert!(cache.total_bytes() <= 100);
 }

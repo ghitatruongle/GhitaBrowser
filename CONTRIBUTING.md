@@ -12,7 +12,16 @@ cargo fmt --all -- --check
 cargo check --all-targets --locked
 cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
+
+# Centralized tiers with one build job and JSON metrics
+.\tools\test.ps1 -Tier fast
+.\tools\test.ps1 -Tier release
+.\tools\test.ps1 -Tier full
 ```
+
+The clean-workspace budget for `target/debug` is below 8 GB. Inspect the latest
+file in `dist/build-metrics` when changing build profiles; do not delete another
+developer's artifacts to satisfy the budget.
 
 Changes affecting parsing, layout, networking, storage or untrusted input should
 also add a bounded/adversarial regression test. Performance-sensitive changes

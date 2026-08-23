@@ -14,12 +14,22 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # rustc 1.97.1 races on this dependency graph when Cargo builds many test
+  # targets in parallel (intermittent "crate X required to be available in
+  # rlib format"). Cap jobs and disable incremental so check/test artifacts
+  # cannot get out of sync. Locally, `cargo test -j 1` is the fully-verified
+  # invocation.
+  CARGO_BUILD_JOBS: 1
+  CARGO_INCREMENTAL: 0
+  # Deep but legitimate page recursion in debug JS needs more than the
+  # default 2 MB test-thread stack (see MAX_CALL_DEPTH in javascript.rs).
+  RUST_MIN_STACK: 16777216
 
 jobs:
   quality:
     name: Quality and tests
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Install pinned Rust toolchain
@@ -30,24 +40,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Formatting
         run: cargo fmt --all -- --check
-      - name: Check every target
-        run: cargo check --all-targets --locked
+      - name: Test every target (builds all targets once; jobs capped in env)
+        run: cargo test --all-targets --locked -j 1
       - name: Audit dependency license metadata
         shell: pwsh
         run: ./tools/audit-licenses.ps1
       - name: Audit RustSec vulnerabilities
         shell: pwsh
         run: ./tools/audit-rustsec.ps1
-      - name: Test every target
-        run: cargo test --all-targets --locked
       - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -j 1 -- -D warnings
 
   release:
     name: Release artifact
     needs: quality
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Install pinned Rust toolchain
@@ -55,18 +63,35 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2
+      - name: Resolve package version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build release
-        run: cargo build --release --locked
+        run: cargo build --release --locked -j 1
+      - name: Generate frozen source manifest (phase29)
+        shell: pwsh
+        run: ./tools/make-source-manifest.ps1 -OutputPath ./phase29-freeze.json -ReleaseVersion $env:RELEASE_VERSION
       - name: Stage portable files
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path portable | Out-Null
           Copy-Item target/release/ghitabrowser.exe portable/GhitaBrowser.exe
           Copy-Item target/release/ghita-renderer-worker.exe portable/
+          Copy-Item target/release/ghita-browser-child.exe portable/
           Copy-Item icon.ico,LICENSE,README.md,THIRD_PARTY_NOTICES.md portable/
       - name: Upload portable artifact
         uses: actions/upload-artifact@v7
         with:
-          name: GhitaBrowser-v2.0.0-windows-x64
+          name: GhitaBrowser-${{ env.RELEASE_VERSION }}-windows-x64
           path: portable/
+          if-no-files-found: error
+      - name: Upload release evidence (freeze manifest)
+        uses: actions/upload-artifact@v7
+        with:
+          name: phase29-release-evidence
+          path: |
+            phase29-freeze.json
+            phase29-freeze.json.sha256.txt
           if-no-files-found: error

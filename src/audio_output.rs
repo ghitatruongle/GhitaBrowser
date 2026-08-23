@@ -100,6 +100,9 @@ pub struct WindowsWasapiSink {
     max_samples: usize,
     pending: VecDeque<i16>,
     running: bool,
+    /// User-intent pause. Without it any pump() that found buffer room
+    /// restarted playback (auto-start), defeating pause entirely.
+    paused: bool,
     com_initialized: bool,
 }
 
@@ -113,6 +116,34 @@ impl std::fmt::Debug for WindowsWasapiSink {
             .field("queued_samples", &self.pending.len())
             .field("running", &self.running)
             .finish()
+    }
+}
+
+/// RAII balance for CoInitializeEx inside `open`: every early error return
+/// previously leaked one apartment reference per attempt (the UI retries
+/// opens on each playback attempt).
+#[cfg(target_os = "windows")]
+struct ComApartmentGuard {
+    armed: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl ComApartmentGuard {
+    fn acquire(initialized: bool) -> Self {
+        Self { armed: initialized }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ComApartmentGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
     }
 }
 
@@ -130,6 +161,7 @@ impl WindowsWasapiSink {
 
         validate_format(sample_rate_hz, channels)?;
         let com_initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        let apartment_guard = ComApartmentGuard::acquire(com_initialized);
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .map_err(|error| format!("Cannot create WASAPI device enumerator: {error}"))?;
@@ -166,6 +198,8 @@ impl WindowsWasapiSink {
             .unwrap_or(usize::MAX)
             .saturating_mul(usize::from(channels))
             .saturating_mul(2);
+        // The sink's own Drop now balances CoUninitialize; stop the guard.
+        apartment_guard.disarm();
         Ok(Self {
             client,
             render,
@@ -174,12 +208,13 @@ impl WindowsWasapiSink {
             max_samples,
             pending: VecDeque::new(),
             running: false,
+            paused: false,
             com_initialized,
         })
     }
 
     pub fn pump(&mut self) -> Result<usize, String> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() || self.paused {
             return Ok(0);
         }
         let buffer_frames = unsafe { self.client.GetBufferSize() }
@@ -240,6 +275,7 @@ impl AudioSink for WindowsWasapiSink {
     }
 
     fn pause(&mut self) -> Result<(), String> {
+        self.paused = true;
         if self.running {
             unsafe { self.client.Stop() }
                 .map_err(|error| format!("Cannot pause WASAPI playback: {error}"))?;
@@ -249,6 +285,9 @@ impl AudioSink for WindowsWasapiSink {
     }
 
     fn resume(&mut self) -> Result<(), String> {
+        // resume() is the ONLY path that restarts the stream; pump()'s
+        // auto-start no longer overrides an explicit user pause.
+        self.paused = false;
         if !self.running && !self.pending.is_empty() {
             let _ = self.pump()?;
         }

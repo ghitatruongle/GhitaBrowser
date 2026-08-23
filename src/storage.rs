@@ -82,8 +82,10 @@ impl Cookie {
                         // server could set a cookie for an unrelated site (or
                         // a bare public suffix like ".com"). Invalid domains
                         // are ignored, which makes this a host-only cookie.
-                        let d = val.trim_start_matches('.');
-                        if is_domain_suffix(d, default_domain) {
+                        // The stored key must be lowercase: jar lookups
+                        // compare against the (always lowercase) host.
+                        let d = val.trim_start_matches('.').to_ascii_lowercase();
+                        if is_domain_suffix(&d, default_domain) {
                             domain = format!(".{}", d);
                         }
                     }
@@ -206,29 +208,26 @@ impl Cookie {
     }
 }
 
-/// RFC 6265 domain-match: `domain` equals `host` or is a subdomain of it,
-/// compared case-insensitively. Bare labels / public suffixes (no dot, e.g.
-/// `com` or `co.uk`) are never accepted so a cookie can never claim an
-/// entire TLD.
+/// RFC 6265 §5.3 step 5-6: a Domain attribute equal to (a suffix of) the
+/// host is only accepted when it is NOT itself a public suffix, so a cookie
+/// can never claim an entire TLD or shared hosting suffix like `github.io`.
 fn is_domain_suffix(domain: &str, host: &str) -> bool {
-    if domain.is_empty() || !domain.contains('.') {
+    if domain.is_empty() {
         return false;
     }
     let domain = domain.to_ascii_lowercase();
     let host = host.to_ascii_lowercase();
-    domain == host || host.ends_with(&format!(".{}", domain))
+    if domain != host && !host.ends_with(&format!(".{}", domain)) {
+        return false;
+    }
+    !crate::public_suffix::is_public_suffix(&domain)
 }
 
-/// Approximate "registrable domain" (eTLD+1) with a two-label heuristic —
-/// good enough for SameSite checks on the ordinary web without shipping a
-/// public-suffix list. `www.example.co.uk` → `co.uk` here, which errs on
-/// the side of treating those as the same site (acceptable for this check).
+/// Registrable domain (eTLD+1) via the bundled Public Suffix List. Falls
+/// back to the host itself when no registrable part exists (single-label or
+/// public-suffix hosts), which errs toward same-site for SameSite checks.
 fn registrable_domain(host: &str) -> String {
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() <= 2 {
-        return host.to_string();
-    }
-    labels[labels.len() - 2..].join(".")
+    crate::public_suffix::registrable_domain(host).unwrap_or_else(|| host.to_string())
 }
 
 /// Parse a standard HTTP-date (RFC 7231) such as
@@ -523,6 +522,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_memory_saver_threshold_minutes() -> u32 {
+    5
+}
+
+fn default_memory_soft_limit_mb() -> u32 {
+    400
+}
+
+fn default_memory_hard_limit_mb() -> u32 {
+    500
+}
+
+fn default_image_cache_capacity_mb() -> u32 {
+    24
+}
+
 /// User-facing browser settings (Chrome-style preferences)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserSettings {
@@ -556,19 +571,29 @@ pub struct BrowserSettings {
     pub tab_memory_saver: bool,
     /// Inactivity threshold in minutes before a tab is put to sleep (0 = never).
     /// Default 5 minutes, matching Chrome's Memory Saver default.
-    #[serde(default)]
+    #[serde(default = "default_memory_saver_threshold_minutes")]
     pub memory_saver_threshold_minutes: u32,
+    /// Soft pressure threshold. Cache eviction and one inactive-tab sleep are
+    /// attempted before destructive discarding is considered.
+    #[serde(default = "default_memory_soft_limit_mb")]
+    pub memory_soft_limit_mb: u32,
     /// Memory pressure threshold in MB. When estimated browser memory exceeds this,
     /// the least important tab is discarded. 0 = disabled. Default 500 MB.
-    #[serde(default)]
+    #[serde(default = "default_memory_hard_limit_mb")]
     pub memory_pressure_threshold_mb: u32,
-    /// Image cache capacity in MB. Default 50 MB. Images are evicted using
+    /// Image cache capacity in MB. Default 24 MB. Images are evicted using
     /// LRU (Least Recently Used) when this limit is reached.
-    #[serde(default)]
+    #[serde(default = "default_image_cache_capacity_mb")]
     pub image_cache_capacity_mb: u32,
     /// Custom NewTab wallpaper (Chrome feature)
     #[serde(default)]
     pub custom_wallpaper_url: Option<String>,
+    /// Opt-in for direct YouTube playback through the bounded Rust adapter.
+    /// Disabled by default: YouTube pages render the navigation shell instead
+    /// of contacting YouTube's internal player endpoints until the user
+    /// explicitly enables live playback.
+    #[serde(default)]
+    pub youtube_live_playback_enabled: bool,
 }
 
 impl Default for BrowserSettings {
@@ -586,9 +611,11 @@ impl Default for BrowserSettings {
             adblock_cosmetic_filtering: true,
             tab_memory_saver: true,
             memory_saver_threshold_minutes: 5,
+            memory_soft_limit_mb: 400,
             memory_pressure_threshold_mb: 500,
-            image_cache_capacity_mb: 30,
+            image_cache_capacity_mb: 24,
             custom_wallpaper_url: None,
+            youtube_live_playback_enabled: false,
         }
     }
 }
@@ -745,10 +772,27 @@ impl StorageManager {
             .map(|(origin, ls)| (origin.clone(), ls.data.clone()))
             .collect();
 
+        // Session cookies (no Expires/Max-Age) must die with the browser
+        // session (RFC 6265 §5.3), so only persistent cookies are written.
+        let persisted_cookies: HashMap<String, HashSet<Cookie>> = self
+            .cookies
+            .cookies
+            .iter()
+            .map(|(domain, jar)| {
+                let persistent: HashSet<Cookie> = jar
+                    .iter()
+                    .filter(|cookie| cookie.expires.is_some())
+                    .cloned()
+                    .collect();
+                (domain.clone(), persistent)
+            })
+            .filter(|(_, jar)| !jar.is_empty())
+            .collect();
+
         let state = StorageState {
             schema_version: STORAGE_SCHEMA_VERSION,
             version: crate::VERSION.to_string(),
-            cookies: self.cookies.cookies.clone(),
+            cookies: persisted_cookies,
             local_storage: ls_map,
             bookmarks: self.bookmarks.clone(),
             bookmark_tree: self.bookmark_tree.root.clone(),
@@ -1108,6 +1152,22 @@ mod tests {
     }
 
     #[test]
+    fn missing_memory_fields_use_personal_defaults() {
+        let defaults = BrowserSettings::default();
+        let mut value = serde_json::to_value(defaults).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("memory_saver_threshold_minutes");
+        object.remove("memory_soft_limit_mb");
+        object.remove("memory_pressure_threshold_mb");
+        object.remove("image_cache_capacity_mb");
+        let restored: BrowserSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.memory_saver_threshold_minutes, 5);
+        assert_eq!(restored.memory_soft_limit_mb, 400);
+        assert_eq!(restored.memory_pressure_threshold_mb, 500);
+        assert_eq!(restored.image_cache_capacity_mb, 24);
+    }
+
+    #[test]
     fn test_cookie_store() {
         let mut store = CookieStore::new();
         let cookie = Cookie::new("test", "value", ".example.com", "/");
@@ -1377,9 +1437,14 @@ mod tests {
 
         let mut manager = StorageManager::new();
         manager.storage_dir = Some(dir.clone());
+        // Persistent cookie (has an expiry): survives save/load round trips.
+        let mut persistent = Cookie::new("session", "value", "example.com", "/");
+        persistent.expires = Some(chrono::Utc::now().timestamp() + 3600);
+        manager.cookies_mut().add_cookie(persistent);
+        // Session cookies must not be persisted (RFC 6265 §5.3).
         manager
             .cookies_mut()
-            .add_cookie(Cookie::new("session", "value", "example.com", "/"));
+            .add_cookie(Cookie::new("ephemeral", "value", "example.com", "/"));
         manager
             .local_storage("https://example.com")
             .set("key", "value");

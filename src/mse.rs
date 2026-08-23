@@ -140,7 +140,11 @@ impl SourceBuffer {
         if self.updating {
             return Err("SourceBuffer is already updating".to_string());
         }
-        let rollback = self.clone();
+        // Crash-safe rollback via a scalar prefix snapshot instead of
+        // deep-cloning the whole buffer per segment.
+        let samples_len_before = self.samples.len();
+        let queued_before = self.queued_bytes;
+        let events_len_before = self.events.len();
         self.updating = true;
         self.events.push(MediaSourceEvent::UpdateStart);
         let result = self.append_buffer_inner(bytes);
@@ -152,7 +156,9 @@ impl SourceBuffer {
                 Ok(report)
             }
             Err(error) => {
-                *self = rollback;
+                self.samples.truncate(samples_len_before);
+                self.queued_bytes = queued_before;
+                self.events.truncate(events_len_before);
                 self.events.push(MediaSourceEvent::UpdateStart);
                 self.events.push(MediaSourceEvent::Abort);
                 self.events.push(MediaSourceEvent::UpdateEnd);
@@ -241,25 +247,36 @@ impl SourceBuffer {
             return Err("Cannot remove while SourceBuffer is updating".to_string());
         }
         let before = self.samples.len();
+        let mut removed_bytes = 0usize;
         self.samples.retain(|sample| {
             let end = sample
                 .presentation_timestamp_us
                 .saturating_add(sample.duration_us as i64);
-            end <= range.start_us || sample.presentation_timestamp_us >= range.end_us
+            let keep = end <= range.start_us || sample.presentation_timestamp_us >= range.end_us;
+            if !keep {
+                // Incremental accounting: no O(n) re-sum per call.
+                removed_bytes += sample.data.len();
+            }
+            keep
         });
-        self.queued_bytes = self.samples.iter().map(|item| item.data.len()).sum();
+        self.queued_bytes -= removed_bytes;
         Ok(before - self.samples.len())
     }
 
     pub fn evict_before(&mut self, timestamp_us: i64) -> usize {
         let before = self.samples.len();
+        let mut removed_bytes = 0usize;
         self.samples.retain(|sample| {
-            sample
+            let keep = sample
                 .presentation_timestamp_us
                 .saturating_add(sample.duration_us as i64)
-                > timestamp_us
+                > timestamp_us;
+            if !keep {
+                removed_bytes += sample.data.len();
+            }
+            keep
         });
-        self.queued_bytes = self.samples.iter().map(|item| item.data.len()).sum();
+        self.queued_bytes -= removed_bytes;
         before - self.samples.len()
     }
 
@@ -417,10 +434,23 @@ impl MediaSource {
             .iter()
             .position(|buffer| buffer.id == id)
             .ok_or_else(|| "Unknown MediaSource SourceBuffer".to_string())?;
-        let original = self.source_buffers[index].clone();
+        // Scalar snapshot: the inner append is already atomic (plan/commit),
+        // so reverting the aggregate-budget failure only needs the buffer's
+        // own sample list length and byte count, not a full deep clone.
+        let (samples_len_before, queued_before, events_before) = {
+            let buffer = &self.source_buffers[index];
+            (
+                buffer.samples.len(),
+                buffer.queued_bytes,
+                buffer.events.len(),
+            )
+        };
         let report = self.source_buffers[index].append_buffer(bytes)?;
         if self.total_queued_bytes() > MAX_TOTAL_MEDIA_BYTES {
-            self.source_buffers[index] = original;
+            let buffer = &mut self.source_buffers[index];
+            buffer.samples.truncate(samples_len_before);
+            buffer.queued_bytes = queued_before;
+            buffer.events.truncate(events_before);
             return Err("MediaSource total byte budget exceeded".to_string());
         }
         Ok(report)

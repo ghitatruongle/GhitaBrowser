@@ -208,6 +208,44 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// Measure a single line of text with the real shaping engine, falling back
+/// to the proportional heuristic whenever the shaping engine rejects the
+/// request (budget or font issues). Layout can therefore never fail because
+/// of measurement; it can only become slightly less accurate.
+///
+/// The result is clamped to be at least the heuristic estimate: the wrap
+/// logic (`wrap_single_line`) decides "fits" using `estimate_text_width`, so
+/// an inline box sized below that estimate would wrap its own text onto a
+/// second line. Keeping box width >= the heuristic preserves the invariant
+/// that a box sized to its content fits that content on one line, while real
+/// glyph advances still apply wherever the heuristic underestimates (wide
+/// glyphs, bold/monospace runs).
+fn measure_text_width_real(text: &str, font_size: f64, bold: bool, monospace: bool) -> f64 {
+    let estimated = estimate_text_width(text, font_size);
+    match crate::text_shaper::measure_text_width(text, font_size as f32, bold, monospace) {
+        Ok(width) if width.is_finite() && width >= 0.0 => width.max(estimated),
+        _ => estimated,
+    }
+}
+
+fn is_bold(style: &ComputedStyle) -> bool {
+    style
+        .font_weight
+        .map(|weight| weight >= 600)
+        .unwrap_or(false)
+}
+
+fn is_monospace(style: &ComputedStyle) -> bool {
+    style
+        .font_family
+        .as_deref()
+        .map(|family| {
+            let family = family.to_ascii_lowercase();
+            family.contains("mono") || family.contains("courier") || family.contains("console")
+        })
+        .unwrap_or(false)
+}
+
 /// Get font size from computed style
 pub fn get_font_size(style: &ComputedStyle, parent_font_size: f64) -> f64 {
     style
@@ -558,7 +596,12 @@ fn build_layout_node(
                     200.0_f64.min(viewport_width - margin_left - margin_right)
                 }
             } else {
-                let text_width = estimate_text_width(&desc_text, font_size);
+                let text_width = measure_text_width_real(
+                    &desc_text,
+                    font_size,
+                    is_bold(&computed_style),
+                    is_monospace(&computed_style),
+                );
                 if matches!(element.tag.as_str(), "input" | "select" | "textarea") {
                     text_width.max(160.0) + h_padding_border
                 } else if element.tag == "button" {
@@ -659,8 +702,37 @@ fn build_layout_node(
 /// Perform full layout pass across the tree
 pub fn perform_layout(root: &mut LayoutNode, viewport_width: f64) {
     let viewport_width = viewport_width.max(0.0);
+    // rem units resolve against the root element's font size, not a
+    // hardcoded 16px.
+    let root_font_size = effective_font_size(&root.computed_style, &root.element.tag, 16.0);
     let mut float_ctx = FloatContext::default();
-    layout_node_recursive(root, 0.0, 0.0, viewport_width, 16.0, &mut float_ctx, 0);
+    layout_node_recursive(
+        root,
+        0.0,
+        0.0,
+        viewport_width,
+        16.0,
+        None,
+        root_font_size,
+        &mut float_ctx,
+        0,
+    );
+}
+
+/// Resolve a height unit against the containing block's content height.
+/// Percentages need a definite containing-block height; without one they act
+/// as `auto` (None), matching CSS. Other units resolve normally.
+fn resolve_height_unit(
+    unit: &CssUnit,
+    containing_height: Option<f64>,
+    width_reference: f64,
+    root_font_size: f64,
+) -> Option<f64> {
+    match unit {
+        CssUnit::Percent(pct) => containing_height.map(|h| h * pct / 100.0),
+        CssUnit::Auto => None,
+        other => Some(other.to_pixels(width_reference, root_font_size).max(0.0)),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -707,12 +779,15 @@ impl FloatContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_node_recursive(
     node: &mut LayoutNode,
     current_x: f64,
     current_y: f64,
     parent_width: f64,
     parent_font_size: f64,
+    containing_height: Option<f64>,
+    root_font_size: f64,
     float_ctx: &mut FloatContext,
     depth: usize,
 ) -> f64 {
@@ -780,7 +855,12 @@ fn layout_node_recursive(
         }
         DisplayType::Inline | DisplayType::InlineBlock | DisplayType::TableCell => {
             if node.rect.width == 0.0 {
-                let text_width = estimate_text_width(&node.element.text_content(), font_size);
+                let text_width = measure_text_width_real(
+                    &node.element.text_content(),
+                    font_size,
+                    is_bold(&node.computed_style),
+                    is_monospace(&node.computed_style),
+                );
                 node.rect.width = (text_width + h_padding_border).max(0.0);
             }
         }
@@ -789,7 +869,7 @@ fn layout_node_recursive(
 
     // Clamping min/max width
     if let Some(ref min_w) = node.computed_style.min_width {
-        let min_px = min_w.to_pixels(parent_width, 16.0);
+        let min_px = min_w.to_pixels(parent_width, root_font_size);
         let min_border_box = if is_border_box {
             min_px
         } else {
@@ -798,7 +878,7 @@ fn layout_node_recursive(
         node.rect.width = node.rect.width.max(min_border_box);
     }
     if let Some(ref max_w) = node.computed_style.max_width {
-        let max_px = max_w.to_pixels(parent_width, 16.0);
+        let max_px = max_w.to_pixels(parent_width, root_font_size);
         let max_border_box = if is_border_box {
             max_px
         } else {
@@ -812,6 +892,14 @@ fn layout_node_recursive(
     let content_y = node.rect.y + node.rect.padding_top + node.rect.border_top;
     let inner_width = node.rect.content_width();
 
+    // Resolve an explicit height early so children can resolve their own
+    // percentage heights against a definite containing block.
+    let explicit_content_height: Option<f64> = node
+        .computed_style
+        .height
+        .as_ref()
+        .and_then(|unit| resolve_height_unit(unit, containing_height, node.rect.width, root_font_size));
+
     // Text wrapping with CSS rules
     let text_lines = if node.element.text.is_empty() {
         Vec::new()
@@ -824,11 +912,7 @@ fn layout_node_recursive(
             node.computed_style.word_break.as_deref(),
         )
     };
-    let line_height = node
-        .computed_style
-        .line_height
-        .map(|lh| lh * font_size)
-        .unwrap_or(font_size * 1.4);
+    let line_height = crate::css_parser::line_height_px(node.computed_style.line_height, font_size);
     let text_height = text_lines.len() as f64 * line_height;
 
     let all_inline_children = !node.children.is_empty()
@@ -865,7 +949,12 @@ fn layout_node_recursive(
             + if node.element.text.is_empty() {
                 0.0
             } else {
-                estimate_text_width(&node.element.text, font_size)
+                measure_text_width_real(
+                    &node.element.text,
+                    font_size,
+                    is_bold(&node.computed_style),
+                    is_monospace(&node.computed_style),
+                )
             }
     } else {
         content_x
@@ -882,45 +971,51 @@ fn layout_node_recursive(
         .computed_style
         .gap
         .as_ref()
-        .map(|unit| unit.to_pixels(inner_width, 16.0))
+        .map(|unit| unit.to_pixels(inner_width, root_font_size))
         .unwrap_or(0.0)
         .clamp(0.0, inner_width.max(0.0));
 
     if node.rect.display == DisplayType::Flex {
-        layout_flex(
+        let extent = layout_flex(
             node,
             content_x,
             content_y,
             inner_width,
             font_size,
+            containing_height,
+            root_font_size,
             gap,
             &mut local_float_ctx,
             depth + 1,
         );
-        line_y = content_y + node.rect.content_height();
+        line_y = content_y + extent;
     } else if node.rect.display == DisplayType::Grid {
-        layout_grid(
+        let extent = layout_grid(
             node,
             content_x,
             content_y,
             inner_width,
             font_size,
+            containing_height,
+            root_font_size,
             gap,
             &mut local_float_ctx,
             depth + 1,
         );
-        line_y = content_y + node.rect.content_height();
+        line_y = content_y + extent;
     } else if node.rect.display == DisplayType::Table {
-        layout_table(
+        let extent = layout_table(
             node,
             content_x,
             content_y,
             inner_width,
             font_size,
+            containing_height,
+            root_font_size,
             &mut local_float_ctx,
             depth + 1,
         );
-        line_y = content_y + node.rect.content_height();
+        line_y = content_y + extent;
     } else {
         let mut prev_margin_bottom: f64 = 0.0;
         for child in &mut node.children {
@@ -931,6 +1026,8 @@ fn layout_node_recursive(
                     content_y,
                     inner_width,
                     font_size,
+                    explicit_content_height,
+                    root_font_size,
                     &mut local_float_ctx,
                     depth + 1,
                 );
@@ -983,6 +1080,8 @@ fn layout_node_recursive(
                     line_y,
                     inner_width,
                     font_size,
+                    explicit_content_height,
+                    root_font_size,
                     &mut local_float_ctx,
                     depth + 1,
                 );
@@ -998,6 +1097,8 @@ fn layout_node_recursive(
                     float_y,
                     inner_width,
                     font_size,
+                    explicit_content_height,
+                    root_font_size,
                     &mut local_float_ctx,
                     depth + 1,
                 );
@@ -1016,6 +1117,8 @@ fn layout_node_recursive(
                     float_y,
                     inner_width,
                     font_size,
+                    explicit_content_height,
+                    root_font_size,
                     &mut local_float_ctx,
                     depth + 1,
                 );
@@ -1045,6 +1148,8 @@ fn layout_node_recursive(
                     pass_y,
                     inner_width,
                     font_size,
+                    explicit_content_height,
+                    root_font_size,
                     &mut local_float_ctx,
                     depth + 1,
                 );
@@ -1075,16 +1180,25 @@ fn layout_node_recursive(
         (line_y - content_y).max(own_text_height)
     };
 
-    // Height resolution
-    if let Some(ref h) = node.computed_style.height {
-        let h_px = h.to_pixels(node.rect.width, 16.0).max(0.0);
+    // Height resolution. An explicit height was already resolved against the
+    // containing block's height (percentages need a definite base; without
+    // one they behave as auto and fall through to the content height).
+    if let Some(h_px) = explicit_content_height {
         let border_box_h = if is_border_box {
             h_px
         } else {
             h_px + v_padding_border
         };
         node.rect.height = border_box_h;
-        return finish_layout_node(node, current_x, current_y, parent_width, node.rect.height);
+        return finish_layout_node(
+            node,
+            current_x,
+            current_y,
+            parent_width,
+            containing_height,
+            root_font_size,
+            node.rect.height,
+        );
     }
 
     if matches!(
@@ -1092,7 +1206,15 @@ fn layout_node_recursive(
         "input" | "button" | "select" | "textarea"
     ) {
         node.rect.height = text_height.max(font_size * 1.4) + v_padding_border;
-        return finish_layout_node(node, current_x, current_y, parent_width, node.rect.height);
+        return finish_layout_node(
+            node,
+            current_x,
+            current_y,
+            parent_width,
+            containing_height,
+            root_font_size,
+            node.rect.height,
+        );
     }
 
     let is_img = node.element.tag == "img";
@@ -1103,7 +1225,15 @@ fn layout_node_recursive(
             .and_then(|v| v.parse::<f64>().ok())
         {
             node.rect.height = h + node.rect.padding_top + node.rect.padding_bottom;
-            return finish_layout_node(node, current_x, current_y, parent_width, node.rect.height);
+            return finish_layout_node(
+                node,
+                current_x,
+                current_y,
+                parent_width,
+                containing_height,
+                root_font_size,
+                node.rect.height,
+            );
         }
         if node.rect.width > 0.0 {
             let aspect_ratio = node
@@ -1124,36 +1254,65 @@ fn layout_node_recursive(
                 .unwrap_or(0.75);
             node.rect.height =
                 (node.rect.width * aspect_ratio) + node.rect.padding_top + node.rect.padding_bottom;
-            return finish_layout_node(node, current_x, current_y, parent_width, node.rect.height);
+            return finish_layout_node(
+                node,
+                current_x,
+                current_y,
+                parent_width,
+                containing_height,
+                root_font_size,
+                node.rect.height,
+            );
         }
     }
 
-    let mut final_height = (content_height + v_padding_border).max(font_size * 1.4);
+    // Floor at one line box. With an explicit line-height that is the
+    // authoritative minimum (24px on a 32px font stays 24px); with the
+    // default it equals the old font_size * 1.4 heuristic.
+    let mut final_height = (content_height + v_padding_border).max(line_height);
 
-    // Clamping min/max height
+    // Clamping min/max height. Percentages resolve against the containing
+    // block's height; with an indefinite height they are ignored (auto).
     if let Some(ref min_h) = node.computed_style.min_height {
-        let min_px = min_h.to_pixels(parent_width, 16.0);
-        let min_box = if is_border_box {
-            min_px
-        } else {
-            min_px + v_padding_border
-        };
-        final_height = final_height.max(min_box);
+        if let Some(min_px) =
+            resolve_height_unit(min_h, containing_height, parent_width, root_font_size)
+        {
+            let min_box = if is_border_box {
+                min_px
+            } else {
+                min_px + v_padding_border
+            };
+            final_height = final_height.max(min_box);
+        }
     }
     if let Some(ref max_h) = node.computed_style.max_height {
-        let max_px = max_h.to_pixels(parent_width, 16.0);
-        let max_box = if is_border_box {
-            max_px
-        } else {
-            max_px + v_padding_border
-        };
-        final_height = final_height.min(max_box);
+        if let Some(max_px) =
+            resolve_height_unit(max_h, containing_height, parent_width, root_font_size)
+        {
+            let max_box = if is_border_box {
+                max_px
+            } else {
+                max_px + v_padding_border
+            };
+            final_height = final_height.min(max_box);
+        }
     }
 
     node.rect.height = final_height;
-    finish_layout_node(node, current_x, current_y, parent_width, node.rect.height)
+    finish_layout_node(
+        node,
+        current_x,
+        current_y,
+        parent_width,
+        containing_height,
+        root_font_size,
+        node.rect.height,
+    )
 }
 
+/// Lay out a flex container and return its content extent (bottom - top).
+/// The caller folds the extent into `line_y`; the container's own height
+/// resolution happens in `layout_node_recursive` as for any box.
 #[allow(clippy::too_many_arguments)]
 fn layout_flex(
     node: &mut LayoutNode,
@@ -1161,10 +1320,12 @@ fn layout_flex(
     content_y: f64,
     inner_width: f64,
     font_size: f64,
+    containing_height: Option<f64>,
+    root_font_size: f64,
     gap: f64,
     float_ctx: &mut FloatContext,
     depth: usize,
-) {
+) -> f64 {
     node.children
         .sort_by_key(|child| child.computed_style.order);
     let is_column = node.computed_style.flex_direction.as_deref() == Some("column")
@@ -1178,6 +1339,7 @@ fn layout_flex(
 
     if is_column {
         let mut curr_y = content_y;
+        let mut extent: f64 = 0.0;
         for child in &mut node.children {
             if is_out_of_flow(child) {
                 layout_node_recursive(
@@ -1186,6 +1348,8 @@ fn layout_flex(
                     content_y,
                     inner_width,
                     font_size,
+                    containing_height,
+                    root_font_size,
                     float_ctx,
                     depth,
                 );
@@ -1197,11 +1361,15 @@ fn layout_flex(
                 curr_y,
                 inner_width,
                 font_size,
+                containing_height,
+                root_font_size,
                 float_ctx,
                 depth,
             );
+            extent = (curr_y + child_height) - content_y;
             curr_y += child_height + gap;
         }
+        extent
     } else {
         let wrap = node.computed_style.flex_wrap.as_deref() == Some("wrap")
             || node.computed_style.flex_wrap.as_deref() == Some("wrap-reverse");
@@ -1226,7 +1394,7 @@ fn layout_flex(
                         .computed_style
                         .flex_basis
                         .as_ref()
-                        .map(|basis| basis.to_pixels(inner_width, 16.0))
+                        .map(|basis| basis.to_pixels(inner_width, root_font_size))
                         .unwrap_or(0.0)
                         .max(0.0)
                 }
@@ -1308,6 +1476,8 @@ fn layout_flex(
                     content_y,
                     inner_width,
                     font_size,
+                    containing_height,
+                    root_font_size,
                     float_ctx,
                     depth,
                 );
@@ -1328,6 +1498,8 @@ fn layout_flex(
                 row_y,
                 child.rect.width,
                 font_size,
+                containing_height,
+                root_font_size,
                 float_ctx,
                 depth,
             );
@@ -1341,7 +1513,9 @@ fn layout_flex(
                     for child in &mut node.children {
                         if !is_out_of_flow(child) {
                             let delta = (row_height - child.rect.outer_height()).max(0.0);
-                            child.rect.y += delta / 2.0;
+                            // Translate the child's whole subtree, not just
+                            // its own box, so descendants follow.
+                            translate_subtree(child, 0.0, delta / 2.0);
                         }
                     }
                 }
@@ -1349,13 +1523,29 @@ fn layout_flex(
                     for child in &mut node.children {
                         if !is_out_of_flow(child) {
                             let delta = (row_height - child.rect.outer_height()).max(0.0);
-                            child.rect.y += delta;
+                            translate_subtree(child, 0.0, delta);
                         }
                     }
                 }
                 _ => {}
             }
         }
+
+        if wrap {
+            (row_y + row_height) - content_y
+        } else {
+            row_height
+        }
+    }
+}
+
+/// Shift a node and every descendant by (dx, dy). Used when a layout pass
+/// repositions an already-laid-out subtree (flex cross-axis alignment).
+fn translate_subtree(node: &mut LayoutNode, dx: f64, dy: f64) {
+    node.rect.x += dx;
+    node.rect.y += dy;
+    for child in &mut node.children {
+        translate_subtree(child, dx, dy);
     }
 }
 
@@ -1366,10 +1556,12 @@ fn layout_grid(
     content_y: f64,
     inner_width: f64,
     font_size: f64,
+    containing_height: Option<f64>,
+    root_font_size: f64,
     gap: f64,
     float_ctx: &mut FloatContext,
     depth: usize,
-) {
+) -> f64 {
     let columns = grid_column_count(
         node.computed_style.grid_template_columns.as_deref(),
         node.children.len(),
@@ -1387,8 +1579,17 @@ fn layout_grid(
                 child.rect.width = column_width;
             }
             let x = content_x + col as f64 * (column_width + gap);
-            let child_height =
-                layout_node_recursive(child, x, line_y, column_width, font_size, float_ctx, depth);
+            let child_height = layout_node_recursive(
+                child,
+                x,
+                line_y,
+                column_width,
+                font_size,
+                containing_height,
+                root_font_size,
+                float_ctx,
+                depth,
+            );
             row_height = row_height.max(child_height);
         }
         line_y += row_height;
@@ -1397,17 +1598,22 @@ fn layout_grid(
             line_y += gap;
         }
     }
+    line_y - content_y
 }
 
+/// Lay out a table and return its content extent (bottom - top).
+#[allow(clippy::too_many_arguments)]
 fn layout_table(
     node: &mut LayoutNode,
     content_x: f64,
     content_y: f64,
     inner_width: f64,
     font_size: f64,
+    containing_height: Option<f64>,
+    root_font_size: f64,
     float_ctx: &mut FloatContext,
     depth: usize,
-) {
+) -> f64 {
     // Collect all rows and their cells across the table hierarchy
     let mut rows: Vec<&mut LayoutNode> = Vec::new();
     for child in &mut node.children {
@@ -1430,7 +1636,7 @@ fn layout_table(
     }
 
     if rows.is_empty() {
-        return;
+        return 0.0;
     }
 
     // Determine total column count
@@ -1478,6 +1684,8 @@ fn layout_table(
                 curr_y,
                 cell_w,
                 font_size,
+                containing_height,
+                root_font_size,
                 float_ctx,
                 depth + 1,
             );
@@ -1488,6 +1696,7 @@ fn layout_table(
         row.rect.height = max_cell_h.max(font_size * 1.4);
         curr_y += row.rect.height;
     }
+    curr_y - content_y
 }
 
 fn is_out_of_flow(node: &LayoutNode) -> bool {
@@ -1497,28 +1706,42 @@ fn is_out_of_flow(node: &LayoutNode) -> bool {
     )
 }
 
-fn resolve_offset(value: Option<&CssUnit>, parent_size: f64) -> Option<f64> {
+fn resolve_offset(
+    value: Option<&CssUnit>,
+    parent_size: f64,
+    root_font_size: f64,
+) -> Option<f64> {
     value.map(|value| {
         value
-            .to_pixels(parent_size, 16.0)
+            .to_pixels(parent_size, root_font_size)
             .clamp(-1_000_000.0, 1_000_000.0)
     })
 }
 
 /// Apply relative/absolute/fixed offsets and the bounded axis-aligned transform
+#[allow(clippy::too_many_arguments)]
 fn finish_layout_node(
     node: &mut LayoutNode,
     containing_x: f64,
     containing_y: f64,
     containing_width: f64,
+    containing_height: Option<f64>,
+    root_font_size: f64,
     flow_height: f64,
 ) -> f64 {
     let original_x = node.rect.x;
     let original_y = node.rect.y;
-    let left = resolve_offset(node.computed_style.left.as_ref(), containing_width);
-    let right = resolve_offset(node.computed_style.right.as_ref(), containing_width);
-    let top = resolve_offset(node.computed_style.top.as_ref(), containing_width);
-    let bottom = resolve_offset(node.computed_style.bottom.as_ref(), containing_width);
+    let left = resolve_offset(node.computed_style.left.as_ref(), containing_width, root_font_size);
+    let right =
+        resolve_offset(node.computed_style.right.as_ref(), containing_width, root_font_size);
+    let top = resolve_offset(node.computed_style.top.as_ref(), containing_width, root_font_size);
+    // `bottom` is a vertical offset: it resolves against the containing
+    // block's HEIGHT, not its width, and anchors the box's bottom edge to
+    // the containing block's bottom.
+    let bottom = node.computed_style.bottom.as_ref().and_then(|unit| {
+        resolve_height_unit(unit, containing_height, containing_width, root_font_size)
+            .map(|px| px.clamp(-1_000_000.0, 1_000_000.0))
+    });
     match node.computed_style.position {
         PositionMode::Static => {}
         PositionMode::Relative => {
@@ -1541,7 +1764,12 @@ fn finish_layout_node(
             node.rect.y = if let Some(top) = top {
                 base_y + top + node.rect.margin_top
             } else if let Some(bottom) = bottom {
-                base_y - bottom - node.rect.height - node.rect.margin_bottom
+                // Anchor the bottom edge to the containing block's bottom.
+                // Fixed boxes nominally anchor to the viewport, whose height
+                // layout does not track; the parent height is the closest
+                // available base there too.
+                let cb_height = containing_height.unwrap_or(0.0);
+                base_y + cb_height - bottom - node.rect.height - node.rect.margin_bottom
             } else {
                 base_y + node.rect.margin_top
             };
@@ -1892,5 +2120,70 @@ mod tests {
         assert_eq!(input.element.text, "Search");
         assert!(input.rect.width >= 160.0);
         assert!(input.rect.height > 20.0);
+    }
+
+    #[test]
+    fn inline_box_real_width_never_wraps_its_own_text() {
+        // R8 invariant: measure_text_width_real returns max(real, heuristic).
+        // The wrap logic decides "fits" using estimate_text_width, so clamping
+        // the box to at least the heuristic guarantees a box sized to its own
+        // text fits that text on ONE line. This must hold for narrow text
+        // (where real < heuristic), wide text (where real > heuristic), bold,
+        // monospace, CJK and emoji. The assertion is font-independent: the
+        // fits-check compares the heuristic against the box width, and the box
+        // is by construction >= the heuristic.
+        let cases: &[(&str, f64, bool, bool)] = &[
+            // Narrow proportional: real advance is far below the heuristic.
+            ("iiii", 16.0, false, false),
+            ("Click me", 16.0, false, false), // multi-word single line
+            // Wide proportional: real advance can exceed the heuristic.
+            ("WWWW", 16.0, false, false),
+            ("MMMM", 24.0, false, false),
+            // Bold: real bold advance is wider than the normal-weight heuristic.
+            ("WWWW", 16.0, true, false),
+            ("Bold Text", 20.0, true, false),
+            // Monospace: every glyph is wide, including 'i' and 'l'.
+            ("iiii", 16.0, false, true),
+            ("WWWW", 16.0, false, true),
+            // CJK / emoji: full-width runs.
+            ("中文测试", 16.0, false, false),
+            ("🚀🛰️", 16.0, false, false),
+        ];
+        for &(text, font_size, bold, monospace) in cases {
+            let box_width = measure_text_width_real(text, font_size, bold, monospace);
+            assert!(
+                box_width.is_finite() && box_width > 0.0,
+                "{text:?}: measured width must be finite and positive"
+            );
+            assert!(
+                box_width >= estimate_text_width(text, font_size),
+                "{text:?}: box width {box_width:.1} must never undercut the heuristic {:.1}",
+                estimate_text_width(text, font_size)
+            );
+            let lines = wrap_text_with_rules(text, box_width, font_size, None, None);
+            assert_eq!(
+                lines.len(),
+                1,
+                "{text:?}: box of width {box_width:.1}px wraps its own text: {lines:?}"
+            );
+            assert_eq!(
+                lines[0], text,
+                "{text:?}: single-line box must keep the text intact"
+            );
+        }
+    }
+
+    #[test]
+    fn monospace_real_width_beats_heuristic_for_narrow_glyphs() {
+        // Any monospace font draws every glyph at >= 0.5 em, so the real
+        // advance of "iiii" (>= 0.5 em per char) must exceed the heuristic
+        // 0.32 em per char. This proves the max() actually exercises the real
+        // measurement branch and is not a no-op.
+        let heuristic = estimate_text_width("iiii", 16.0);
+        let real = measure_text_width_real("iiii", 16.0, false, true);
+        assert!(
+            real > heuristic + 1.0,
+            "monospace real width {real:.1} must exceed heuristic {heuristic:.1}"
+        );
     }
 }

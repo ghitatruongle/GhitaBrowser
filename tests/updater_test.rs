@@ -239,3 +239,68 @@ fn standalone_installer_rejects_symlink_or_path_escape_payloads() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn profile_trusted_publishers_file_cannot_introduce_new_trust() {
+    // An attacker with profile write access plants their own Ed25519 key and
+    // a manifest signed by it. The pinned-key policy must reject both.
+    let (root, install, profile, state) = roots("pin-overlay");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let attacker_key = SigningKey::from_bytes(&[99; 32]);
+    let mut persisted = BTreeMap::new();
+    persisted.insert(
+        "attacker-key".to_string(),
+        attacker_key.verifying_key().to_bytes(),
+    );
+    let trust_path = state.join("trusted_publishers.json");
+    std::fs::write(
+        &trust_path,
+        serde_json::to_vec_pretty(&persisted).unwrap(),
+    )
+    .unwrap();
+
+    let mut manager =
+        UpdateManager::new_with_paths(
+            "2.0.0",
+            &install,
+            &state,
+            &profile,
+            PublisherTrustStore::new(),
+        )
+        .unwrap();
+    let mut planted = package("2.0.1", None);
+    // Re-sign with the attacker key so only the (ignored) planted key could
+    // validate it.
+    planted.manifest.publisher_key_id = "attacker-key".into();
+    let signature = attacker_key.sign(&planted.canonical_payload().unwrap());
+    planted.manifest.signature =
+        ghitabrowser::package_crypto::encode_hex(signature.to_bytes().as_slice());
+
+    match manager.apply_update(planted) {
+        Err(UpdateError::InvalidSignature(_)) => {}
+        other => panic!("planted key must fail closed, got {other:?}"),
+    }
+    if root.exists() {
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn pinned_release_keys_are_present_and_valid_hex() {
+    let pins = ghitabrowser::updater::PINNED_RELEASE_KEYS;
+    assert!(!pins.is_empty(), "at least one release key must be pinned");
+    for (key_id, key_hex) in pins {
+        assert!(!key_id.is_empty());
+        assert_eq!(
+            key_hex.len(),
+            64,
+            "pinned key {key_id} must be 32 bytes of hex"
+        );
+        assert!(
+            ghitabrowser::package_crypto::decode_hex_exact::<32>(key_hex).is_ok(),
+            "pinned key {key_id} is not valid hex"
+        );
+    }
+}

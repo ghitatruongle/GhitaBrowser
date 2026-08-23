@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head><title>Safe filtering fixture</title></head>
+<body>
+  <header><h1>Reliable personal browsing</h1><nav>Home Articles Settings Help</nav></header>
+  <main>
+    <article>
+      <h2>Why conservative filtering matters</h2>
+      <p>A request blocker should remove clearly identified advertising and tracking resources without changing the document that the user asked to open. Main navigation, account controls, stylesheets, fonts, media, and same-site scripts remain available. This fixture contains enough ordinary article text to detect accidental content loss.</p>
+      <p>Rules are evaluated with an explicit resource type and a top-level page context. A missing context fails open. A same-site request fails open. Local files and loopback development servers fail open. Explicit allow rules take priority over block rules so a false positive can be repaired without disabling protection everywhere.</p>
+      <p>Cosmetic filtering is intentionally narrow. It recognizes only project-owned advertisement markers and a precise accessibility label. It does not hide generic banners, sidebars, frames, promotions, or class names that merely contain short letter sequences. The readable article therefore stays intact when filtering is enabled.</p>
+      <p>The release gate renders this document twice with the same runtime and viewport. It compares readable text, blank-space diagnostics, and script errors. A change is accepted only when the main content is preserved and at least one representative tracker request is blocked.</p>
+      <p>Users can disable filtering for a specific site. The exception covers subdomains, persists with browser settings, and can be reversed. Statistics retain bounded counters only and never retain full request URLs, query strings, cookies, tokens, or page content.</p>
+    </article>
+    <aside data-ghita-ad aria-label="Advertisement"></aside>
+    <section class="sponsored-content" aria-label="Sponsored placement"></section>
+  </main>
+  <footer>Deterministic local fixture for GhitaBrowser release testing.</footer>
+</body>
+</html>
