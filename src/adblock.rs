@@ -580,8 +580,7 @@ fn registrable_domain(host: &str) -> String {
     // eTLD+1 via the bundled Public Suffix List so distinct tenants on
     // shared suffixes (user1.github.io vs user2.github.io) are NOT same-site.
     // Falls back to the host itself when no registrable part exists.
-    crate::public_suffix::registrable_domain(host)
-        .unwrap_or_else(|| host.to_ascii_lowercase())
+    crate::public_suffix::registrable_domain(host).unwrap_or_else(|| host.to_ascii_lowercase())
 }
 
 fn is_local_or_loopback(host: &str) -> bool {

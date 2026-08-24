@@ -9,3 +9,8 @@
 *.ico binary
 *.png binary
 *.zip binary
+
+# Fixtures are hash-locked by tests/real_site_acceptance_test.rs; they must
+# check out byte-for-byte identical on every platform (CI runners default to
+# CRLF, which breaks the SHA-256 integrity verification).
+tests/fixtures/** -text

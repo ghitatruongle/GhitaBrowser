@@ -29,9 +29,8 @@ fn replace_via_move_file(existing_temporary: &Path, path: &Path) -> io::Result<(
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
-    let to_wide = |value: &Path| -> Vec<u16> {
-        HSTRING::from(value.as_os_str()).as_wide().to_vec()
-    };
+    let to_wide =
+        |value: &Path| -> Vec<u16> { HSTRING::from(value.as_os_str()).as_wide().to_vec() };
     let mut from = to_wide(existing_temporary);
     from.push(0);
     let mut to = to_wide(path);

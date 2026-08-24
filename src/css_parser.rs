@@ -333,11 +333,9 @@ impl CompoundSelector {
                         match attr.case_sensitivity {
                             CaseSensitivity::CaseInsensitive => {
                                 actual.len() >= attr.value.len()
-                                    && actual
-                                        .get(actual.len() - attr.value.len()..)
-                                        .is_some_and(|suffix| {
-                                            suffix.eq_ignore_ascii_case(&attr.value)
-                                        })
+                                    && actual.get(actual.len() - attr.value.len()..).is_some_and(
+                                        |suffix| suffix.eq_ignore_ascii_case(&attr.value),
+                                    )
                             }
                             _ => actual.ends_with(&attr.value),
                         }
@@ -2635,9 +2633,15 @@ fn eval_math_expression_bounded(
         let args = split_math_args(inner);
         let mut min_val = f64::INFINITY;
         for arg in args {
-            if let Some(v) =
-                eval_math_expression_bounded(&arg, parent_size, root_size, vw, vh, customs, depth + 1)
-            {
+            if let Some(v) = eval_math_expression_bounded(
+                &arg,
+                parent_size,
+                root_size,
+                vw,
+                vh,
+                customs,
+                depth + 1,
+            ) {
                 if v < min_val {
                     min_val = v;
                 }
@@ -2656,9 +2660,15 @@ fn eval_math_expression_bounded(
         let args = split_math_args(inner);
         let mut max_val = f64::NEG_INFINITY;
         for arg in args {
-            if let Some(v) =
-                eval_math_expression_bounded(&arg, parent_size, root_size, vw, vh, customs, depth + 1)
-            {
+            if let Some(v) = eval_math_expression_bounded(
+                &arg,
+                parent_size,
+                root_size,
+                vw,
+                vh,
+                customs,
+                depth + 1,
+            ) {
                 if v > max_val {
                     max_val = v;
                 }
@@ -2676,9 +2686,33 @@ fn eval_math_expression_bounded(
     {
         let args = split_math_args(inner);
         if args.len() == 3 {
-            let min = eval_math_expression_bounded(&args[0], parent_size, root_size, vw, vh, customs, depth + 1)?;
-            let val = eval_math_expression_bounded(&args[1], parent_size, root_size, vw, vh, customs, depth + 1)?;
-            let max = eval_math_expression_bounded(&args[2], parent_size, root_size, vw, vh, customs, depth + 1)?;
+            let min = eval_math_expression_bounded(
+                &args[0],
+                parent_size,
+                root_size,
+                vw,
+                vh,
+                customs,
+                depth + 1,
+            )?;
+            let val = eval_math_expression_bounded(
+                &args[1],
+                parent_size,
+                root_size,
+                vw,
+                vh,
+                customs,
+                depth + 1,
+            )?;
+            let max = eval_math_expression_bounded(
+                &args[2],
+                parent_size,
+                root_size,
+                vw,
+                vh,
+                customs,
+                depth + 1,
+            )?;
             // CSS clamp(MIN, VAL, MAX) is max(MIN, min(VAL, MAX)): when MIN
             // exceeds MAX the spec resolves to MIN. f64::clamp panics on
             // inverted bounds, so compose min/max instead.
@@ -2743,8 +2777,14 @@ fn eval_calc_terms(
                 current_term.push(c);
             }
             '+' | '-' if paren_depth == 0 => {
-                let term_val =
-                    eval_single_calc_term(current_term.trim(), parent_size, root_size, vw, vh, depth)?;
+                let term_val = eval_single_calc_term(
+                    current_term.trim(),
+                    parent_size,
+                    root_size,
+                    vw,
+                    vh,
+                    depth,
+                )?;
                 if current_op == '+' {
                     total += term_val;
                 } else {
@@ -2758,7 +2798,8 @@ fn eval_calc_terms(
     }
 
     if !current_term.trim().is_empty() {
-        let term_val = eval_single_calc_term(current_term.trim(), parent_size, root_size, vw, vh, depth)?;
+        let term_val =
+            eval_single_calc_term(current_term.trim(), parent_size, root_size, vw, vh, depth)?;
         if current_op == '+' {
             total += term_val;
         } else {

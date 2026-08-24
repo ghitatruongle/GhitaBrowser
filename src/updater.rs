@@ -26,12 +26,10 @@ const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 /// own — a user-writable file must never be the root of a code-installation
 /// signature chain. Rotate by adding a new `(key_id, hex)` entry and signing
 /// with `ghita-release-tool` (see tools/).
-pub const PINNED_RELEASE_KEYS: &[(&str, &str)] = &[
-    (
-        "ghita-release-2026-08",
-        "612897ca9842a77ddb162a138e62900cc4d7685570b289ba47af34a78aacaa0c",
-    ),
-];
+pub const PINNED_RELEASE_KEYS: &[(&str, &str)] = &[(
+    "ghita-release-2026-08",
+    "612897ca9842a77ddb162a138e62900cc4d7685570b289ba47af34a78aacaa0c",
+)];
 
 /// Build the runtime trust store from the pinned keys only.
 fn pinned_trust_store() -> PublisherTrustStore {

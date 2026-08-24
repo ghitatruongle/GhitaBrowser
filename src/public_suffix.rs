@@ -70,7 +70,11 @@ fn public_suffix_label_count(labels: &[&str]) -> usize {
             return k;
         }
         // A wildcard rule covers exactly one label above its base.
-        if k >= 2 && rules().wildcard_bases.contains(labels[n - k + 1..].join(".").as_str()) {
+        if k >= 2
+            && rules()
+                .wildcard_bases
+                .contains(labels[n - k + 1..].join(".").as_str())
+        {
             return k;
         }
     }
@@ -137,11 +141,11 @@ mod tests {
         assert!(is_public_suffix("foo.ck"));
         // ...and the exception carves www.ck back out.
         assert!(!is_public_suffix("www.ck"));
+        assert_eq!(registrable_domain("www.ck").as_deref(), Some("www.ck"));
         assert_eq!(
-            registrable_domain("www.ck").as_deref(),
-            Some("www.ck")
+            registrable_domain("site.foo.ck").as_deref(),
+            Some("site.foo.ck")
         );
-        assert_eq!(registrable_domain("site.foo.ck").as_deref(), Some("site.foo.ck"));
     }
 
     #[test]

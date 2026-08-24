@@ -393,8 +393,17 @@ fn nth_child_matches_real_sibling_position() {
         ..Default::default()
     };
 
-    let matched =
-        compute_computed_style_full("li", &classes, None, &rules, None, &attrs, false, &[], &second);
+    let matched = compute_computed_style_full(
+        "li",
+        &classes,
+        None,
+        &rules,
+        None,
+        &attrs,
+        false,
+        &[],
+        &second,
+    );
     assert_eq!(
         matched.color.as_deref(),
         Some("red"),
@@ -435,9 +444,21 @@ fn adjacent_sibling_combinator_requires_matching_previous_sibling() {
         ..Default::default()
     };
     let matched = compute_computed_style_full(
-        "p", &classes, None, &rules, None, &attrs, false, &[], &after_h2,
+        "p",
+        &classes,
+        None,
+        &rules,
+        None,
+        &attrs,
+        false,
+        &[],
+        &after_h2,
     );
-    assert_eq!(matched.color.as_deref(), Some("red"), "p after h2 must match");
+    assert_eq!(
+        matched.color.as_deref(),
+        Some("red"),
+        "p after h2 must match"
+    );
 
     let after_div = ghitabrowser::css_parser::SiblingContext {
         previous_siblings: &[ElementAncestry {
@@ -449,7 +470,15 @@ fn adjacent_sibling_combinator_requires_matching_previous_sibling() {
         ..Default::default()
     };
     let unmatched = compute_computed_style_full(
-        "p", &classes, None, &rules, None, &attrs, false, &[], &after_div,
+        "p",
+        &classes,
+        None,
+        &rules,
+        None,
+        &attrs,
+        false,
+        &[],
+        &after_div,
     );
     assert_ne!(
         unmatched.color.as_deref(),
@@ -490,7 +519,9 @@ fn ancestor_attribute_selectors_match_against_real_attrs() {
         tag: "form".into(),
         classes: Vec::new(),
         id: None,
-        attrs: [("action".to_string(), "/submit".to_string())].into_iter().collect(),
+        attrs: [("action".to_string(), "/submit".to_string())]
+            .into_iter()
+            .collect(),
     }];
     let style = compute_computed_style_with_ancestors(
         "input", &classes, None, &rules, None, &attrs, false, &ancestry,

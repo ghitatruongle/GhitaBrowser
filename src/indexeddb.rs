@@ -880,7 +880,9 @@ mod tests {
             "the live reopened database stays"
         );
         assert!(
-            engine.databases["doomed"].object_stores.contains_key("fresh"),
+            engine.databases["doomed"]
+                .object_stores
+                .contains_key("fresh"),
             "stale rollback must not clobber newer schema"
         );
     }

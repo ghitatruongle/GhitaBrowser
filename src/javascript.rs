@@ -10760,7 +10760,10 @@ mod tests {
     fn test_division_by_zero() {
         let mut engine = JsvEngine::new();
         // ECMAScript: division by zero yields IEEE results, not errors.
-        assert_eq!(engine.eval("1 / 0").unwrap().as_number(), Some(f64::INFINITY));
+        assert_eq!(
+            engine.eval("1 / 0").unwrap().as_number(),
+            Some(f64::INFINITY)
+        );
         assert_eq!(
             engine.eval("-1 / 0").unwrap().as_number(),
             Some(f64::NEG_INFINITY)

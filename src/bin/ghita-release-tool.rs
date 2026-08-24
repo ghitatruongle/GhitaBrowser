@@ -67,8 +67,11 @@ fn command_gen(args: &[String]) -> Result<(), String> {
     }
     #[cfg(windows)]
     restrict_private_key_file(std::path::Path::new(&out))?;
-    std::fs::write(&out, format!("{}\n", ghitabrowser::package_crypto::encode_hex(&seed)))
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &out,
+        format!("{}\n", ghitabrowser::package_crypto::encode_hex(&seed)),
+    )
+    .map_err(|e| e.to_string())?;
 
     println!("Private seed written to {out} — keep it out of version control.");
     println!("Key id suggestion: ghita-release-YYYY-MM");
@@ -83,7 +86,8 @@ fn command_sign(args: &[String]) -> Result<(), String> {
     use ghitabrowser::updater::UpdatePackage;
 
     let manifest_path = arg_value(args, "--manifest").ok_or("sign requires --manifest <json>")?;
-    let payload_dir = arg_value(args, "--payload-dir").ok_or("sign requires --payload-dir <dir>")?;
+    let payload_dir =
+        arg_value(args, "--payload-dir").ok_or("sign requires --payload-dir <dir>")?;
     let key_path = arg_value(args, "--key").ok_or("sign requires --key <private-key-file>")?;
 
     let seed_hex = std::fs::read_to_string(key_path)
@@ -94,8 +98,8 @@ fn command_sign(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("bad key file: {e:?}"))?;
     let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
 
-    let manifest_json = std::fs::read_to_string(manifest_path)
-        .map_err(|e| format!("cannot read manifest: {e}"))?;
+    let manifest_json =
+        std::fs::read_to_string(manifest_path).map_err(|e| format!("cannot read manifest: {e}"))?;
     let manifest: ghitabrowser::updater::UpdateManifest =
         serde_json::from_str(&manifest_json).map_err(|e| format!("bad manifest JSON: {e}"))?;
 
@@ -117,15 +121,15 @@ fn command_sign(args: &[String]) -> Result<(), String> {
             ed25519_dalek::VerifyingKey::from(&signing).to_bytes(),
         )
         .map_err(|e| e.to_string())?;
-    package.verify_signature(&trust).map_err(|e| e.to_string())?;
+    package
+        .verify_signature(&trust)
+        .map_err(|e| e.to_string())?;
 
     let output = serde_json::to_vec_pretty(&package.manifest).map_err(|e| e.to_string())?;
     std::fs::write(manifest_path, output).map_err(|e| e.to_string())?;
     println!(
         "signed manifest {} for version {} by key {:?}",
-        manifest_path,
-        package.manifest.version,
-        package.manifest.publisher_key_id
+        manifest_path, package.manifest.version, package.manifest.publisher_key_id
     );
     Ok(())
 }
@@ -172,7 +176,9 @@ fn read_payload_files(
 
 #[cfg(windows)]
 fn fill_random(buffer: &mut [u8]) -> Result<(), String> {
-    use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    use windows::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
     // SAFETY: buffer is a valid slice for the duration of the call; the
     // system-preferred RNG flag needs no algorithm handle.
     let status = unsafe { BCryptGenRandom(None, buffer, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };

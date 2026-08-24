@@ -126,7 +126,14 @@ impl ChildProcessManager {
             .take()
             .ok_or_else(|| "Browser child stdout is unavailable".to_string())?;
         let replies = spawn_reply_reader(stdout);
-        self.native_processes.insert(pid, NativeChildProcess { child, stdin, replies });
+        self.native_processes.insert(
+            pid,
+            NativeChildProcess {
+                child,
+                stdin,
+                replies,
+            },
+        );
         self.processes
             .get_mut(&pid)
             .expect("logical child exists")
@@ -351,9 +358,7 @@ fn resume_child_main_thread(child: &Child) -> Result<(), String> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
-    use windows::Win32::System::Threading::{
-        OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
     let os_pid = child.id();
     unsafe {
@@ -370,8 +375,7 @@ fn resume_child_main_thread(child: &Child) -> Result<(), String> {
             let mut resumed = false;
             loop {
                 if entry.th32OwnerProcessID == os_pid {
-                    if let Ok(thread) =
-                        OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
+                    if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
                     {
                         // Any non-negative return means the thread is running.
                         let _ = ResumeThread(thread);

@@ -1080,8 +1080,7 @@ impl Application for GhitaBrowserApp {
                         .map(|tab| tab.url.starts_with("file://"))
                         .unwrap_or(false);
                     if !current_is_local {
-                        self.status_msg =
-                            "Blocked: web pages cannot open local files".to_string();
+                        self.status_msg = "Blocked: web pages cannot open local files".to_string();
                         return Command::none();
                     }
                 }

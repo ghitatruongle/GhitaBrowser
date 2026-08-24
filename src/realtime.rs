@@ -578,8 +578,7 @@ fn eventsource_transport(
                 }
                 Ok(read) => {
                     pending.reserve(read);
-                    let (_, _, _) =
-                        decoder.decode_to_string(&chunk[..read], &mut pending, false);
+                    let (_, _, _) = decoder.decode_to_string(&chunk[..read], &mut pending, false);
                     if pending.len() > MAX_SSE_BUFFER_BYTES {
                         let _ = events.try_send(EventSourceTransportEvent::Error(
                             "EventSource buffer exceeds 1 MB".to_string(),

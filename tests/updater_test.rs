@@ -255,21 +255,16 @@ fn profile_trusted_publishers_file_cannot_introduce_new_trust() {
         attacker_key.verifying_key().to_bytes(),
     );
     let trust_path = state.join("trusted_publishers.json");
-    std::fs::write(
-        &trust_path,
-        serde_json::to_vec_pretty(&persisted).unwrap(),
+    std::fs::write(&trust_path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+    let mut manager = UpdateManager::new_with_paths(
+        "2.0.0",
+        &install,
+        &state,
+        &profile,
+        PublisherTrustStore::new(),
     )
     .unwrap();
-
-    let mut manager =
-        UpdateManager::new_with_paths(
-            "2.0.0",
-            &install,
-            &state,
-            &profile,
-            PublisherTrustStore::new(),
-        )
-        .unwrap();
     let mut planted = package("2.0.1", None);
     // Re-sign with the attacker key so only the (ignored) planted key could
     // validate it.

@@ -513,13 +513,11 @@ fn cascade_element_with_siblings(
     // Compute real sibling facts for each child in one pass. Summaries are
     // built forward once and borrowed as slices, so the loop stays linear.
     let total_siblings = element.children.len();
-    let mut type_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for child in &element.children {
         *type_counts.entry(child.tag.as_str()).or_insert(0) += 1;
     }
-    let mut type_seen: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut type_seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     // Forward document-order summaries; a child borrows the sub-slice before
     // its own entry is pushed (the last entry is its nearest prior sibling).
     let mut forward_summaries: Vec<crate::css_parser::ElementAncestry> = Vec::new();

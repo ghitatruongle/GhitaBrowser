@@ -9,13 +9,23 @@ pub enum HttpsMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpsUpgradeResult {
-    Upgraded { new_url: String },
-    AlreadySecure { url: String },
+    Upgraded {
+        new_url: String,
+    },
+    AlreadySecure {
+        url: String,
+    },
     /// Schemes that are neither http nor https (file:, ghita:, about:...).
     /// They are not "secure web origins" and must not be labeled as such.
-    NonHttpScheme { url: String },
-    ExemptLocal { url: String },
-    InsecureAllowed { url: String },
+    NonHttpScheme {
+        url: String,
+    },
+    ExemptLocal {
+        url: String,
+    },
+    InsecureAllowed {
+        url: String,
+    },
 }
 
 pub struct HttpsUpgradeEngine {

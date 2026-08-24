@@ -894,11 +894,10 @@ fn layout_node_recursive(
 
     // Resolve an explicit height early so children can resolve their own
     // percentage heights against a definite containing block.
-    let explicit_content_height: Option<f64> = node
-        .computed_style
-        .height
-        .as_ref()
-        .and_then(|unit| resolve_height_unit(unit, containing_height, node.rect.width, root_font_size));
+    let explicit_content_height: Option<f64> =
+        node.computed_style.height.as_ref().and_then(|unit| {
+            resolve_height_unit(unit, containing_height, node.rect.width, root_font_size)
+        });
 
     // Text wrapping with CSS rules
     let text_lines = if node.element.text.is_empty() {
@@ -1706,11 +1705,7 @@ fn is_out_of_flow(node: &LayoutNode) -> bool {
     )
 }
 
-fn resolve_offset(
-    value: Option<&CssUnit>,
-    parent_size: f64,
-    root_font_size: f64,
-) -> Option<f64> {
+fn resolve_offset(value: Option<&CssUnit>, parent_size: f64, root_font_size: f64) -> Option<f64> {
     value.map(|value| {
         value
             .to_pixels(parent_size, root_font_size)
@@ -1731,10 +1726,21 @@ fn finish_layout_node(
 ) -> f64 {
     let original_x = node.rect.x;
     let original_y = node.rect.y;
-    let left = resolve_offset(node.computed_style.left.as_ref(), containing_width, root_font_size);
-    let right =
-        resolve_offset(node.computed_style.right.as_ref(), containing_width, root_font_size);
-    let top = resolve_offset(node.computed_style.top.as_ref(), containing_width, root_font_size);
+    let left = resolve_offset(
+        node.computed_style.left.as_ref(),
+        containing_width,
+        root_font_size,
+    );
+    let right = resolve_offset(
+        node.computed_style.right.as_ref(),
+        containing_width,
+        root_font_size,
+    );
+    let top = resolve_offset(
+        node.computed_style.top.as_ref(),
+        containing_width,
+        root_font_size,
+    );
     // `bottom` is a vertical offset: it resolves against the containing
     // block's HEIGHT, not its width, and anchors the box's bottom edge to
     // the containing block's bottom.
