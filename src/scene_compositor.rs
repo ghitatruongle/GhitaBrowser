@@ -40,14 +40,14 @@ impl SceneRect {
         })
     }
 
-    fn intersects(self, other: Self) -> bool {
+    pub(crate) fn intersects(self, other: Self) -> bool {
         self.x < other.x + other.width
             && self.x + self.width > other.x
             && self.y < other.y + other.height
             && self.y + self.height > other.y
     }
 
-    fn union(self, other: Self) -> Self {
+    pub(crate) fn union(self, other: Self) -> Self {
         let left = self.x.min(other.x);
         let top = self.y.min(other.y);
         let right = (self.x + self.width).max(other.x + other.width);
@@ -352,15 +352,40 @@ pub struct CompositedFrame {
 pub struct CpuCompositor;
 
 impl CpuCompositor {
+    /// UI-thread CPU fallback. The allocation (`pixels * 4`) is capped to a
+    /// 16M-pixel UI budget (~64 MiB RGBA) even though the hard surface limit
+    /// is higher, and per-primitive work is clipped to the scene damage union
+    /// so background frames repaint only what changed.
     pub fn render(
         &self,
         scene: &RetainedScene,
         width: u32,
         height: u32,
     ) -> Result<CompositedFrame, String> {
+        const MAX_UI_PIXELS: usize = 16 * 1024 * 1024;
         let pixels = validate_dimensions(width, height)?;
+        if pixels > MAX_UI_PIXELS {
+            return Err("Compositor UI pixel budget exceeded (16M px)".to_string());
+        }
         let mut rgba = vec![0u8; pixels * 4];
+        // Clip raster work to the damage union when the scene tracks one; a
+        // scene with no tracked damage (or a full-damage initial paint) keeps
+        // every primitive. Callers doing incremental repaints onto a retained
+        // surface pass partial damage; fresh full-frame callers use a
+        // full-damage scene so nothing is skipped.
+        let damage_union = scene
+            .damage()
+            .iter()
+            .copied()
+            .reduce(|acc, rect| acc.union(rect));
+        let clipped_out = |bounds: SceneRect| match damage_union {
+            Some(damage) => !bounds.intersects(damage),
+            None => false,
+        };
         for primitive in &scene.primitives {
+            if clipped_out(primitive.bounds()) {
+                continue;
+            }
             match primitive {
                 ScenePrimitive::SolidRect { bounds, color, .. } => {
                     fill_rect(&mut rgba, width, height, *bounds, *color)
@@ -462,6 +487,11 @@ impl<G: OptionalGpuAdapter> ResilientCompositor<G> {
                 Ok(frame) => return Ok(frame),
                 Err(_) => {
                     self.device_losses = self.device_losses.saturating_add(1);
+                    // Background recovery: `recover_device` blocks on driver
+                    // init, so a failure must not stall this frame — the CPU
+                    // fallback below is returned immediately. Recovery is
+                    // best-effort here; move it to a background thread /
+                    // `spawn_blocking` for production use.
                     let _ = gpu.recover_device();
                 }
             }

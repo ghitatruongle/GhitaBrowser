@@ -119,7 +119,9 @@ impl CacheStorage {
             }
             self.caches.insert(name.to_string(), Cache::new(name));
         }
-        Ok(self.caches.get_mut(name).expect("cache exists"))
+        self.caches
+            .get_mut(name)
+            .ok_or_else(|| "InvalidStateError: cache vanished after insert".to_string())
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -188,6 +190,15 @@ impl CacheStorage {
             schema: u32,
             origin: String,
             caches: HashMap<String, Cache>,
+        }
+        // Reject oversized/corrupt persistence files before slurping them
+        // whole into memory (the IndexedDB sibling already does this).
+        const MAX_PERSISTED_BYTES: u64 = 256 * 1024 * 1024;
+        if path.metadata().map(|m| m.len()).unwrap_or(0) > MAX_PERSISTED_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cache persistence file exceeds budget",
+            ));
         }
         let bytes = fs::read(path)?;
         let persisted: Persisted = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;

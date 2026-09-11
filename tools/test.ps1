@@ -72,7 +72,9 @@ try {
 
     $env:CARGO_BUILD_JOBS = "1"
     $env:CARGO_INCREMENTAL = "0"
-    $env:RUST_MIN_STACK = "16777216"
+    # 32 MB: rustc worker threads overflowed the smaller 16 MB stack while
+    # compiling the larger integration-test crates on low-RAM machines.
+    $env:RUST_MIN_STACK = "33554432"
 
     if ($Tier -in @("fast", "release")) {
         Invoke-Checked "Formatting" { cargo fmt --all -- --check }

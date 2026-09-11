@@ -1,6 +1,6 @@
 [package]
 name = "ghitabrowser"
-version = "2.0.6"
+version = "2.0.7"
 edition = "2021"
 authors = ["GhitaBrowser"]
 description = "A lightweight document-focused browser written in safe Rust"
@@ -53,7 +53,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # HTTP client - real networking
-ureq = { version = "2.9", features = ["json", "brotli", "charset"] }
+ureq = { version = "2.9", features = ["json", "brotli", "charset", "gzip"] }
 
 # WHATWG-compatible response charset decoding (ISO-8859-1 labels map to
 # Windows-1252 as required by modern web content processing).

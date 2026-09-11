@@ -3,39 +3,71 @@
 use crate::parser::Element;
 
 pub fn get_element_by_id_mut<'a>(root: &'a mut Element, id: &str) -> Option<&'a mut Element> {
-    if root.get_attr("id").map(String::as_str) == Some(id) {
-        return Some(root);
+    fn rec<'a>(node: &'a mut Element, id: &str, depth: usize) -> Option<&'a mut Element> {
+        if depth > crate::parser::MAX_DOM_DEPTH * 4 {
+            return None;
+        }
+        if node.get_attr("id").map(String::as_str) == Some(id) {
+            return Some(node);
+        }
+        for child in &mut node.children {
+            if let Some(found) = rec(child, id, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
     }
-    root.children
-        .iter_mut()
-        .find_map(|child| get_element_by_id_mut(child, id))
+    rec(root, id, 0)
 }
 
 pub fn get_element_by_id<'a>(root: &'a Element, id: &str) -> Option<&'a Element> {
-    if root.get_attr("id").map(String::as_str) == Some(id) {
-        return Some(root);
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > crate::parser::MAX_DOM_DEPTH * 4 {
+            continue;
+        }
+        if node.get_attr("id").map(String::as_str) == Some(id) {
+            return Some(node);
+        }
+        for child in node.children.iter().rev() {
+            stack.push((child, depth + 1));
+        }
     }
-    root.children
-        .iter()
-        .find_map(|child| get_element_by_id(child, id))
+    None
 }
 
 pub fn query_selector_mut<'a>(root: &'a mut Element, selector: &str) -> Option<&'a mut Element> {
-    if matches_selector(root, selector) {
-        return Some(root);
+    fn rec<'a>(node: &'a mut Element, selector: &str, depth: usize) -> Option<&'a mut Element> {
+        if depth > crate::parser::MAX_DOM_DEPTH * 4 {
+            return None;
+        }
+        if matches_selector(node, selector) {
+            return Some(node);
+        }
+        for child in &mut node.children {
+            if let Some(found) = rec(child, selector, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
     }
-    root.children
-        .iter_mut()
-        .find_map(|child| query_selector_mut(child, selector))
+    rec(root, selector, 0)
 }
 
 pub fn query_selector<'a>(root: &'a Element, selector: &str) -> Option<&'a Element> {
-    if matches_selector(root, selector) {
-        return Some(root);
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > crate::parser::MAX_DOM_DEPTH * 4 {
+            continue;
+        }
+        if matches_selector(node, selector) {
+            return Some(node);
+        }
+        for child in node.children.iter().rev() {
+            stack.push((child, depth + 1));
+        }
     }
-    root.children
-        .iter()
-        .find_map(|child| query_selector(child, selector))
+    None
 }
 
 pub fn set_text_content(element: &mut Element, value: &str) {
@@ -68,7 +100,7 @@ fn matches_selector(element: &Element, selector: &str) -> bool {
     if let Some(class) = selector.strip_prefix('.') {
         return element
             .get_attr("class")
-            .is_some_and(|classes| classes.split_ascii_whitespace().any(|value| value == class));
+            .is_some_and(|classes| classes.split_whitespace().any(|value| value == class));
     }
     !selector.is_empty() && element.tag.eq_ignore_ascii_case(selector)
 }

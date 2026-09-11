@@ -12,6 +12,7 @@ fn make_fetch_result(body: &str, url: &str) -> FetchResult {
         headers: HashMap::new(),
         fetch_time_ms: 10,
         set_cookie_headers: vec![],
+        set_cookie_hosts: Vec::new(),
     }
 }
 

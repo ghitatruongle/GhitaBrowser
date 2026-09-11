@@ -60,20 +60,43 @@ pub struct JobObjectSandbox {
 impl JobObjectSandbox {
     pub fn new(job_id: u64, policy: SandboxPolicy) -> Self {
         #[cfg(windows)]
-        let native_job = create_native_job(&policy).ok();
+        let (native_job, terminated) = match create_native_job(&policy) {
+            Ok(job) => (Some(job), false),
+            // Fail closed: without a native job the sandbox must refuse work.
+            Err(_) => (None, true),
+        };
         Self {
             job_id,
             policy,
             active_processes: Vec::new(),
+            #[cfg(windows)]
+            terminated,
+            #[cfg(not(windows))]
             terminated: false,
             #[cfg(windows)]
             native_job,
         }
     }
 
+    /// Fallible constructor for callers that want an explicit error instead
+    /// of a fail-closed (terminated) sandbox.
+    pub fn try_new(job_id: u64, policy: SandboxPolicy) -> Result<Self, String> {
+        let sandbox = Self::new(job_id, policy);
+        #[cfg(windows)]
+        if !sandbox.has_native_job() {
+            return Err("Sandbox requires a native Windows Job Object".to_string());
+        }
+        Ok(sandbox)
+    }
+
     pub fn assign_process(&mut self, process_id: ProcessId) -> Result<(), String> {
         if self.terminated {
             return Err("Cannot assign process to terminated sandbox".to_string());
+        }
+        // On Windows the logical assignment is meaningless without the OS job.
+        #[cfg(windows)]
+        if !self.has_native_job() {
+            return Err("Native Windows Job Object is unavailable".to_string());
         }
         if !self.active_processes.contains(&process_id) {
             self.active_processes.push(process_id);
@@ -94,12 +117,34 @@ impl JobObjectSandbox {
 
     pub fn validate_site_access(&self, target_origin: &str) -> bool {
         match &self.policy.allowed_origin {
-            Some(allowed) => allowed == target_origin,
+            Some(allowed) => {
+                // Compare origins canonically so trailing slashes, case and
+                // default ports cannot bypass isolation.
+                let parse_origin = |s: &str| {
+                    url::Url::parse(s)
+                        .ok()
+                        .filter(|u| matches!(u.scheme(), "http" | "https"))
+                        .map(|u| u.origin().ascii_serialization())
+                };
+                match (parse_origin(allowed), parse_origin(target_origin)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                }
+            }
             None => true, // Non-renderer processes have global network access
         }
     }
 
     pub fn terminate(&mut self) {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::JobObjects::TerminateJobObject;
+            if let Some(job) = self.native_job {
+                unsafe {
+                    let _ = TerminateJobObject(job, 1);
+                }
+            }
+        }
         self.terminated = true;
         self.active_processes.clear();
     }

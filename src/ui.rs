@@ -227,11 +227,12 @@ fn build_video_info_html(video_id: &str, source_url: &str) -> String {
          <a class=\"btn\" href=\"https://www.youtube.com/embed/{id}\">Watch via Embed</a>\
          <a class=\"btn btn-secondary\" href=\"ghita://search?q={id}\">Search in Ghita</a>\
          </div>\
-         <p class=\"notice\">GhitaBrowser 2.0.6 document player mode active.</p>\
+         <p class=\"notice\">GhitaBrowser {version} document player mode active.</p>\
          </div></body></html>",
         id = safe_id,
         url = safe_url,
         thumb = safe_thumb,
+        version = crate::VERSION,
         title = title
     )
 }
@@ -761,6 +762,11 @@ pub struct GhitaBrowserApp {
     canvas_cache: canvas::Cache,
     /// Decoded image handles (url -> RGBA pixels) for the web page widget
     page_image_handles: Arc<HashMap<String, iced::widget::image::Handle>>,
+    /// Debounce for UI-thread display-list rebuilds (see `rebuild_display_list`).
+    last_display_rebuild: Option<std::time::Instant>,
+    /// URL the current `display_list` was built for; used to avoid skipping
+    /// a rebuild after navigation while still coalescing rapid repeats.
+    last_display_url: String,
 
     // DevTools
     show_devtools: bool,
@@ -997,6 +1003,8 @@ impl Application for GhitaBrowserApp {
             youtube_playback: None,
             display_list: Arc::new(DisplayList::default()),
             page_image_handles: Arc::new(HashMap::new()),
+            last_display_rebuild: None,
+            last_display_url: String::new(),
             canvas_cache: canvas::Cache::new(),
             show_devtools: false,
             dev_pane: DevPane::Console,
@@ -1362,6 +1370,12 @@ impl Application for GhitaBrowserApp {
                     Ok(tick) => {
                         if tick.video_frame_presented {
                             if let Some(frame) = playback.controller.current_video_frame() {
+                                // `current_video_frame` returns a borrow, so the
+                                // RGBA bytes must be copied into the iced
+                                // `Handle` (which takes ownership). The copy
+                                // is bounded by the decoded frame size; a
+                                // future `Arc<[u8]>`/bytes-backed handle would
+                                // remove it entirely.
                                 playback.frame_handle =
                                     Some(iced::widget::image::Handle::from_pixels(
                                         frame.width,
@@ -2175,6 +2189,18 @@ impl Application for GhitaBrowserApp {
                 tab_id,
                 seq,
             } => {
+                // NOTE (UI-thread pipeline): this arm currently runs the full
+                // parse/style/layout/paint pipeline synchronously on the Iced
+                // UI thread (`update` must stay non-blocking). Heavy stages
+                // below — `worker::prepare_document_isolated` /
+                // `prepare_pdf_isolated`, `PageRuntime::from_element_*`,
+                // `build_display_list_with_cache`, reader-mode extraction —
+                // belong in `tokio::task::spawn_blocking` with the prepared
+                // bundle posted back as a `Message` (see `start_fetch` for the
+                // async pattern). Iced `update` signatures are intentionally
+                // unchanged here. As a stopgap, layout is reused from the
+                // cached `Tab::layout` and `rebuild_display_list` is
+                // debounced below to avoid repeated UI-thread work.
                 // Discard responses for loads superseded by a newer navigation
                 // or search in the same tab (e.g. user typed a new URL while
                 // the old one was still in flight).
@@ -2223,9 +2249,20 @@ impl Application for GhitaBrowserApp {
                 if !incognito {
                     if let Ok(parsed) = url::Url::parse(&url) {
                         if let Some(host) = parsed.host_str() {
-                            for header in &result.set_cookie_headers {
-                                let cookie =
-                                    crate::storage::Cookie::from_set_cookie_header(header, host);
+                            // Attribute each Set-Cookie to the hop that sent
+                            // it (falls back to the final host for results
+                            // without per-hop attribution).
+                            let hosts = &result.set_cookie_hosts;
+                            for (index, header) in result.set_cookie_headers.iter().enumerate() {
+                                let origin_host = hosts
+                                    .get(index)
+                                    .map(String::as_str)
+                                    .filter(|candidate| !candidate.is_empty())
+                                    .unwrap_or(host);
+                                let cookie = crate::storage::Cookie::from_set_cookie_header(
+                                    header,
+                                    origin_host,
+                                );
                                 if !cookie.name.is_empty() {
                                     self.browser.storage.cookies_mut().add_cookie(cookie);
                                 }
@@ -3368,6 +3405,13 @@ impl GhitaBrowserApp {
     /// Rebuild the pixel display list for the active tab, load any pending
     /// images (so they become `DisplayItem::Image`), and refresh the decoded
     /// image handles used by the page widget.
+    ///
+    /// NOTE: this runs on the Iced UI thread. Prefer reusing the cached
+    /// `Tab::layout` (done in `build_list` below) and move full re-layout /
+    /// display-list builds into `tokio::task::spawn_blocking`, posting the
+    /// result back as a `Message`. The short debounce here only coalesces
+    /// rapid successive calls (runtime ticks, image batches) for the same URL
+    /// and never changes `update` signatures.
     fn rebuild_display_list(&mut self) {
         fn build_list(
             browser: &crate::Browser,
@@ -3397,11 +3441,29 @@ impl GhitaBrowserApp {
         }
 
         // Build display list with whatever images are already decoded.
+        // Debounce rapid repeats for the same URL (runtime ticks, image
+        // batches); a navigation (URL change) always rebuilds.
+        const REBUILD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(32);
+        let active_url = self
+            .browser
+            .active_tab()
+            .map(|tab| tab.url.clone())
+            .unwrap_or_default();
+        if let Some(last) = self.last_display_rebuild {
+            if last.elapsed() < REBUILD_DEBOUNCE
+                && active_url == self.last_display_url
+                && !self.display_list.is_empty()
+            {
+                return;
+            }
+        }
         let list = build_list(&self.browser, &self.browser.image_cache);
 
         self.display_list = Arc::new(list);
         self.refresh_image_handles();
         self.canvas_cache.clear();
+        self.last_display_rebuild = Some(std::time::Instant::now());
+        self.last_display_url = active_url;
     }
 
     /// Spawn async image loading for any PendingImage items in the display list.
@@ -3443,14 +3505,49 @@ impl GhitaBrowserApp {
         self.load_seq = self.load_seq.wrapping_add(1);
         let seq = self.load_seq;
         self.pending_image_batches.insert(tab_id, seq);
+        // Cancellation token for this tab; checked per iteration inside the
+        // concurrent batch so navigation abandons remaining fetches early.
+        let cancel = self
+            .load_cancellations
+            .get(&tab_id)
+            .cloned()
+            .unwrap_or_default();
 
         Command::perform(
             async move {
+                // Concurrent fetch/decode with a small bound (pending_urls is
+                // already capped at 8). Each iteration checks cancellation so
+                // a navigation mid-batch stops scheduling new work.
+                const MAX_CONCURRENT_IMAGES: usize = 4;
+                let cancel = cancel.clone();
                 let mut loaded = Vec::new();
-                for url in &pending_urls {
-                    let result = crate::image_loader::fetch_and_decode_image_async(url).await;
-                    if let Ok(image_data) = result {
-                        loaded.push(image_data);
+                let mut index = 0;
+                while index < pending_urls.len() {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let end = (index + MAX_CONCURRENT_IMAGES).min(pending_urls.len());
+                    let mut set = tokio::task::JoinSet::new();
+                    for url in pending_urls[index..end].iter().cloned() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        set.spawn(async move {
+                            crate::image_loader::fetch_and_decode_image_async(&url).await
+                        });
+                    }
+                    index = end;
+                    while let Some(joined) = set.join_next().await {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        match joined {
+                            Ok(Ok(image_data)) => loaded.push(image_data),
+                            _ => {}
+                        }
+                    }
+                    if cancel.is_cancelled() {
+                        break;
                     }
                 }
                 loaded
@@ -3464,6 +3561,12 @@ impl GhitaBrowserApp {
     }
 
     /// Rebuild the url -> RGBA Handle map from the decoded image cache.
+    ///
+    /// NOTE: `Handle::from_pixels` takes an owned `Vec<u8>`, so the cached
+    /// RGBA bytes must be copied into the handle. The cache holds
+    /// `Arc<ImageData>` (cheap `Arc` clone via `get_decoded`); the pixel
+    /// memcpy is only done once per URL and is moved out of the `Arc` without
+    /// an extra copy when this is the last owner.
     fn refresh_image_handles(&mut self) {
         let mut handles: HashMap<String, iced::widget::image::Handle> = HashMap::new();
         for item in &self.display_list.items {
@@ -3472,13 +3575,13 @@ impl GhitaBrowserApp {
                     continue;
                 }
                 if let Some(data) = self.browser.image_cache.get_decoded(url) {
+                    let (width, height, pixels) = match std::sync::Arc::try_unwrap(data) {
+                        Ok(owned) => (owned.width, owned.height, owned.rgba_pixels),
+                        Err(shared) => (shared.width, shared.height, shared.rgba_pixels.clone()),
+                    };
                     handles.insert(
                         url.clone(),
-                        iced::widget::image::Handle::from_pixels(
-                            data.width,
-                            data.height,
-                            data.rgba_pixels.clone(),
-                        ),
+                        iced::widget::image::Handle::from_pixels(width, height, pixels),
                     );
                 }
             }
@@ -4606,7 +4709,21 @@ impl GhitaBrowserApp {
 
     #[cfg(target_os = "windows")]
     fn build_youtube_player(&self, pal: &'static Pal) -> Element<'_, Message> {
-        let playback = self.youtube_playback.as_ref().expect("player exists");
+        // The view path must never panic: the player can be torn down
+        // (tab switch, sleep, error) between state changes and a `view`
+        // call, so return a fallback widget instead of `expect`.
+        let Some(playback) = self.youtube_playback.as_ref() else {
+            return container(
+                text("Video player unavailable")
+                    .size(16)
+                    .style(iced::theme::Text::from(pal.text_dim)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(360.0))
+            .center_x()
+            .center_y()
+            .into();
+        };
         let controls = playback.controller.controls();
         let duration = controls.duration_seconds.unwrap_or_default();
         let title = &playback.controller.response.title;

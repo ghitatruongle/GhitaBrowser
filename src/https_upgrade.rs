@@ -26,6 +26,28 @@ pub enum HttpsUpgradeResult {
     InsecureAllowed {
         url: String,
     },
+    /// The input could not be parsed as a URL. Fail-closed: unlike
+    /// `InsecureAllowed`, this signals callers must NOT navigate or fetch
+    /// the raw input as an insecure fallback.
+    Invalid {
+        url: String,
+    },
+    /// An http URL that was denied rather than upgraded/allowed
+    /// (fail-closed for parse failures when callers need an explicit
+    /// blocked signal distinct from `Invalid`).
+    InsecureBlocked {
+        url: String,
+    },
+}
+
+impl HttpsUpgradeResult {
+    /// True for fail-closed outcomes that must not proceed as insecure.
+    pub fn is_blocked(&self) -> bool {
+        matches!(
+            self,
+            HttpsUpgradeResult::Invalid { .. } | HttpsUpgradeResult::InsecureBlocked { .. }
+        )
+    }
 }
 
 pub struct HttpsUpgradeEngine {
@@ -46,12 +68,15 @@ impl HttpsUpgradeEngine {
     }
 
     pub fn evaluate_url(&self, url: &str) -> HttpsUpgradeResult {
+        // Fail-closed: unparseable input is never reported as
+        // `InsecureAllowed` (fail-open). Callers must treat `Invalid` as
+        // blocked.
         let parsed = match url::Url::parse(url) {
             Ok(parsed) => parsed,
             Err(_) => {
-                return HttpsUpgradeResult::InsecureAllowed {
+                return HttpsUpgradeResult::Invalid {
                     url: url.to_string(),
-                }
+                };
             }
         };
         if parsed.scheme() == "https" {
@@ -66,12 +91,7 @@ impl HttpsUpgradeEngine {
         }
 
         let domain = parsed.host_str().unwrap_or("");
-
-        if self
-            .exemptions
-            .iter()
-            .any(|ex| domain.eq_ignore_ascii_case(ex.trim_matches(['[', ']'])))
-        {
+        if is_exempt_local(domain, &self.exemptions) {
             return HttpsUpgradeResult::ExemptLocal {
                 url: url.to_string(),
             };
@@ -84,12 +104,64 @@ impl HttpsUpgradeEngine {
             HttpsMode::EnabledAll => {
                 let mut upgraded = parsed;
                 let _ = upgraded.set_scheme("https");
+                // `http://host:80/x` must become `https://host/x`: an
+                // explicit :80 is the default for http but a non-default
+                // (and wrong) port for https. `Url::set_scheme` preserves
+                // the port, so drop it explicitly.
+                if upgraded.port() == Some(80) {
+                    let _ = upgraded.set_port(None);
+                }
                 HttpsUpgradeResult::Upgraded {
                     new_url: upgraded.into(),
                 }
             }
         }
     }
+}
+
+/// Normalize a host for exemption comparison: strip brackets (IPv6
+/// `[::1]`), strip a single trailing dot (`localhost.`), trim whitespace
+/// and lowercase. Both the request host and each exemption entry are
+/// normalized so `[::1]` and `::1` compare equal.
+fn normalize_exempt_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches([']', '.'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn is_exempt_local(host: &str, exemptions: &[String]) -> bool {
+    let normalized = normalize_exempt_host(host);
+    if normalized.is_empty() {
+        return false;
+    }
+    // Any loopback IP (127.0.0.1, ::1, 127.x.x.x, ...) is local, even if
+    // not listed in `exemptions`. Parsing covers bracket-stripped forms.
+    if normalized
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+    {
+        return true;
+    }
+    if normalized == "localhost" {
+        return true;
+    }
+    exemptions
+        .iter()
+        .map(|ex| normalize_exempt_host(ex))
+        .any(|ex| {
+            if ex.is_empty() {
+                return false;
+            }
+            if ex
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+            {
+                return normalized == ex;
+            }
+            normalized == ex
+        })
 }
 
 #[cfg(test)]

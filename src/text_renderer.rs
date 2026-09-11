@@ -24,7 +24,35 @@ impl TextRenderer {
         output
     }
 
+    /// Iterative pre-order walk (explicit stack, no recursion) with a depth
+    /// limit and an output cap so adversarially deep/wide layouts cannot
+    /// overflow the stack or grow the string without bound.
     fn render_node(&self, node: &LayoutNode, indent: usize, output: &mut String) {
+        const MAX_RENDER_DEPTH: usize = 512;
+        const MAX_RENDER_BYTES: usize = 2 * 1024 * 1024;
+        // Explicit (node, indent, depth) stack; children pushed in reverse so
+        // output order matches the former recursive pre-order walk.
+        let mut work: Vec<(&LayoutNode, usize, usize)> = vec![(node, indent, 0)];
+        while let Some((current, current_indent, depth)) = work.pop() {
+            if output.len() >= MAX_RENDER_BYTES {
+                output.push_str("\n…[truncated: output cap reached]\n");
+                return;
+            }
+            if depth > MAX_RENDER_DEPTH {
+                continue;
+            }
+            Self::render_single(current, current_indent, depth, output, &mut work);
+        }
+    }
+
+    /// Emit one node and push its children onto the iterative work stack.
+    fn render_single<'a>(
+        node: &'a LayoutNode,
+        indent: usize,
+        depth: usize,
+        output: &mut String,
+        work: &mut Vec<(&'a LayoutNode, usize, usize)>,
+    ) {
         let space = "  ".repeat(indent);
 
         match node.rect.display {
@@ -51,8 +79,8 @@ impl TextRenderer {
                     output.push_str(&format!("{}{}\n", space, tag_display));
                 }
 
-                for child in &node.children {
-                    self.render_node(child, indent + 1, output);
+                for child in node.children.iter().rev() {
+                    work.push((child, indent + 1, depth + 1));
                 }
             }
             DisplayType::Inline | DisplayType::InlineBlock | DisplayType::TableCell => {
@@ -62,8 +90,8 @@ impl TextRenderer {
                         output.push('\n');
                     }
                 }
-                for child in &node.children {
-                    self.render_node(child, indent, output);
+                for child in node.children.iter().rev() {
+                    work.push((child, indent, depth + 1));
                 }
             }
             DisplayType::None => {}

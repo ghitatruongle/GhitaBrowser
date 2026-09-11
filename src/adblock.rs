@@ -167,6 +167,12 @@ impl AdBlocker {
             .blocked
     }
 
+    /// Evaluate a request. Safety bypass: top-level `Document` loads and
+    /// requests with an empty page context are ALWAYS allowed
+    /// (`SafetyBypass`), even when an explicit custom `BLOCK` rule matches.
+    /// Blocking the top-level document or acting without a trustworthy
+    /// top-level context would break navigation and risks false positives;
+    /// only third-party subresources are blockable.
     pub fn evaluate_resource(
         &mut self,
         url: &str,
@@ -569,10 +575,13 @@ fn host_matches(host: &str, pattern: &str) -> bool {
     !pattern.is_empty() && (host == pattern || host.ends_with(&format!(".{pattern}")))
 }
 
+/// Same-site per registrable domain (eTLD+1) equality only.
+///
+/// There is deliberately no `host_matches` suffix shortcut here:
+/// `host_matches("evil.com", "com")` is true, but `evil.com` is NOT
+/// same-site with `com`. Suffix matching would collapse every host under a
+/// shared suffix to same-site. Only exact eTLD+1 equality counts.
 fn same_site(left: &str, right: &str) -> bool {
-    if host_matches(left, right) || host_matches(right, left) {
-        return true;
-    }
     registrable_domain(left) == registrable_domain(right)
 }
 

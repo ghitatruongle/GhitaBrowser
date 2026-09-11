@@ -189,6 +189,13 @@ fn storage_network_grants_persist_and_uninstall_removes_only_owned_data() {
     }
     {
         let mut manager = ExtensionManager::new_with_profile(&root).unwrap();
+        // Trust is binary-pinned now; the profile file no longer grants it.
+        // Re-insert the session publisher and reload explicitly — mirrors
+        // the documented runtime-trust flow.
+        manager
+            .trust_publisher("phase26-test-publisher", public_key)
+            .unwrap();
+        manager.reload_installed().unwrap();
         assert_eq!(
             manager.storage_get("persistent_ext", "theme").unwrap(),
             Some(&"dark".to_string())

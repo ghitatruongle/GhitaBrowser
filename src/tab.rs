@@ -51,14 +51,29 @@ impl HistoryEntry {
     }
 
     /// Compress a DOM tree into a compact binary representation
+    ///
+    /// NOTE: sync serde+gzip runs on the caller (today: the Iced UI thread
+    /// via `sleep`/`push_history`). Move snapshot compression into
+    /// `tokio::task::spawn_blocking` and post the bytes back, keeping the UI
+    /// non-blocking. A byte cap below keeps a pathological DOM from
+    /// stalling or OOMing the UI thread in the meantime.
     fn compress_dom(dom: &Element) -> Option<Vec<u8>> {
         // Don't compress trivial DOMs
         if dom.children.is_empty() && dom.tag == "root" {
             return None;
         }
 
-        // Serialize to JSON first
+        // Serialize to JSON first (byte-capped: huge DOMs skip the snapshot
+        // rather than stalling the UI thread in serde+gzip).
+        const MAX_SNAPSHOT_JSON_BYTES: usize = 8 * 1024 * 1024;
         let json = serde_json::to_vec(dom).ok()?;
+        if json.len() > MAX_SNAPSHOT_JSON_BYTES {
+            log::warn!(
+                "Skipping history DOM snapshot: {} bytes exceeds the cap",
+                json.len()
+            );
+            return None;
+        }
 
         // Compress with gzip for better compression ratio
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -181,8 +196,13 @@ fn flatten_deep(root: Element, max_depth: usize) -> Element {
         let eff_depth = raw_depth.min(max_depth);
         // Attach completed subtrees: any top whose depth >= eff_depth is
         // closed into the node that will be the new sibling's parent.
-        while !depths.is_empty() && *depths.last().unwrap() >= eff_depth {
-            let child = stack.pop().unwrap();
+        while let Some(&top) = depths.last() {
+            if top < eff_depth {
+                break;
+            }
+            let Some(child) = stack.pop() else {
+                break;
+            };
             depths.pop();
             if let Some(parent) = stack.last_mut() {
                 parent.add_child(child);
@@ -192,10 +212,17 @@ fn flatten_deep(root: Element, max_depth: usize) -> Element {
         depths.push(eff_depth);
     }
     while stack.len() > 1 {
-        let child = stack.pop().unwrap();
+        let Some(child) = stack.pop() else {
+            break;
+        };
         depths.pop();
         if let Some(parent) = stack.last_mut() {
             parent.add_child(child);
+        } else {
+            // Orphaned child with no parent to attach to: it becomes the
+            // fallback root below; keep it to avoid silently dropping content.
+            stack.push(child);
+            break;
         }
     }
     stack.pop().unwrap_or_else(|| Element::new("html"))
@@ -468,7 +495,9 @@ impl Tab {
 
     /// Hibernate the tab to save memory (Chrome Memory Saver).
     /// Compresses the DOM tree into a compact binary format and drops
-    /// the in-memory tree and layout tree. Preserves:
+    /// the in-memory tree and layout tree. NOTE: the sync serde+gzip snapshot
+    /// below runs on the caller (UI thread); move it to `spawn_blocking`.
+    /// Preserves:
     /// - URL, title, incognito flag
     /// - History stack (needed for back/forward)
     /// - Pinned status, last_active_timestamp
@@ -597,13 +626,19 @@ impl Tab {
     /// Compress the current DOM tree into a compact binary representation.
     /// Uses JSON serialization via serde with gzip compression for efficiency.
     /// Returns None if the DOM is empty or serialization fails.
+    ///
+    /// NOTE: sync serde+gzip runs on the caller (today: the UI thread via
+    /// `sleep`/`discard`). Prefer `tokio::task::spawn_blocking` for the
+    /// serialize+compress step; the byte cap below only bounds how much work
+    /// the UI thread will do synchronously.
     fn compress_dom(&self) -> Option<Vec<u8>> {
         // Don't compress trivial DOMs (just root with no children)
         if self.dom.children.is_empty() && self.dom.tag == "root" {
             return None;
         }
 
-        // Serialize to JSON first
+        // Serialize to JSON first (byte-capped).
+        const MAX_SNAPSHOT_JSON_BYTES: usize = 8 * 1024 * 1024;
         let json = match serde_json::to_vec(&self.dom) {
             Ok(data) => data,
             Err(e) => {
@@ -611,6 +646,14 @@ impl Tab {
                 return None;
             }
         };
+        if json.len() > MAX_SNAPSHOT_JSON_BYTES {
+            log::warn!(
+                "Skipping sleep snapshot for {}: {} bytes exceeds the cap",
+                self.url,
+                json.len()
+            );
+            return None;
+        }
 
         // Compress with gzip
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -691,6 +734,8 @@ impl Tab {
 
     /// Mark this tab as discarded by the memory-pressure monitor.
     /// Drops DOM and layout (like sleep) but sets is_discarded instead.
+    /// NOTE: sync snapshot accounting here runs on the UI thread; move any
+    /// future serde+gzip work to `spawn_blocking` (see `sleep`).
     pub fn discard(&mut self) -> usize {
         if self.is_discarded {
             return 0;

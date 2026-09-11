@@ -29,6 +29,11 @@ impl ThirdPartyCookieBlocker {
                     .trim_start_matches('.')
                     .trim_end_matches('.')
                     .to_ascii_lowercase();
+                // Reject public-suffix cookie domains outright: allowing
+                // Domain=github.io would leak across tenants.
+                if cookie.is_empty() || crate::public_suffix::is_public_suffix(&cookie) {
+                    return false;
+                }
                 top.is_some_and(|top| domain_matches(&top, &cookie))
             }
         }
@@ -49,10 +54,24 @@ pub struct CanvasFingerprintProtector {
 }
 
 impl CanvasFingerprintProtector {
+    #[deprecated(
+        since = "2.0.7",
+        note = "fixed seed is a stable cross-session identifier; use for_origin instead"
+    )]
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            noise_seed: 0x1337_c0de,
+            // Randomized per-process fallback instead of a fixed constant.
+            noise_seed: Self::process_secret(),
+        }
+    }
+
+    /// Non-deprecated constructor for tests and callers that explicitly want
+    /// a deterministic seed.
+    pub fn new_for_tests(enabled: bool, seed: u32) -> Self {
+        Self {
+            enabled,
+            noise_seed: seed,
         }
     }
 
@@ -82,20 +101,49 @@ impl CanvasFingerprintProtector {
     fn process_secret() -> u32 {
         static SECRET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         *SECRET.get_or_init(|| {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let seed = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            let stack_addr = &seed as *const u64 as u64;
-            use std::hash::{BuildHasher, Hasher};
-            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-            hasher.write_u64(stack_addr);
-            let mixed = (hasher.finish() as u32) ^ (seed as u32);
-            if mixed == 0 {
+            // Prefer OS entropy; fall back to a hashed time+counter mix only
+            // if the OS RNG is unavailable (fail-closed non-zero).
+            #[cfg(windows)]
+            {
+                // BCryptGenRandom via getrandom-style read: use system time +
+                // process id hashed — Windows getrandom crate is not a direct
+                // dep, so mix multiple independent sources.
+                use std::hash::{BuildHasher, Hash, Hasher};
+                let builder = std::collections::hash_map::RandomState::new();
+                let mut hasher = builder.build_hasher();
+                std::process::id().hash(&mut hasher);
+                std::time::SystemTime::now().hash(&mut hasher);
+                // Include a stack address for per-process ASLR entropy.
+                let stack_probe = 0u8;
+                std::ptr::addr_of!(stack_probe).hash(&mut hasher);
+                let buf = (hasher.finish() as u32).to_le_bytes();
+                // Mix in high-resolution counter for extra variance.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E37_79B9_7F4A_7C15);
+                let mixed = u32::from_le_bytes(buf) ^ (nanos as u32).rotate_left(13);
+                if mixed != 0 {
+                    return mixed;
+                }
+                return 0x9E37_79B9;
+            }
+            #[cfg(not(windows))]
+            {
+                // Try /dev/urandom; fall back to hashed mix.
+                if std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| {
+                        use std::io::Read;
+                        f.read_exact(&mut buf)
+                    })
+                    .is_ok()
+                {
+                    let v = u32::from_le_bytes(buf);
+                    if v != 0 {
+                        return v;
+                    }
+                }
                 0x9E37_79B9
-            } else {
-                mixed
             }
         })
     }
@@ -139,6 +187,7 @@ mod tests {
 
     #[test]
     fn canvas_fingerprint_noise_scrambling() {
+        #[allow(deprecated)]
         let mut protector = CanvasFingerprintProtector::new(true);
         let mut pixels = vec![100, 150, 200, 255, 50, 60, 70, 255];
         let original_alpha1 = pixels[3];

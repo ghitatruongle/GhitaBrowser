@@ -30,12 +30,19 @@ GhitaBrowser is not a full modern web-platform implementation. Its JavaScript
 engine supports a bounded language subset but not a complete DOM or Web APIs.
 Sites requiring unsupported SPA hydration, DRM, live video output, WebRTC,
 service workers or browser extensions may show a readable fallback instead of
-the interactive app. Media and MSE processing remain bounded, and direct
+the interactive app. Media processing is bounded by one shared decoded-byte
+ceiling (64 MB per asset/pipeline, split 48 MB video / 16 MB audio) enforced
+identically at the decoder and the page pipeline — oversized input is rejected
+early instead of being decoded and discarded. MediaSource queues hold up to
+256 MB of ENCODED (not decoded) bytes, a distinct evictable resource. Direct
 YouTube playback is an explicit opt-in for the personal build.
 
-PiP, Web Capture, sidebar apps, quick notes, split-screen and password autofill
-are not advertised as 2.0 features because their experimental modules do not yet
-meet the release criteria. See the [security boundaries](SECURITY.md).
+Picture-in-Picture, Web Capture, sidebar apps, quick notes, split-screen and
+password autofill are not 2.0 features: the first five exist only as small,
+unwired prototype modules that no UI surface, shortcut or setting can reach
+(split-screen has no implementation at all), and password storage is excluded
+from the interface until it uses the operating-system credential vault rather
+than reversible obfuscation. See the [security boundaries](SECURITY.md).
 
 ## Build and test
 

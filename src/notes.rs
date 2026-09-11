@@ -1,4 +1,11 @@
 // Quick notes manager
+//
+// 2.0.7 disposition (audit 2026-08-26): intentionally UNSHIPPED prototype.
+// `NoteStore` is sound in isolation (monotonic ids, unit-tested) but is not
+// reachable from the UI, not persisted through `StorageManager`, and the
+// `ghita://notes` sidebar pin points at an unimplemented internal page. Do
+// not surface it until it has: StorageManager persistence, a notes panel,
+// and integration coverage — see README "Deliberate limitations".
 
 use serde::{Deserialize, Serialize};
 

@@ -47,6 +47,7 @@ pub struct PromiseRuntime {
     records: BTreeMap<PromiseId, PromiseRecord>,
     jobs: BTreeMap<u64, QueuedReaction>,
     event_loop: AgentEventLoop,
+    truncated: bool,
 }
 
 impl PromiseRuntime {
@@ -58,6 +59,7 @@ impl PromiseRuntime {
             records: BTreeMap::new(),
             jobs: BTreeMap::new(),
             event_loop: AgentEventLoop::new(0, max_microtasks),
+            truncated: false,
         }
     }
 
@@ -88,6 +90,14 @@ impl PromiseRuntime {
         self.jobs.len()
     }
 
+    /// True when the last [`Self::drain_jobs`] stopped with jobs still pending
+    /// (caller `max_jobs` budget exhausted). Pair with [`Self::pending_jobs`]:
+    /// a truncated drain returns `Ok(processed)` — partial success is not an
+    /// error — and the caller checks this flag to decide whether to re-drive.
+    pub fn drain_truncated(&self) -> bool {
+        self.truncated
+    }
+
     pub fn then(
         &mut self,
         promise: PromiseId,
@@ -109,7 +119,7 @@ impl PromiseRuntime {
             PromiseState::Pending => {
                 self.records
                     .get_mut(&promise)
-                    .expect("Promise record was validated")
+                    .ok_or_else(|| "Unknown Promise record".to_string())?
                     .reactions
                     .push(reaction);
                 Ok(())
@@ -136,6 +146,7 @@ impl PromiseRuntime {
     where
         F: FnMut(u64, RuntimeValue) -> Result<RuntimeValue, RuntimeValue>,
     {
+        self.truncated = false;
         let mut processed = 0;
         while processed < max_jobs {
             let Some(job) = self.event_loop.pop_next_ready() else {
@@ -159,9 +170,10 @@ impl PromiseRuntime {
             }
             processed += 1;
         }
-        if self.pending_jobs() > 0 {
-            return Err("Promise job execution budget exceeded".to_string());
-        }
+        // Partial success is success: report how many jobs ran and flag the
+        // remaining budget overrun instead of converting completed work into
+        // an Err (which would discard `processed` for the caller).
+        self.truncated = self.pending_jobs() > 0;
         Ok(processed)
     }
 
@@ -181,7 +193,9 @@ impl PromiseRuntime {
         let (argument, rejected_input) = match state {
             PromiseState::Fulfilled(value) => (value, false),
             PromiseState::Rejected(reason) => (reason, true),
-            PromiseState::Pending => unreachable!(),
+            PromiseState::Pending => {
+                return Err("Cannot settle a Promise as pending".to_string());
+            }
         };
 
         let mut first_error = None;
@@ -319,9 +333,13 @@ mod tests {
         let second = runtime.then(first, Some(1), None).unwrap();
         let third = runtime.then(second, Some(2), None).unwrap();
         runtime.resolve(first, RuntimeValue::Undefined).unwrap();
-        assert!(runtime
+        // Partial success: one job ran, the rest stays queued and the
+        // truncation flag records the budget overrun (no Err).
+        let processed = runtime
             .drain_jobs(1, |_, _| Ok(RuntimeValue::Undefined))
-            .is_err());
+            .unwrap();
+        assert_eq!(processed, 1);
+        assert!(runtime.drain_truncated());
         assert_eq!(runtime.pending_jobs(), 1);
         assert_eq!(runtime.state(third), Some(&PromiseState::Pending));
     }

@@ -567,22 +567,25 @@ impl TypedArrayKind {
         MAX_STRING_LENGTH / self.bytes_per_element()
     }
 
-    fn read(self, bytes: &[u8], index: usize) -> f64 {
-        let offset = index * self.bytes_per_element();
-        if offset + self.bytes_per_element() > bytes.len() {
-            return f64::NAN;
+    fn read(self, bytes: &[u8], index: usize) -> Result<f64, String> {
+        let oob = || "RangeError: typed array OOB".to_string();
+        let bpe = self.bytes_per_element();
+        let offset = index.checked_mul(bpe).ok_or_else(oob)?;
+        let end = offset.checked_add(bpe).ok_or_else(oob)?;
+        if end > bytes.len() {
+            return Err(oob());
         }
-        let slice = &bytes[offset..offset + self.bytes_per_element()];
-        match self {
-            Self::Int8 => i8::from_le_bytes(slice.try_into().unwrap()) as f64,
-            Self::Uint8 | Self::Uint8Clamped => slice[0] as f64,
-            Self::Int16 => i16::from_le_bytes(slice.try_into().unwrap()) as f64,
-            Self::Uint16 => u16::from_le_bytes(slice.try_into().unwrap()) as f64,
-            Self::Int32 => i32::from_le_bytes(slice.try_into().unwrap()) as f64,
-            Self::Uint32 => u32::from_le_bytes(slice.try_into().unwrap()) as f64,
-            Self::Float32 => f32::from_le_bytes(slice.try_into().unwrap()) as f64,
-            Self::Float64 => f64::from_le_bytes(slice.try_into().unwrap()),
-        }
+        let slice = bytes.get(offset..end).ok_or_else(oob)?;
+        Ok(match self {
+            Self::Int8 => i8::from_le_bytes(slice.try_into().map_err(|_| oob())?) as f64,
+            Self::Uint8 | Self::Uint8Clamped => slice.first().copied().ok_or_else(oob)? as f64,
+            Self::Int16 => i16::from_le_bytes(slice.try_into().map_err(|_| oob())?) as f64,
+            Self::Uint16 => u16::from_le_bytes(slice.try_into().map_err(|_| oob())?) as f64,
+            Self::Int32 => i32::from_le_bytes(slice.try_into().map_err(|_| oob())?) as f64,
+            Self::Uint32 => u32::from_le_bytes(slice.try_into().map_err(|_| oob())?) as f64,
+            Self::Float32 => f32::from_le_bytes(slice.try_into().map_err(|_| oob())?) as f64,
+            Self::Float64 => f64::from_le_bytes(slice.try_into().map_err(|_| oob())?),
+        })
     }
 
     fn write(self, bytes: &mut [u8], index: usize, value: f64) {
@@ -729,8 +732,27 @@ pub struct JsvGeneratorState {
     pub started: bool,
     pub done: bool,
     pub resume: Option<GeneratorResume>,
+    /// Reentrancy guard: true while `generator_next` is driving this
+    /// generator. A script that calls `.next()` reentrantly (via a getter,
+    /// proxy trap or promise callback running inside resume) gets a
+    /// TypeError instead of a RefCell double-borrow panic.
+    pub running: bool,
 }
 pub type JsvGeneratorRef = Rc<RefCell<JsvGeneratorState>>;
+
+/// RAII guard clearing [`JsvGeneratorState::running`] on all exits
+/// (including `Err` and early returns).
+struct GeneratorRunningGuard {
+    generator: JsvGeneratorRef,
+}
+
+impl Drop for GeneratorRunningGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.generator.try_borrow_mut() {
+            state.running = false;
+        }
+    }
+}
 
 /// Built-in iterator used by `for...of`, spread and collection methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1261,10 +1283,29 @@ impl JsvValue {
     }
 
     pub fn to_display_string(&self) -> String {
+        self.to_display_string_at_depth(0)
+    }
+
+    fn to_display_string_at_depth(&self, depth: usize) -> String {
+        // Array/object display recursion is script-reachable on cyclic
+        // values (`var a = []; a.push(a); "" + a`), so cap the depth
+        // instead of overflowing the stack.
+        if depth > 32 {
+            return "…".to_string();
+        }
+        let inner = |value: &JsvValue| value.to_display_string_at_depth(depth + 1);
         match self {
             JsvValue::Number(n) => {
-                if *n == n.floor() && n.is_finite() {
+                if n.is_infinite() {
+                    if *n > 0.0 {
+                        "Infinity".to_string()
+                    } else {
+                        "-Infinity".to_string()
+                    }
+                } else if *n == n.floor() && n.is_finite() && n.abs() < 1e15 {
                     format!("{}", *n as i64)
+                } else if *n == 0.0 && n.is_sign_negative() {
+                    "-0".to_string()
                 } else {
                     format!("{}", n)
                 }
@@ -1276,11 +1317,7 @@ impl JsvValue {
             JsvValue::Object(_) => "[object Object]".to_string(),
             JsvValue::Array(a) => format!(
                 "[{}]",
-                a.borrow()
-                    .iter()
-                    .map(|v| v.to_display_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                a.borrow().iter().map(inner).collect::<Vec<_>>().join(", ")
             ),
             JsvValue::Function(name, _, _, _) => format!("[Function: {}]", name),
             JsvValue::AsyncFunction(name, _, _, _) => format!("[AsyncFunction: {}]", name),
@@ -1384,7 +1421,8 @@ fn object_property(object: &JsvObjectRef, name: &str) -> Option<JsvValue> {
     let mut current = Some(object.clone());
     for _ in 0..64 {
         let reference = current?;
-        let borrowed = reference.borrow();
+        // Fail closed on reentrant borrowing instead of panicking the host.
+        let borrowed = reference.try_borrow().ok()?;
         if let Some(value) = borrowed.properties.get(name) {
             return Some(value.clone());
         }
@@ -3357,7 +3395,43 @@ fn eval_expr(
         }
 
         JsvExpr::Update(target, prefix, increment) => {
-            let current = eval_expr(target, env, console, ctx)?;
+            // JS evaluates the target's container expressions exactly once.
+            // The old path evaluated the whole target to read, then evaluated
+            // its object/key sub-expressions AGAIN for the write — double
+            // side effects and a wrong index when the key itself increments
+            // (`a[i++]++`).
+            enum UpdateTarget {
+                Identifier(String),
+                Member(JsvValue, String),
+                Index(JsvValue, JsvValue),
+            }
+            let plan = match &**target {
+                JsvExpr::Identifier(name) => UpdateTarget::Identifier(name.clone()),
+                JsvExpr::Member(object, property) => {
+                    let object = eval_expr(object, env, console, ctx)?;
+                    UpdateTarget::Member(object, property.clone())
+                }
+                JsvExpr::Index(object, key) => {
+                    let object = eval_expr(object, env, console, ctx)?;
+                    let key = eval_expr(key, env, console, ctx)?;
+                    UpdateTarget::Index(object, key)
+                }
+                _ => return Err("TypeError: invalid update target".to_string()),
+            };
+            let current = match &plan {
+                UpdateTarget::Identifier(_) => eval_expr(target, env, console, ctx)?,
+                UpdateTarget::Member(object, property) => {
+                    read_property(object.deref_live(), property, env, console, ctx, false)?
+                }
+                UpdateTarget::Index(object, key) => index_read(
+                    object.deref_live(),
+                    key.deref_live(),
+                    env,
+                    console,
+                    ctx,
+                    false,
+                )?,
+            };
             if let JsvValue::YieldSignal(_) = current {
                 return Err("SyntaxError: yield in update target is not supported".to_string());
             }
@@ -3366,10 +3440,11 @@ fn eval_expr(
                 return Err("TypeError: increment/decrement requires a number".to_string());
             }
             let next = JsvValue::Number(if *increment { value + 1.0 } else { value - 1.0 });
-            match &**target {
-                JsvExpr::Identifier(name) => env.assign(name, next.clone())?,
-                JsvExpr::Member(object, property) => {
-                    let object = eval_expr(object, env, console, ctx)?;
+            match &plan {
+                UpdateTarget::Identifier(name) => {
+                    env.assign(name, next.clone())?;
+                }
+                UpdateTarget::Member(object, property) => {
                     write_property(
                         object.deref_live(),
                         property,
@@ -3379,9 +3454,7 @@ fn eval_expr(
                         ctx,
                     )?;
                 }
-                JsvExpr::Index(object, key) => {
-                    let object = eval_expr(object, env, console, ctx)?;
-                    let key = eval_expr(key, env, console, ctx)?;
+                UpdateTarget::Index(object, key) => {
                     index_write(
                         object.deref_live(),
                         key.deref_live(),
@@ -3391,7 +3464,6 @@ fn eval_expr(
                         ctx,
                     )?;
                 }
-                _ => return Err("TypeError: invalid update target".to_string()),
             }
             if *prefix {
                 Ok(next)
@@ -3635,9 +3707,13 @@ fn eval_expr(
         JsvExpr::ForIn(binding, kind, object_expr, body) => {
             let obj_val = eval_expr(object_expr, env, console, ctx)?;
             let keys = match &obj_val {
-                JsvValue::Object(map) => {
-                    map.borrow().properties.keys().cloned().collect::<Vec<_>>()
-                }
+                JsvValue::Object(map) => map
+                    .borrow()
+                    .properties
+                    .keys()
+                    .filter(|key| !is_symbol_property_key(key))
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 JsvValue::Array(array) => (0..array.borrow().len())
                     .map(|index| index.to_string())
                     .collect(),
@@ -3784,7 +3860,9 @@ fn apply_binary_op(
             OpKind::Eq => Ok(JsvValue::Boolean(ls == rs)),
             OpKind::Neq => Ok(JsvValue::Boolean(ls != rs)),
             OpKind::Lt => Ok(JsvValue::Boolean(ls < rs)),
+            OpKind::Le => Ok(JsvValue::Boolean(ls <= rs)),
             OpKind::Gt => Ok(JsvValue::Boolean(ls > rs)),
+            OpKind::Ge => Ok(JsvValue::Boolean(ls >= rs)),
             _ => Err("Invalid operator for strings".to_string()),
         },
         (JsvValue::Null, JsvValue::Undefined) | (JsvValue::Undefined, JsvValue::Null) => match op {
@@ -3799,7 +3877,7 @@ fn apply_binary_op(
                 check_string_alloc(ctx, display.len())?;
                 Ok(JsvValue::String(format!("{}{}", ln, display)))
             } else {
-                Err("Type mismatch in binary operation".to_string())
+                numeric_fallthrough(JsvValue::Number(ln), rhs, op, ctx)
             }
         }
         (JsvValue::String(ls), rhs) => {
@@ -3808,9 +3886,71 @@ fn apply_binary_op(
                 check_string_alloc(ctx, ls.len() + display.len())?;
                 Ok(JsvValue::String(format!("{}{}", ls, display)))
             } else {
-                Err("Type mismatch in binary operation".to_string())
+                numeric_fallthrough(JsvValue::String(ls), rhs, op, ctx)
             }
         }
+        (l_val, r_val) => numeric_fallthrough(l_val, r_val, op, ctx),
+    }
+}
+
+/// Mixed-type fallthrough for the operators ECMAScript defines through
+/// ToNumber coercion (arithmetic, relational, loose equality). These used
+/// to throw "Type mismatch", breaking common idioms such as `5 == "5"`,
+/// `10 - "5"`, `x < "10"` and `null >= 0`.
+fn numeric_fallthrough(
+    l_val: JsvValue,
+    r_val: JsvValue,
+    op: OpKind,
+    ctx: &mut EvalCtx<'_>,
+) -> Result<JsvValue, String> {
+    match op {
+        OpKind::Eq | OpKind::Neq => {
+            // Loose equality: booleans coerce to numbers first; a
+            // number/string pair compares numerically; everything else
+            // (null vs 0, objects, symbols) is strict identity per spec.
+            let left = if matches!(l_val, JsvValue::Boolean(_)) {
+                JsvValue::Number(to_number(&l_val))
+            } else {
+                l_val
+            };
+            let right = if matches!(r_val, JsvValue::Boolean(_)) {
+                JsvValue::Number(to_number(&r_val))
+            } else {
+                r_val
+            };
+            let equal = match (&left, &right) {
+                (JsvValue::Number(_), JsvValue::String(_))
+                | (JsvValue::String(_), JsvValue::Number(_)) => {
+                    to_number(&left) == to_number(&right)
+                }
+                _ => js_strict_equal(&left, &right),
+            };
+            Ok(JsvValue::Boolean(if op == OpKind::Eq {
+                equal
+            } else {
+                !equal
+            }))
+        }
+        OpKind::Add => {
+            // `x + y` concatenates when either primitive is a string,
+            // otherwise adds the ToNumber forms (`true + true` is 2).
+            if matches!(l_val, JsvValue::String(_)) || matches!(r_val, JsvValue::String(_)) {
+                let left = l_val.to_display_string();
+                let right = r_val.to_display_string();
+                check_string_alloc(ctx, left.len().saturating_add(right.len()))?;
+                Ok(JsvValue::String(format!("{}{}", left, right)))
+            } else {
+                Ok(JsvValue::Number(to_number(&l_val) + to_number(&r_val)))
+            }
+        }
+        OpKind::Sub => Ok(JsvValue::Number(to_number(&l_val) - to_number(&r_val))),
+        OpKind::Mul => Ok(JsvValue::Number(to_number(&l_val) * to_number(&r_val))),
+        OpKind::Div => Ok(JsvValue::Number(to_number(&l_val) / to_number(&r_val))),
+        OpKind::Mod => Ok(JsvValue::Number(to_number(&l_val) % to_number(&r_val))),
+        OpKind::Lt => Ok(JsvValue::Boolean(to_number(&l_val) < to_number(&r_val))),
+        OpKind::Le => Ok(JsvValue::Boolean(to_number(&l_val) <= to_number(&r_val))),
+        OpKind::Gt => Ok(JsvValue::Boolean(to_number(&l_val) > to_number(&r_val))),
+        OpKind::Ge => Ok(JsvValue::Boolean(to_number(&l_val) >= to_number(&r_val))),
         _ => Err("Type mismatch in binary operation".to_string()),
     }
 }
@@ -3937,7 +4077,10 @@ fn call_function(
                     fn_env.define("this", this_arg);
                     let state = match eval_expr(&body, &mut fn_env, console, ctx) {
                         Ok(JsvValue::ReturnSignal(value)) => match *value {
-                            JsvValue::Promise(promise) => promise.borrow().clone(),
+                            JsvValue::Promise(promise) => promise
+                                .try_borrow()
+                                .map_err(|_| "TypeError: Reentrant access to promise".to_string())?
+                                .clone(),
                             value => JsvPromiseState::Fulfilled(value),
                         },
                         Ok(JsvValue::ThrowSignal(reason)) => JsvPromiseState::Rejected(*reason),
@@ -3975,6 +4118,7 @@ fn call_function(
                     started: false,
                     done: false,
                     resume: None,
+                    running: false,
                 },
             ))))
         }
@@ -4225,12 +4369,106 @@ fn to_number(value: &JsvValue) -> f64 {
             if trimmed.is_empty() {
                 0.0
             } else {
-                trimmed.parse::<f64>().unwrap_or(f64::NAN)
+                match trimmed.parse::<f64>() {
+                    Ok(value) => value,
+                    Err(_) => whole_hex_number(trimmed).unwrap_or(f64::NAN),
+                }
             }
         }
         JsvValue::Undefined => f64::NAN,
         _ => f64::NAN,
     }
+}
+
+/// Parse an ENTIRE string as a signed hex integer literal (`Number("0x1F")`
+/// is 31; trailing junk stays NaN, unlike the prefix-tolerant parseInt).
+fn whole_hex_number(trimmed: &str) -> Option<f64> {
+    let (negative, body) = match trimmed.as_bytes().first() {
+        Some(b'-') => (true, &trimmed[1..]),
+        Some(b'+') => (false, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    let digits = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))?;
+    if digits.is_empty() {
+        return None;
+    }
+    let value = i64::from_str_radix(digits, 16).ok()? as f64;
+    Some(if negative { -value } else { value })
+}
+
+/// Longest ECMAScript decimal-literal PREFIX of `text` (parseFloat-style:
+/// surrounding whitespace allowed, trailing junk ignored, optional sign,
+/// `12.` / `.5` / `1e3` forms). None when no digit was consumed.
+fn parse_number_prefix(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let bytes = trimmed.as_bytes();
+    let mut index = 0;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        index += 1;
+    }
+    let start = index;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index < bytes.len() && bytes[index] == b'.' {
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    if index == start {
+        return None;
+    }
+    let mut end = index;
+    if index < bytes.len() && (bytes[index] == b'e' || bytes[index] == b'E') {
+        let mut exponent = index + 1;
+        if exponent < bytes.len() && (bytes[exponent] == b'+' || bytes[exponent] == b'-') {
+            exponent += 1;
+        }
+        let digits = exponent;
+        while exponent < bytes.len() && bytes[exponent].is_ascii_digit() {
+            exponent += 1;
+        }
+        if exponent > digits {
+            end = exponent;
+        }
+    }
+    trimmed[start..end].parse::<f64>().ok()
+}
+
+/// parseInt semantics: optional sign, 0x/0X hex (unsigned digits after the
+/// sign per ES2015+), otherwise a decimal prefix truncated toward zero.
+fn parse_int_prefix(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let bytes = trimmed.as_bytes();
+    let mut index = 0;
+    let negative = index < bytes.len() && bytes[index] == b'-';
+    if negative || (index < bytes.len() && bytes[index] == b'+') {
+        index += 1;
+    }
+    if index + 1 < bytes.len() && bytes[index] == b'0' && (bytes[index + 1] | 0x20) == b'x' {
+        let mut value = 0f64;
+        let mut digits = 0;
+        for byte in &bytes[index + 2..] {
+            let digit = match byte {
+                b'0'..=b'9' => u32::from(byte - b'0'),
+                b'a'..=b'f' => u32::from(byte - b'a') + 10,
+                b'A'..=b'F' => u32::from(byte - b'A') + 10,
+                _ => break,
+            };
+            value = value * 16.0 + f64::from(digit);
+            digits += 1;
+        }
+        return if digits == 0 {
+            // "0x" alone: the leading "0" is still a valid decimal prefix.
+            parse_number_prefix(trimmed).map(f64::trunc)
+        } else {
+            Some(if negative { -value } else { value })
+        };
+    }
+    parse_number_prefix(trimmed).map(f64::trunc)
 }
 
 /// Convert a function-call completion into its plain value, rejecting illegal
@@ -4313,7 +4551,9 @@ fn eval_try_catch_finally(
     }
     let catch_result = match outcome {
         JsvValue::ThrowSignal(reason) if catch_binding.is_some() => {
-            let binding = catch_binding.expect("catch binding checked");
+            let Some(binding) = catch_binding else {
+                return Err("InvalidStateError: catch binding vanished".to_string());
+            };
             let mut catch_env = JsvEnvironment::with_parent(env.clone());
             catch_env.define(binding, (*reason).clone());
             let result = match eval_statement_list(catch_body, &mut catch_env, console, ctx) {
@@ -4561,16 +4801,20 @@ fn direct_property_read(value: &JsvValue, key: &str) -> JsvValue {
             }
         }
         JsvValue::TypedArray(array) => {
-            let borrowed = array.borrow();
-            if borrowed.buffer.borrow().detached {
+            let Ok(borrowed) = array.try_borrow() else {
+                return JsvValue::Undefined;
+            };
+            let Ok(buffer) = borrowed.buffer.try_borrow() else {
+                return JsvValue::Undefined;
+            };
+            if buffer.detached {
                 return JsvValue::Undefined;
             }
             key.parse::<usize>()
                 .ok()
                 .filter(|index| *index < borrowed.length)
-                .map(|index| {
-                    JsvValue::Number(borrowed.kind.read(&borrowed.buffer.borrow().bytes, index))
-                })
+                .and_then(|index| borrowed.kind.read(&buffer.bytes, index).ok())
+                .map(JsvValue::Number)
                 .unwrap_or(JsvValue::Undefined)
         }
         _ => JsvValue::Undefined,
@@ -4750,7 +4994,15 @@ fn write_property(
         JsvValue::HostObject(object) => ctx.host.set_property(object, property, rhs),
         JsvValue::Proxy(proxy) => proxy_set(&proxy, property, rhs, env, console, ctx),
         JsvValue::Object(object) => {
-            let existing = object.borrow().properties.get(property).cloned();
+            // Clone under try_borrow and drop before call_function: holding the
+            // guard across the call would panic if the setter reenters this
+            // object.
+            let existing = object
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to object".to_string())?
+                .properties
+                .get(property)
+                .cloned();
             if let Some(JsvValue::GetterSetter(_, set)) = existing {
                 if is_callable(&set) {
                     let called = call_function(
@@ -4766,7 +5018,8 @@ fn write_property(
                 return Err("TypeError: property has no setter".to_string());
             }
             object
-                .borrow_mut()
+                .try_borrow_mut()
+                .map_err(|_| "TypeError: Reentrant access to object".to_string())?
                 .properties
                 .insert(property.to_string(), rhs.clone());
             Ok(rhs)
@@ -4833,11 +5086,19 @@ fn index_read(
                 .unwrap_or(JsvValue::Undefined))
         }
         JsvValue::TypedArray(array) => {
-            let borrowed = array.borrow();
-            if borrowed.buffer.borrow().detached {
+            let borrowed = array
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to typed array".to_string())?;
+            let buffer = borrowed
+                .buffer
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to ArrayBuffer".to_string())?;
+            if buffer.detached {
                 return Err("TypeError: Cannot access a detached ArrayBuffer".to_string());
             }
             if is_symbol_property_key(&key_text) {
+                drop(buffer);
+                drop(borrowed);
                 return symbol_index_read(
                     JsvValue::TypedArray(array.clone()),
                     &key_text,
@@ -4847,12 +5108,11 @@ fn index_read(
                 );
             }
             let index = key_text.parse::<usize>().ok();
-            Ok(index
-                .filter(|index| *index < borrowed.length)
-                .map(|index| {
-                    JsvValue::Number(borrowed.kind.read(&borrowed.buffer.borrow().bytes, index))
-                })
-                .unwrap_or(JsvValue::Undefined))
+            let Some(index) = index.filter(|index| *index < borrowed.length) else {
+                return Ok(JsvValue::Undefined);
+            };
+            let value = borrowed.kind.read(&buffer.bytes, index)?;
+            Ok(JsvValue::Number(value))
         }
         JsvValue::Object(object) => {
             if is_symbol_property_key(&key_text) {
@@ -4990,19 +5250,22 @@ fn own_properties(value: &JsvValue) -> Result<Vec<(String, JsvValue)>, String> {
             .map(|(index, item)| (index.to_string(), item.clone()))
             .collect()),
         JsvValue::TypedArray(array) => {
-            let borrowed = array.borrow();
-            if borrowed.buffer.borrow().detached {
+            let borrowed = array
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to typed array".to_string())?;
+            let buffer = borrowed
+                .buffer
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to ArrayBuffer".to_string())?;
+            if buffer.detached {
                 return Err("TypeError: Cannot access a detached ArrayBuffer".to_string());
             }
-            let bytes = borrowed.buffer.borrow();
-            Ok((0..borrowed.length)
-                .map(|index| {
-                    (
-                        index.to_string(),
-                        JsvValue::Number(borrowed.kind.read(&bytes.bytes, index)),
-                    )
-                })
-                .collect())
+            let mut out = Vec::with_capacity(borrowed.length.min(1024));
+            for index in 0..borrowed.length {
+                let value = borrowed.kind.read(&buffer.bytes, index)?;
+                out.push((index.to_string(), JsvValue::Number(value)));
+            }
+            Ok(out)
         }
         JsvValue::Proxy(proxy) => proxy_own_keys(&proxy),
         _ => Ok(Vec::new()),
@@ -5190,18 +5453,22 @@ fn iterator_next(
                 JsvValue::TypedArray(array) => array.clone(),
                 _ => return Err("InvalidStateError: iterator source changed".to_string()),
             };
-            let borrowed = array.borrow();
-            if borrowed.buffer.borrow().detached {
+            let borrowed = array
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to typed array".to_string())?;
+            let buffer = borrowed
+                .buffer
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to ArrayBuffer".to_string())?;
+            if buffer.detached {
                 return Err("TypeError: Cannot access a detached ArrayBuffer".to_string());
             }
             if state.index >= borrowed.length {
                 Ok((true, JsvValue::Undefined))
             } else {
-                let value = JsvValue::Number(
-                    borrowed
-                        .kind
-                        .read(&borrowed.buffer.borrow().bytes, state.index),
-                );
+                let value = JsvValue::Number(borrowed.kind.read(&buffer.bytes, state.index)?);
+                drop(buffer);
+                drop(borrowed);
                 state.index += 1;
                 Ok((false, value))
             }
@@ -5678,6 +5945,27 @@ fn construct_class_with_this(
     console: &mut Vec<String>,
     ctx: &mut EvalCtx<'_>,
 ) -> Result<JsvValue, String> {
+    // The constructor chain recurses once per `extends` ancestor; without a
+    // depth guard a 300-level chain aborted the process (call_function
+    // counts its frames, this path did not).
+    ctx.call_depth += 1;
+    if ctx.call_depth > MAX_CALL_DEPTH {
+        ctx.call_depth = ctx.call_depth.saturating_sub(1);
+        return Err("Maximum call stack size exceeded".to_string());
+    }
+    let result = construct_class_with_this_inner(class, args, this_value, env, console, ctx);
+    ctx.call_depth = ctx.call_depth.saturating_sub(1);
+    result
+}
+
+fn construct_class_with_this_inner(
+    class: &JsvClassRef,
+    args: Vec<JsvValue>,
+    this_value: JsvValue,
+    env: &mut JsvEnvironment,
+    console: &mut Vec<String>,
+    ctx: &mut EvalCtx<'_>,
+) -> Result<JsvValue, String> {
     let JsvValue::Object(this_object) = &this_value else {
         return Err("TypeError: super() requires a valid this".to_string());
     };
@@ -5997,13 +6285,19 @@ fn generator_next(
     console: &mut Vec<String>,
     ctx: &mut EvalCtx<'_>,
 ) -> Result<(bool, JsvValue), String> {
-    // The setup guard must drop before the resume loop below re-borrows the
-    // generator, otherwise the second borrow_mut() panics.
+    // Reentrancy guard: a `.next()` issued from inside this generator (getter,
+    // proxy trap, nested next) previously hit a RefCell double-borrow panic.
     {
-        let mut state = generator.borrow_mut();
+        let mut state = generator
+            .try_borrow_mut()
+            .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
         if state.done {
             return Ok((true, JsvValue::Undefined));
         }
+        if state.running {
+            return Err("TypeError: generator is already running (reentrant .next)".to_string());
+        }
+        state.running = true;
         if !state.started {
             state.started = true;
             let name = state.name.clone();
@@ -6026,11 +6320,17 @@ fn generator_next(
             });
         }
     }
+    // Clears `running` on every exit, including `?` early returns.
+    let _guard = GeneratorRunningGuard {
+        generator: generator.clone(),
+    };
     // Resume: pop continuation frames, feeding each result into the next.
     let mut value = argument;
     loop {
         let cont = {
-            let mut state = generator.borrow_mut();
+            let mut state = generator
+                .try_borrow_mut()
+                .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
             let Some(resume) = state.resume.as_mut() else {
                 state.done = true;
                 return Ok((true, JsvValue::Undefined));
@@ -6038,19 +6338,25 @@ fn generator_next(
             if resume.conts.is_empty() {
                 break;
             }
-            resume.conts.pop().expect("checked")
+            resume
+                .conts
+                .pop()
+                .ok_or_else(|| "InvalidStateError: generator continuation is missing".to_string())?
         };
         // The resumed statement's environment is authoritative for resume.
         let mut env = generator
-            .borrow()
+            .try_borrow()
+            .map_err(|_| "TypeError: Reentrant access to generator".to_string())?
             .resume
             .as_ref()
-            .expect("checked")
+            .ok_or_else(|| "InvalidStateError: generator has no resume state".to_string())?
             .env
             .clone();
         match resume_cont(cont, value, &mut env, console, ctx)? {
             JsvValue::YieldSignal(signal) => {
-                let mut state = generator.borrow_mut();
+                let mut state = generator
+                    .try_borrow_mut()
+                    .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
                 let Some(resume) = state.resume.as_mut() else {
                     state.done = true;
                     return Ok((true, JsvValue::Undefined));
@@ -6065,7 +6371,9 @@ fn generator_next(
         }
     }
     // Continuation stack exhausted: the suspended statement finished.
-    let mut state = generator.borrow_mut();
+    let mut state = generator
+        .try_borrow_mut()
+        .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
     let Some(resume) = state.resume.take() else {
         state.done = true;
         return Ok((true, JsvValue::Undefined));
@@ -6091,7 +6399,9 @@ fn run_generator_statements(
     let mut env = resume.env;
     loop {
         if index >= resume.stmts.len() {
-            let mut state = generator.borrow_mut();
+            let mut state = generator
+                .try_borrow_mut()
+                .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
             state.done = true;
             state.resume = None;
             ctx.in_generator -= 1;
@@ -6100,7 +6410,9 @@ fn run_generator_statements(
         }
         match eval_expr(&resume.stmts[index], &mut env, console, ctx) {
             Ok(JsvValue::YieldSignal(signal)) => {
-                let mut state = generator.borrow_mut();
+                let mut state = generator
+                    .try_borrow_mut()
+                    .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
                 state.resume = Some(GeneratorResume {
                     stmts: resume.stmts.clone(),
                     index: index + 1,
@@ -6114,7 +6426,9 @@ fn run_generator_statements(
                 return Ok((false, *signal.value));
             }
             Ok(JsvValue::ReturnSignal(value)) => {
-                let mut state = generator.borrow_mut();
+                let mut state = generator
+                    .try_borrow_mut()
+                    .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
                 state.done = true;
                 state.resume = None;
                 drop(state);
@@ -6133,7 +6447,9 @@ fn run_generator_statements(
                 return Err("SyntaxError: illegal continue statement in generator".to_string());
             }
             Ok(JsvValue::ThrowSignal(reason)) => {
-                let mut state = generator.borrow_mut();
+                let mut state = generator
+                    .try_borrow_mut()
+                    .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
                 state.done = true;
                 state.resume = None;
                 drop(state);
@@ -6148,7 +6464,9 @@ fn run_generator_statements(
                 result = value;
             }
             Err(error) => {
-                let mut state = generator.borrow_mut();
+                let mut state = generator
+                    .try_borrow_mut()
+                    .map_err(|_| "TypeError: Reentrant access to generator".to_string())?;
                 state.done = true;
                 state.resume = None;
                 drop(state);
@@ -7378,7 +7696,11 @@ fn settle_promise(
     promise: &JsvPromiseRef,
     state: JsvPromiseState,
 ) -> Result<(), String> {
-    *promise.borrow_mut() = state.clone();
+    // try_borrow_mut: a promise callback that settles the same promise
+    // reentrantly must fail closed instead of panicking the host.
+    *promise
+        .try_borrow_mut()
+        .map_err(|_| "TypeError: Reentrant access to promise".to_string())? = state.clone();
     if matches!(state, JsvPromiseState::Pending) {
         return Ok(());
     }
@@ -7407,7 +7729,11 @@ fn resolve_promise(
                     )),
                 );
             }
-            match source.borrow().clone() {
+            match source
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to promise".to_string())?
+                .clone()
+            {
                 JsvPromiseState::Pending => register_pending_reaction(
                     ctx,
                     &source,
@@ -7662,6 +7988,12 @@ fn call_string_method(
                                 chars[index..index + separator_chars.len()].iter().collect();
                             if candidate == separator {
                                 parts.push(JsvValue::String(std::mem::take(&mut current)));
+                                // Check inside the loop: a huge input with a
+                                // tiny separator used to materialize millions
+                                // of parts before any budget noticed.
+                                if parts.len() > 100_000 {
+                                    return Err("Split result budget exceeded".to_string());
+                                }
                                 index += separator_chars.len();
                                 continue;
                             }
@@ -8064,7 +8396,10 @@ fn call_bound_native(
             JsvValue::Promise(promise),
         ) => {
             let result = Rc::new(RefCell::new(JsvPromiseState::Pending));
-            let state = promise.borrow().clone();
+            let state = promise
+                .try_borrow()
+                .map_err(|_| "TypeError: Reentrant access to promise".to_string())?
+                .clone();
             let callable =
                 |index: usize| args.get(index).filter(|value| is_callable(value)).cloned();
             let reaction = match method {
@@ -8113,12 +8448,16 @@ fn drain_promise_jobs(
     console: &mut Vec<String>,
     ctx: &mut EvalCtx<'_>,
 ) -> Result<(), String> {
+    // Single `processed` counter bounds the whole drain: `>=` (not `>`)
+    // allows exactly MAX_PROMISE_JOBS jobs. Over-budget jobs are pushed back
+    // so the budget error does not drop work.
     let mut processed = 0usize;
     while let Some(job) = ctx.microtasks.pop_front() {
-        processed += 1;
-        if processed > MAX_PROMISE_JOBS {
+        if processed >= MAX_PROMISE_JOBS {
+            ctx.microtasks.push_front(job);
             return Err("Promise job execution budget exceeded".to_string());
         }
+        processed += 1;
         let original_rejected = job.kind == PromiseReactionKind::Reject;
         let outcome = if let Some(handler) = job.handler {
             let arguments = if job.kind == PromiseReactionKind::Finally {
@@ -8147,7 +8486,11 @@ fn drain_promise_jobs(
         let settlement = if job.kind == PromiseReactionKind::Finally {
             match outcome {
                 Err(reason) => Err(reason),
-                Ok(JsvValue::Promise(source)) => match source.borrow().clone() {
+                Ok(JsvValue::Promise(source)) => match source
+                    .try_borrow()
+                    .map_err(|_| "TypeError: Reentrant access to promise".to_string())?
+                    .clone()
+                {
                     JsvPromiseState::Rejected(reason) => Err(reason),
                     JsvPromiseState::Fulfilled(_) if original_rejected => Err(job.argument.clone()),
                     JsvPromiseState::Fulfilled(_) => Ok(job.argument.clone()),
@@ -8274,20 +8617,34 @@ fn call_native_fn(
             Ok(JsvValue::Undefined)
         }
         "parseInt" => {
-            if let Some(s) = args.first().and_then(|a| a.as_string()) {
-                if let Ok(n) = s.parse::<f64>() {
-                    return Ok(JsvValue::Number(n));
-                }
-            }
-            Ok(JsvValue::Number(f64::NAN))
+            // Prefix-tolerant spec semantics: parseInt("12px") is 12,
+            // parseInt("0x1F") is 31, parseInt("-3.9") is -3.
+            let text = args.first().map(|value| value.to_display_string());
+            let value = text
+                .as_deref()
+                .and_then(parse_int_prefix)
+                .unwrap_or(f64::NAN);
+            Ok(JsvValue::Number(value))
         }
         "parseFloat" => {
-            if let Some(s) = args.first().and_then(|a| a.as_string()) {
-                if let Ok(n) = s.parse::<f64>() {
-                    return Ok(JsvValue::Number(n));
-                }
-            }
-            Ok(JsvValue::Number(f64::NAN))
+            let text = args.first().map(|value| value.to_display_string());
+            let value = text
+                .as_deref()
+                .and_then(|text| {
+                    let trimmed = text.trim();
+                    let (sign, body) = match trimmed.as_bytes().first() {
+                        Some(b'+') => (1.0, &trimmed[1..]),
+                        Some(b'-') => (-1.0, &trimmed[1..]),
+                        _ => (1.0, trimmed),
+                    };
+                    if body.starts_with("Infinity") {
+                        Some(sign * f64::INFINITY)
+                    } else {
+                        parse_number_prefix(trimmed)
+                    }
+                })
+                .unwrap_or(f64::NAN);
+            Ok(JsvValue::Number(value))
         }
         "String" => {
             if let Some(a) = args.first() {
@@ -8297,19 +8654,10 @@ fn call_native_fn(
             }
         }
         "Number" => {
-            if let Some(a) = args.first() {
-                match a {
-                    JsvValue::Number(n) => Ok(JsvValue::Number(*n)),
-                    JsvValue::String(s) => s
-                        .parse::<f64>()
-                        .map(JsvValue::Number)
-                        .or(Ok(JsvValue::Number(f64::NAN))),
-                    JsvValue::Boolean(b) => Ok(JsvValue::Number(if *b { 1.0 } else { 0.0 })),
-                    _ => Ok(JsvValue::Number(f64::NAN)),
-                }
-            } else {
-                Ok(JsvValue::Number(f64::NAN))
-            }
+            // Number("") is 0, Number(null) is 0, Number("0x10") is 16 —
+            // exactly the ToNumber table, including no-arg → 0.
+            let value = args.first().map(to_number).unwrap_or(0.0);
+            Ok(JsvValue::Number(value))
         }
         "Object.create" => {
             let prototype = match args.first() {
@@ -8335,6 +8683,7 @@ fn call_native_fn(
                 .borrow()
                 .properties
                 .keys()
+                .filter(|key| !is_symbol_property_key(key))
                 .cloned()
                 .collect::<Vec<_>>();
             keys.sort();
@@ -10021,6 +10370,12 @@ fn parse_assignment(
     pos: usize,
     depth: usize,
 ) -> Result<(JsvExpr, usize), String> {
+    // The generic bracket/paren depth counter never sees unary/ternary
+    // recursion, so `!!!!!...x` or `1?2:1?2:...` chains could overflow the
+    // stack before any budget noticed. Count them here too.
+    if depth > MAX_PARSE_DEPTH {
+        return Err("Expression nesting depth exceeded".to_string());
+    }
     if let Some((parameters, is_async, body_pos)) = parse_arrow_signature(tokens, pos) {
         let (body, next) = if tokens.get(body_pos).map(String::as_str) == Some("{") {
             parse_statement(tokens, body_pos, depth + 1)?
@@ -10281,6 +10636,9 @@ fn parse_factor(tokens: &[String], pos: usize, depth: usize) -> Result<(JsvExpr,
 fn parse_unary(tokens: &[String], pos: usize, depth: usize) -> Result<(JsvExpr, usize), String> {
     if pos >= tokens.len() {
         return Err("Unexpected end of expression".to_string());
+    }
+    if depth > MAX_PARSE_DEPTH {
+        return Err("Expression nesting depth exceeded".to_string());
     }
     if tokens[pos] == "-" {
         let (expr, i) = parse_unary(tokens, pos + 1, depth + 1)?;

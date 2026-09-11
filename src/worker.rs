@@ -360,7 +360,20 @@ pub fn prepare_pdf_with_program_cancellable(
         serde_json::to_vec(&meta).map_err(|error| WorkerError::Protocol(error.to_string()))?;
     let meta_length = u32::try_from(encoded_meta.len())
         .map_err(|_| WorkerError::Protocol("PDF metadata is too large".to_string()))?;
-    let mut payload = Vec::with_capacity(12 + encoded_meta.len() + pdf_bytes.len());
+    // Pre-check lengths before allocating: with_capacity(12 + meta + pdf) on
+    // an unbounded pdf_bytes slice can OOM/abort before exchange_with_program
+    // enforces MAX_WORKER_REQUEST_BYTES.
+    let total_len = 12_usize
+        .checked_add(encoded_meta.len())
+        .and_then(|total| total.checked_add(pdf_bytes.len()))
+        .ok_or_else(|| WorkerError::Protocol("PDF request length overflow".to_string()))?;
+    if total_len > MAX_WORKER_REQUEST_BYTES {
+        return Err(WorkerError::Protocol(format!(
+            "request exceeds {} bytes",
+            MAX_WORKER_REQUEST_BYTES
+        )));
+    }
+    let mut payload = Vec::with_capacity(total_len);
     payload.extend_from_slice(PDF_REQUEST_MAGIC);
     payload.extend_from_slice(&meta_length.to_le_bytes());
     payload.extend_from_slice(&encoded_meta);
@@ -428,6 +441,12 @@ fn exchange_with_program(
         .map_err(|error| WorkerError::Io(error.to_string()))?;
     // Kill-on-drop: every early return below (? on stdin/stdout/stderr takes,
     // encode or write failures) previously leaked a live child process.
+    // TOCTOU note: the child runs between spawn() and WorkerContainment::attach()
+    // below, so it could briefly spawn a grandchild before the job's
+    // ActiveProcessLimit = 1 takes effect. The ideal fix is to spawn suspended
+    // (CREATE_SUSPENDED), attach to the job, then resume the primary thread;
+    // until then the ActiveProcessLimit still bounds steady-state fan-out to a
+    // single active process and kill-on-job-close reaps the tree.
     let mut guard = ChildGuard(child);
     let child = &mut guard.0;
     #[cfg(windows)]
@@ -694,7 +713,27 @@ fn prepare_pdf_request(payload: &[u8]) -> PreparationResponse {
 
 fn worker_executable() -> Result<PathBuf, WorkerError> {
     if let Some(explicit) = std::env::var_os("GHITA_RENDERER_WORKER") {
-        return Ok(PathBuf::from(explicit));
+        // Untrusted env path: canonicalize to resolve symlinks/../ and enforce
+        // an allowlist (must be a real file named ghita-renderer-worker*).
+        // Without this, GHITA_RENDERER_WORKER=/tmp/evil would execute arbitrary
+        // code with the browser's privileges.
+        let raw = PathBuf::from(explicit);
+        let canonical = raw
+            .canonicalize()
+            .map_err(|error| WorkerError::Io(format!("invalid worker path: {error}")))?;
+        let file_name = canonical
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !file_name.starts_with("ghita-renderer-worker") {
+            return Err(WorkerError::Protocol(format!(
+                "worker path is not allowlisted: {file_name}"
+            )));
+        }
+        if !canonical.is_file() {
+            return Err(WorkerError::Io("worker path is not a file".to_string()));
+        }
+        return Ok(canonical);
     }
     let current = std::env::current_exe().map_err(|error| WorkerError::Io(error.to_string()))?;
     let suffix = std::env::consts::EXE_SUFFIX;

@@ -218,7 +218,7 @@ pub fn parse_module(bytes: &[u8]) -> Result<WasmModule, String> {
                     return Err("Data segment budget exceeded".to_string());
                 }
             }
-            _ => unreachable!("section id bounded to 1..=12"),
+            _ => return Err(format!("Unknown section id {section_id}")),
         }
         if !section.is_empty() {
             return Err(format!("Section {section_id} has trailing bytes"));
@@ -603,6 +603,11 @@ fn read_expr(cursor: &mut Cursor) -> Result<Vec<u8>, String> {
             // Only i32.const (0x41), i64.const (0x42), f32/f64.const,
             // global.get (0x23) and ref.null are valid in constant exprs;
             // anything else fails closed here.
+            0x23 => {
+                // global.get <index>: consume the LEB index; bounds are
+                // checked at instantiation in eval_const_expr.
+                cursor.read_leb_u32()?;
+            }
             _ => return Err(format!("Invalid constant expression opcode 0x{opcode:02X}")),
         }
         if depth == 0 && opcode == 0x0B {
@@ -681,8 +686,30 @@ fn validate_code(code: &[u8]) -> Result<usize, String> {
                     }
                 }
             }
+            0x00 | 0x01 => {
+                // unreachable / nop: no immediates.
+            }
             0x05 => {
                 // else: no immediate.
+            }
+            0x0F => {
+                // return: no immediate.
+            }
+            0x1A | 0x1B => {
+                // drop / select: no immediates.
+            }
+            0x1C => {
+                // select with explicit result-type vector.
+                let count = cursor.read_leb_u32()?;
+                if count > 4 {
+                    return Err("select type vector budget exceeded".to_string());
+                }
+                for _ in 0..count {
+                    let value_type = cursor.read_u8()?;
+                    if !matches!(value_type, 0x7C..=0x7F) {
+                        return Err("select type vector must contain value types".to_string());
+                    }
+                }
             }
             0x0C | 0x0D => {
                 cursor.read_leb_u32()?;
@@ -714,12 +741,19 @@ fn validate_code(code: &[u8]) -> Result<usize, String> {
             0x12 | 0x13 => {
                 cursor.read_leb_u32()?;
             }
-            0x20..=0x26 => {
+            0x20..=0x24 => {
                 cursor.read_leb_u32()?;
             }
             0x28..=0x3E => {
                 cursor.read_leb_u32()?;
                 cursor.read_leb_u32()?;
+            }
+            0x3F | 0x40 => {
+                // memory.size / memory.grow: one reserved zero byte.
+                let reserved = cursor.read_u8()?;
+                if reserved != 0 {
+                    return Err("memory instruction reserved byte must be zero".to_string());
+                }
             }
             0x41 => {
                 cursor.read_leb_i32()?;

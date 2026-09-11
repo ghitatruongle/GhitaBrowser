@@ -411,9 +411,11 @@ impl RepairEngine {
         let mut repaired = Vec::new();
         for (relative, bytes) in &verified_package.files {
             let target = install_dir.join(relative);
-            let matches = fs::read(&target)
-                .map(|installed| {
-                    sha256_hex(&installed) == verified_package.manifest.file_hashes[relative]
+            // Stream the installed file in 64 KiB chunks instead of loading
+            // it fully into RAM.
+            let matches = sha256_file_hex(&target)
+                .map(|actual| {
+                    actual.eq_ignore_ascii_case(&verified_package.manifest.file_hashes[relative])
                 })
                 .unwrap_or(false);
             if !matches {
@@ -548,9 +550,12 @@ impl UpdateManager {
             return;
         };
         match VersionComparer::parse_version(&self.current_version) {
-            Ok(persisted) if persisted < running_version => {
+            Ok(persisted) if persisted != running_version => {
+                // Both directions are reset to the running binary: values
+                // BELOW it enable downgrade replay, values ABOVE it (a
+                // profile-writable 999.0.0) permanently brick the channel.
                 log::warn!(
-                    "updater baseline {} was below this build ({running}); lifting",
+                    "updater baseline {} differs from this build ({running}); resetting",
                     self.current_version
                 );
                 self.current_version = running.to_string();
@@ -851,6 +856,24 @@ impl UpdateManager {
     }
 }
 
+/// Hash a file by streaming SHA-256 in 64 KiB chunks so a large payload
+/// never needs to fit in RAM at once.
+fn sha256_file_hex(path: &Path) -> Result<String, UpdateError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(storage_error)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(storage_error)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(crate::package_crypto::encode_hex(&hasher.finalize()))
+}
+
 fn verify_tree_files(root: &Path, expected: &BTreeMap<String, String>) -> Result<(), UpdateError> {
     for (relative, digest) in expected {
         validate_package_path(relative)?;
@@ -866,8 +889,8 @@ fn verify_tree_files(root: &Path, expected: &BTreeMap<String, String>) -> Result
                 "payload target exceeds size limit: {relative}"
             )));
         }
-        let bytes = fs::read(&path).map_err(storage_error)?;
-        if !digest.eq_ignore_ascii_case(&sha256_hex(&bytes)) {
+        let actual = sha256_file_hex(&path)?;
+        if !digest.eq_ignore_ascii_case(&actual) {
             return Err(UpdateError::PayloadCorrupt(format!(
                 "installed SHA-256 mismatch: {relative}"
             )));
@@ -913,23 +936,88 @@ fn copy_tree_bounded(source: &Path, destination: &Path) -> Result<(), UpdateErro
     Ok(())
 }
 
+/// Canonicalize for ownership comparison: resolve symlinks/junctions via
+/// `fs::canonicalize` when the path (or its nearest existing ancestor)
+/// exists, otherwise fall back to a lexically cleaned absolute path. Pure
+/// lexical `starts_with` on non-canonical paths misses symlink aliasing
+/// (`/tmp/link -> /etc` compares unequal lexically but equal on disk).
+fn canonicalized_root(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    // Walk up to the nearest existing ancestor, canonicalize it, then
+    // re-append the non-existing tail and clean `.`/`..` lexically.
+    let mut ancestor = path;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !ancestor.exists() {
+        match ancestor.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                match ancestor.parent() {
+                    Some(parent) => ancestor = parent,
+                    None => break,
+                }
+            }
+            None => break,
+        }
+    }
+    let base = fs::canonicalize(ancestor).unwrap_or_else(|_| {
+        // Last resort: absolutize + lexical clean.
+        let abs = if ancestor.is_absolute() {
+            ancestor.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(ancestor)
+        };
+        clean_lexical(&abs)
+    });
+    let mut out = base;
+    for component in tail.into_iter().rev() {
+        out.push(component);
+    }
+    clean_lexical(&out)
+}
+
+fn clean_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
 fn validate_distinct_roots(
     install: &Path,
     state: &Path,
     profile: &Path,
 ) -> Result<(), UpdateError> {
+    // Compare canonicalized roots so symlink-aliased directories cannot
+    // bypass the overlap/ownership checks.
+    let install = canonicalized_root(install);
+    let state = canonicalized_root(state);
+    let profile = canonicalized_root(profile);
     if install == state
         || install == profile
         || state == profile
-        || state.starts_with(install)
-        || profile.starts_with(install)
-        || install.starts_with(state)
+        || state.starts_with(&install)
+        || profile.starts_with(&install)
+        || install.starts_with(&state)
     {
         return Err(UpdateError::UnsafePath(
             "install, updater-state and profile ownership roots overlap unsafely".into(),
         ));
     }
-    if !state.starts_with(profile) {
+    if !state.starts_with(&profile) {
         return Err(UpdateError::UnsafePath(
             "updater state must be owned by the selected user profile".into(),
         ));

@@ -4,6 +4,59 @@ use log::{info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Sanitize a download filename: strip directories, traversal, drive prefixes
+/// and control chars. Never returns an empty or path-bearing name.
+pub(crate) fn sanitize_download_filename(raw: &str, fallback_host: &str) -> String {
+    // Take only the final segment after / or \ and strip drive prefixes.
+    let mut name = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_string();
+    // Strip Windows drive prefix like C:.
+    if name.len() >= 2 && name.as_bytes()[1] == b':' {
+        name = name[2..].to_string();
+    }
+    // Remove control chars and reserved characters.
+    name = name
+        .chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(*c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    // Reject traversal remnants and reserved basenames.
+    let lower = name.to_ascii_lowercase();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || lower == "con"
+        || lower == "prn"
+        || lower == "aux"
+        || lower == "nul"
+        || name.len() > 128
+    {
+        return format!(
+            "{}.html",
+            fallback_host
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+                .take(64)
+                .collect::<String>()
+                .trim_matches('.')
+        );
+    }
+    if name.len() > 128 {
+        name.truncate(128);
+    }
+    name
+}
+
 /// User agent for all network requests, kept in sync with the crate version
 pub(crate) fn browser_ua() -> String {
     format!("GhitaBrowser/{} (Rust)", crate::VERSION)
@@ -72,6 +125,11 @@ pub struct FetchResult {
     pub headers: HashMap<String, String>,
     pub fetch_time_ms: u64,
     pub set_cookie_headers: Vec<String>,
+    /// Origin host of each Set-Cookie in `set_cookie_headers` (same order).
+    /// A Set-Cookie belongs to the hop that sent it, never to the final URL
+    /// after redirects; empty entries fall back to legacy final-host
+    /// attribution for callers that never populated it.
+    pub set_cookie_hosts: Vec<String>,
 }
 
 impl FetchResult {
@@ -155,9 +213,9 @@ pub fn fetch_with_cookies(
         execute_fetch(&agent, url_str, Some(&cookie_header), &[])?
     };
 
-    // Parse Set-Cookie headers from response. Attribute them to the host of
-    // the FINAL URL (after redirects), so a Set-Cookie sent by the redirect
-    // target is not stored under the original host that never sent it.
+    // Set-Cookie headers are attributed to the hop that sent them; only
+    // fall back to the final URL's host when a transport did not populate
+    // the parallel hosts vector (legacy callers/tests).
     let final_domain = match url::Url::parse(&result.url) {
         Ok(u) => u
             .host_str()
@@ -165,8 +223,14 @@ pub fn fetch_with_cookies(
             .unwrap_or_else(|| domain.clone()),
         Err(_) => domain.clone(),
     };
-    for set_cookie_val in &result.set_cookie_headers {
-        let cookie = crate::storage::Cookie::from_set_cookie_header(set_cookie_val, &final_domain);
+    let hosts = &result.set_cookie_hosts;
+    for (index, set_cookie_val) in result.set_cookie_headers.iter().enumerate() {
+        let hop_host = hosts
+            .get(index)
+            .map(String::as_str)
+            .filter(|host| !host.is_empty())
+            .unwrap_or(&final_domain);
+        let cookie = crate::storage::Cookie::from_set_cookie_header(set_cookie_val, hop_host);
         if !cookie.name.is_empty() {
             info!(
                 "Stored cookie: {}={} for domain {}",
@@ -355,6 +419,7 @@ fn execute_fetch(
     // replayed on cross-origin redirect hops (or scheme downgrades).
     let cookie_origin = url::Url::parse(url_str).ok();
     let mut set_cookie_headers: Vec<String> = Vec::new();
+    let mut set_cookie_hosts: Vec<String> = Vec::new();
     let mut final_response: Option<ureq::Response> = None;
 
     for _hop in 0..=MAX_REDIRECTS {
@@ -385,21 +450,33 @@ fn execute_fetch(
         }
         let response = request.call()?;
 
-        // Collect this hop's Set-Cookie headers
+        // Collect this hop's Set-Cookie headers, each attributed to the hop
+        // that actually sent them (redirect hops are different origins).
         for cookie_val in response.all("set-cookie") {
             let trimmed = cookie_val.trim();
             if !trimmed.is_empty() {
                 set_cookie_headers.push(trimmed.to_string());
+                set_cookie_hosts.push(parsed.host_str().unwrap_or("").to_string());
             }
         }
 
         // Follow 3xx redirects manually (Location header). Relative
-        // locations resolve against the current hop URL.
-        if let Some(loc) = response.header("location") {
-            let next = url::Url::parse(&current)?.join(loc)?;
-            info!("Redirecting {} -> {}", current, next);
-            current = next.to_string();
-            continue;
+        // locations resolve against the current hop URL. Only follow on
+        // actual 3xx statuses so a 200+Location cannot loop or drop the body.
+        let status = response.status();
+        let is_redirect = matches!(status, 301 | 302 | 303 | 307 | 308);
+        if is_redirect {
+            if let Some(loc) = response.header("location") {
+                let next = url::Url::parse(&current)?.join(loc)?;
+                // Per-hop scheme re-check happens at the top of the next
+                // iteration; reject non-http(s) targets here as well.
+                if next.scheme() != "http" && next.scheme() != "https" {
+                    return Err(format!("Unsupported redirect scheme: {}", next.scheme()).into());
+                }
+                info!("Redirecting {} -> {}", current, next);
+                current = next.to_string();
+                continue;
+            }
         }
 
         final_response = Some(response);
@@ -474,6 +551,7 @@ fn execute_fetch(
         headers,
         bytes,
         set_cookie_headers,
+        set_cookie_hosts,
         fetch_time_ms,
         false,
     )?)
@@ -492,6 +570,7 @@ pub(crate) fn finalize_fetch_response(
     headers: HashMap<String, String>,
     bytes: Vec<u8>,
     set_cookie_headers: Vec<String>,
+    set_cookie_hosts: Vec<String>,
     fetch_time_ms: u64,
     binary_mode: bool,
 ) -> Result<FetchResult, String> {
@@ -514,6 +593,7 @@ pub(crate) fn finalize_fetch_response(
         headers,
         fetch_time_ms,
         set_cookie_headers,
+        set_cookie_hosts,
     })
 }
 
@@ -592,7 +672,9 @@ pub fn download_url(
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    // Suggested name: Content-Disposition filename, else last URL path segment
+    // Suggested name: Content-Disposition filename, else last URL path segment.
+    // Both are attacker-controlled and sanitized to a bare basename.
+    let host = parsed.host_str().unwrap_or("download").to_string();
     let mut file_name = response
         .header("content-disposition")
         .and_then(|cd| cd.split("filename=").nth(1))
@@ -606,9 +688,7 @@ pub fn download_url(
             .unwrap_or("")
             .to_string();
     }
-    if file_name.is_empty() {
-        file_name = format!("{}.html", parsed.host_str().unwrap_or("download"));
-    }
+    let file_name = sanitize_download_filename(&file_name, &host);
 
     // Read body bytes (limit 100MB). Read one extra byte so an over-limit
     // response is reported as an error instead of being silently truncated.
@@ -650,23 +730,23 @@ pub async fn download_url_async(url_str: &str) -> Result<(Vec<u8>, String, Strin
     let bytes = response
         .binary_body
         .ok_or_else(|| "Download transport did not return binary data".to_string())?;
-    let mut file_name = response
+    let raw_name = response
         .headers
         .get("content-disposition")
         .and_then(|value| value.split("filename=").nth(1))
         .and_then(|value| value.split(';').next())
         .map(|value| value.trim().trim_matches('"').trim().to_string())
         .unwrap_or_default();
-    if file_name.is_empty() {
-        file_name = parsed
+    let raw_name = if raw_name.is_empty() {
+        parsed
             .path_segments()
             .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
             .unwrap_or_default()
-            .to_string();
-    }
-    if file_name.is_empty() {
-        file_name = format!("{}.html", parsed.host_str().unwrap_or("download"));
-    }
+            .to_string()
+    } else {
+        raw_name
+    };
+    let file_name = sanitize_download_filename(&raw_name, parsed.host_str().unwrap_or("download"));
     Ok((bytes, file_name, response.content_type))
 }
 
@@ -996,6 +1076,7 @@ mod tests {
             headers: HashMap::new(),
             fetch_time_ms: 10,
             set_cookie_headers: vec![],
+            set_cookie_hosts: vec![],
         };
 
         cache.insert(url, fetch_result.clone(), 3600);
@@ -1016,6 +1097,7 @@ mod tests {
             headers: HashMap::new(),
             fetch_time_ms: 5,
             set_cookie_headers: vec![],
+            set_cookie_hosts: vec![],
         };
 
         cache.insert(url, fetch_result, 0); // TTL = 0, expires immediately
@@ -1034,6 +1116,7 @@ mod tests {
             headers: HashMap::new(),
             fetch_time_ms: 5,
             set_cookie_headers: vec![],
+            set_cookie_hosts: vec![],
         };
 
         cache.insert("https://x.com", fetch_result, 0); // expires immediately
@@ -1056,6 +1139,7 @@ mod tests {
                 headers: HashMap::from([("etag".to_string(), "abc".repeat(100))]),
                 fetch_time_ms: 1,
                 set_cookie_headers: vec!["session=value".to_string()],
+                set_cookie_hosts: vec!["old.example".to_string()],
             },
             60,
         );
@@ -1078,6 +1162,7 @@ mod tests {
                     headers: HashMap::new(),
                     fetch_time_ms: 1,
                     set_cookie_headers: vec![],
+                    set_cookie_hosts: vec![],
                 },
                 60,
             );
@@ -1141,6 +1226,7 @@ mod tests {
             headers: HashMap::new(),
             fetch_time_ms: 5,
             set_cookie_headers: vec![],
+            set_cookie_hosts: vec![],
         };
 
         // FetchResult built by hand (no network): verify the guard used by
@@ -1217,6 +1303,7 @@ mod tests {
             headers.clone(),
             bytes.clone(),
             vec![],
+            vec![],
             12,
             false,
         )
@@ -1232,6 +1319,7 @@ mod tests {
             "text/html",
             headers,
             bytes.clone(),
+            vec![],
             vec![],
             12,
             true,
@@ -1267,6 +1355,7 @@ mod tests {
                 HashMap::new(),
                 pdf_bytes.clone(),
                 vec![],
+                vec![],
                 1,
                 false,
             )
@@ -1284,6 +1373,7 @@ mod tests {
             "text/plain",
             HashMap::new(),
             pdf_bytes,
+            vec![],
             vec![],
             1,
             false,

@@ -918,12 +918,6 @@ impl<'a> RuntimeHost<'a> {
         }
     }
 
-    fn element_text(&self, object: u64) -> Result<String, String> {
-        self.dom.text_content(self.locator(object)?)
-    }
-
-    /// Install the event snapshot the page script sees as the `Event` object
-    /// during one callback invocation.
     fn begin_event(&mut self, node: u64, event: &crate::live_dom::DomEvent) {
         let mut snapshot = event.clone();
         snapshot.current_target = Some(node);
@@ -1050,7 +1044,11 @@ impl<'a> RuntimeHost<'a> {
             return Err("QuotaExceededError: event detail exceeds budget".to_string());
         }
         if self.state.events.len() >= MAX_EVENT_RECORDS {
-            return Err("QuotaExceededError: event object budget exceeded".to_string());
+            // Evict the oldest record: a page allocating Events in a loop
+            // used to break `new Event(...)` for its whole lifetime.
+            if let Some(oldest) = self.state.events.keys().next().copied() {
+                self.state.events.remove(&oldest);
+            }
         }
         let id = self.state.next_event_id;
         self.state.next_event_id = self
@@ -1072,7 +1070,10 @@ impl<'a> RuntimeHost<'a> {
 
     fn allocate_form_data(&mut self, form: NodeId) -> Result<u64, String> {
         if self.state.form_data.len() >= MAX_EVENT_RECORDS {
-            return Err("QuotaExceededError: FormData budget exceeded".to_string());
+            // Same eviction rationale as allocate_event.
+            if let Some(oldest) = self.state.form_data.keys().next().copied() {
+                self.state.form_data.remove(&oldest);
+            }
         }
         let mut entries = Vec::new();
         let mut retained_bytes = 0usize;
@@ -1489,7 +1490,7 @@ impl<'a> RuntimeHost<'a> {
                     .state
                     .mutation_observers
                     .get(&observer_id)
-                    .expect("observer existence checked");
+                    .ok_or_else(|| "InvalidStateError: observer is detached".to_string())?;
                 if entry.targets.len() >= MAX_OBSERVER_TARGETS
                     && !entry.targets.contains_key(&target)
                 {
@@ -1498,7 +1499,7 @@ impl<'a> RuntimeHost<'a> {
                 self.state
                     .mutation_observers
                     .get_mut(&observer_id)
-                    .expect("observer existence checked")
+                    .ok_or_else(|| "InvalidStateError: observer is detached".to_string())?
                     .targets
                     .insert(target, options);
                 Ok(JsvValue::Undefined)
@@ -1516,7 +1517,7 @@ impl<'a> RuntimeHost<'a> {
                 self.state
                     .mutation_observers
                     .get_mut(&observer_id)
-                    .expect("observer existence checked")
+                    .ok_or_else(|| "InvalidStateError: observer is detached".to_string())?
                     .targets
                     .remove(&target);
                 Ok(JsvValue::Undefined)
@@ -1526,7 +1527,7 @@ impl<'a> RuntimeHost<'a> {
                     .state
                     .mutation_observers
                     .get_mut(&observer_id)
-                    .expect("observer existence checked");
+                    .ok_or_else(|| "InvalidStateError: observer is detached".to_string())?;
                 entry.targets.clear();
                 entry.records.clear();
                 Ok(JsvValue::Undefined)
@@ -1537,7 +1538,7 @@ impl<'a> RuntimeHost<'a> {
                         .state
                         .mutation_observers
                         .get_mut(&observer_id)
-                        .expect("observer existence checked")
+                        .ok_or_else(|| "InvalidStateError: observer is detached".to_string())?
                         .records,
                 );
                 Ok(Self::observer_records_value(records))
@@ -1637,7 +1638,7 @@ impl<'a> RuntimeHost<'a> {
                         .state
                         .readable_streams
                         .get(&object)
-                        .expect("stream existence checked")
+                        .ok_or_else(|| "InvalidStateError: stream is detached".to_string())?
                         .locked
                     {
                         return Err("TypeError: ReadableStream is already locked".to_string());
@@ -1646,7 +1647,7 @@ impl<'a> RuntimeHost<'a> {
                     self.state
                         .readable_streams
                         .get_mut(&object)
-                        .expect("stream existence checked")
+                        .ok_or_else(|| "InvalidStateError: stream is detached".to_string())?
                         .locked = true;
                     self.state
                         .stream_readers
@@ -1658,7 +1659,7 @@ impl<'a> RuntimeHost<'a> {
                         .state
                         .readable_streams
                         .get_mut(&object)
-                        .expect("stream existence checked");
+                        .ok_or_else(|| "InvalidStateError: stream is detached".to_string())?;
                     stream.cancelled = true;
                     stream.closed = true;
                     stream.chunks.clear();
@@ -1672,7 +1673,7 @@ impl<'a> RuntimeHost<'a> {
                         .readable_streams
                         .get(&object)
                         .cloned()
-                        .expect("stream existence checked");
+                        .ok_or_else(|| "InvalidStateError: stream is detached".to_string())?;
                     if source.locked {
                         return Err("TypeError: cannot tee a locked stream".to_string());
                     }
@@ -2193,7 +2194,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .broadcast_channels
                         .get(&object)
-                        .expect("channel existence checked")
+                        .ok_or_else(|| "InvalidStateError: channel is detached".to_string())?
                         .name
                         .clone(),
                 )),
@@ -2436,9 +2437,10 @@ impl JsvHost for RuntimeHost<'_> {
             },
             HOST_NAVIGATOR => match property {
                 "serviceWorker" => Ok(JsvValue::HostObject(HOST_SERVICE_WORKER)),
-                "userAgent" => Ok(JsvValue::String(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 GhitaBrowser/2.0.6".to_string(),
-                )),
+                "userAgent" => Ok(JsvValue::String(format!(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 GhitaBrowser/{}",
+                    crate::VERSION
+                ))),
                 "language" => Ok(JsvValue::String("en-US".to_string())),
                 "languages" => Ok(JsvValue::Array(Rc::new(RefCell::new(vec![
                     JsvValue::String("en-US".to_string()),
@@ -2661,7 +2663,10 @@ impl JsvHost for RuntimeHost<'_> {
                         None => Ok(JsvValue::Null),
                     }
                 }
-                "innerHTML" => Ok(JsvValue::String(self.element_text(element)?)),
+                                "innerHTML" => {
+                    let node = self.locator(element)?;
+                    Ok(JsvValue::String(self.dom.inner_html(node)?))
+                }
                 "classList" => Ok(JsvValue::HostObject(element | HOST_CLASSLIST_BIT)),
                 "dataset" => Ok(JsvValue::HostObject(element | HOST_DATASET_BIT)),
                 "style" => Ok(JsvValue::HostObject(element | HOST_STYLE_BIT)),
@@ -2850,7 +2855,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .media_elements
                         .get_mut(&object)
-                        .expect("media object existence checked")
+                        .ok_or_else(|| "InvalidStateError: media object is detached".to_string())?
                         .seek(seconds)?;
                     value
                 }
@@ -2861,7 +2866,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .media_elements
                         .get_mut(&object)
-                        .expect("media object existence checked")
+                        .ok_or_else(|| "InvalidStateError: media object is detached".to_string())?
                         .set_volume(volume)?;
                     value
                 }
@@ -2870,7 +2875,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .media_elements
                         .get_mut(&object)
-                        .expect("media object existence checked")
+                        .ok_or_else(|| "InvalidStateError: media object is detached".to_string())?
                         .set_muted(muted);
                     JsvValue::Boolean(muted)
                 }
@@ -2881,7 +2886,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .media_elements
                         .get_mut(&object)
-                        .expect("media object existence checked")
+                        .ok_or_else(|| "InvalidStateError: media object is detached".to_string())?
                         .set_playback_rate(rate)?;
                     value
                 }
@@ -2899,7 +2904,9 @@ impl JsvHost for RuntimeHost<'_> {
                         self.state
                             .media_elements
                             .get_mut(&object)
-                            .expect("media object existence checked")
+                            .ok_or_else(|| {
+                                "InvalidStateError: media object is detached".to_string()
+                            })?
                             .pause();
                     }
                     value
@@ -2956,7 +2963,7 @@ impl JsvHost for RuntimeHost<'_> {
             self.state
                 .media_sources
                 .get_mut(&object)
-                .expect("media source existence checked")
+                .ok_or_else(|| "InvalidStateError: media source is detached".to_string())?
                 .set_duration((seconds * 1_000_000.0) as i64)?;
             return Ok(value);
         }
@@ -3355,7 +3362,6 @@ impl JsvHost for RuntimeHost<'_> {
                         .get_mut(&database_name)
                         .ok_or_else(|| "InvalidStateError: database is closed".to_string())?
                         .create_object_store(&name, key_path, auto_increment)?;
-                    self.state.indexeddb.persist()?;
                     let handle = self.allocate_platform_handle()?;
                     self.state
                         .idb_stores
@@ -3395,7 +3401,6 @@ impl JsvHost for RuntimeHost<'_> {
                         .get_mut(&database_name)
                         .is_some_and(|database| database.delete_object_store(&name));
                     if removed {
-                        self.state.indexeddb.persist()?;
                         self.state.idb_stores.retain(|_, (database, store)| {
                             database != &database_name || store != &name
                         });
@@ -3445,7 +3450,6 @@ impl JsvHost for RuntimeHost<'_> {
                     } else {
                         store.add(key, value)?
                     };
-                    self.state.indexeddb.persist()?;
                     self.update_platform_quota();
                     self.record_platform_operation(format!(
                         "indexedDB.{method} {database_name}/{store_name}"
@@ -3486,9 +3490,6 @@ impl JsvHost for RuntimeHost<'_> {
                         .get_mut(&database_name)
                         .and_then(|database| database.object_stores.get_mut(&store_name))
                         .is_some_and(|store| store.delete(&key));
-                    if removed {
-                        self.state.indexeddb.persist()?;
-                    }
                     self.update_platform_quota();
                     Ok(JsvValue::Boolean(removed))
                 }
@@ -3500,7 +3501,6 @@ impl JsvHost for RuntimeHost<'_> {
                         .and_then(|database| database.object_stores.get_mut(&store_name))
                         .ok_or_else(|| "InvalidStateError: object store is detached".to_string())?
                         .clear();
-                    self.state.indexeddb.persist()?;
                     self.update_platform_quota();
                     Ok(JsvValue::Undefined)
                 }
@@ -3535,7 +3535,6 @@ impl JsvHost for RuntimeHost<'_> {
                         .and_then(|database| database.object_stores.get_mut(&store_name))
                         .ok_or_else(|| "InvalidStateError: object store is detached".to_string())?
                         .create_index(config)?;
-                    self.state.indexeddb.persist()?;
                     let handle = self.allocate_platform_handle()?;
                     self.state.idb_indexes.insert(
                         handle,
@@ -3559,7 +3558,6 @@ impl JsvHost for RuntimeHost<'_> {
                         .and_then(|database| database.object_stores.get_mut(&store_name))
                         .is_some_and(|store| store.delete_index(name));
                     if removed {
-                        self.state.indexeddb.persist()?;
                         self.state
                             .idb_indexes
                             .retain(|_, (database, store, index)| {
@@ -3659,7 +3657,9 @@ impl JsvHost for RuntimeHost<'_> {
                             self.state.idb_cursors.insert(handle, cursor);
                             Ok(JsvValue::HostObject(handle))
                         }
-                        _ => unreachable!(),
+                        _ => Err(format!(
+                            "SecurityError: IDBIndex method '{method}' is unavailable"
+                        )),
                     }
                 }
                 _ => Err(format!(
@@ -3673,7 +3673,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .idb_cursors
                         .get_mut(&object)
-                        .expect("cursor existence checked")
+                        .ok_or_else(|| "InvalidStateError: IDBCursor is detached".to_string())?
                         .advance(1);
                     Ok(JsvValue::HostObject(object))
                 }
@@ -3689,7 +3689,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .idb_cursors
                         .get_mut(&object)
-                        .expect("cursor existence checked")
+                        .ok_or_else(|| "InvalidStateError: IDBCursor is detached".to_string())?
                         .advance(count);
                     Ok(JsvValue::HostObject(object))
                 }
@@ -3796,7 +3796,6 @@ impl JsvHost for RuntimeHost<'_> {
                         std::collections::HashMap::new(),
                         body,
                     )?;
-                    self.state.cache_storage.persist()?;
                     self.update_platform_quota();
                     self.record_platform_operation(format!("Cache.put {target}"));
                     Ok(JsvValue::Undefined)
@@ -3836,9 +3835,6 @@ impl JsvHost for RuntimeHost<'_> {
                         .caches
                         .get_mut(&cache_name)
                         .is_some_and(|cache| cache.delete(&target));
-                    if removed {
-                        self.state.cache_storage.persist()?;
-                    }
                     self.update_platform_quota();
                     Ok(JsvValue::Boolean(removed))
                 }
@@ -4010,7 +4006,9 @@ impl JsvHost for RuntimeHost<'_> {
                             self.state
                                 .media_elements
                                 .get_mut(&object)
-                                .expect("media object existence checked")
+                                .ok_or_else(|| {
+                                    "InvalidStateError: media object is detached".to_string()
+                                })?
                                 .attach_media_source(source)?;
                         }
                     }
@@ -4018,13 +4016,17 @@ impl JsvHost for RuntimeHost<'_> {
                         self.state
                             .media_elements
                             .get_mut(&object)
-                            .expect("media object existence checked")
+                            .ok_or_else(|| {
+                                "InvalidStateError: media object is detached".to_string()
+                            })?
                             .play()?;
                     } else {
                         self.state
                             .media_elements
                             .get_mut(&object)
-                            .expect("media object existence checked")
+                            .ok_or_else(|| {
+                                "InvalidStateError: media object is detached".to_string()
+                            })?
                             .synchronize_source_state();
                     }
                     self.collect_media_events(object);
@@ -4034,7 +4036,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .media_elements
                         .get_mut(&object)
-                        .expect("media object existence checked")
+                        .ok_or_else(|| "InvalidStateError: media object is detached".to_string())?
                         .pause();
                     self.collect_media_events(object);
                     return Ok(JsvValue::Undefined);
@@ -4062,7 +4064,7 @@ impl JsvHost for RuntimeHost<'_> {
                         .state
                         .media_sources
                         .get_mut(&object)
-                        .expect("media source existence checked")
+                        .ok_or_else(|| "InvalidStateError: media source is detached".to_string())?
                         .add_source_buffer(&content_type, &capabilities)?;
                     self.allocate_source_buffer(object, buffer)
                 }
@@ -4070,7 +4072,7 @@ impl JsvHost for RuntimeHost<'_> {
                     self.state
                         .media_sources
                         .get_mut(&object)
-                        .expect("media source existence checked")
+                        .ok_or_else(|| "InvalidStateError: media source is detached".to_string())?
                         .end_of_stream()?;
                     Ok(JsvValue::Undefined)
                 }
@@ -4358,6 +4360,15 @@ impl JsvHost for RuntimeHost<'_> {
                 let callback = arguments.first().cloned().ok_or_else(|| {
                     "TypeError: requestAnimationFrame requires a callback".to_string()
                 })?;
+                // Registration cap: a timer re-arming RAF callbacks grew the
+                // map geometrically across pumps (memory exhaustion and
+                // multi-second frames). 1024 pending callbacks is plenty.
+                if self.state.animation_frame_callbacks.len() >= 1_024 {
+                    return Err(
+                        "QuotaExceededError: requestAnimationFrame callback budget exceeded"
+                            .to_string(),
+                    );
+                }
                 let id = self.state.next_raf_id;
                 self.state.next_raf_id = self.state.next_raf_id.wrapping_add(1);
                 self.state.animation_frame_callbacks.insert(id, callback);
@@ -4452,19 +4463,26 @@ impl JsvHost for RuntimeHost<'_> {
                     .ok_or_else(|| "TypeError: getRandomValues requires an array".to_string())?;
                 match arg {
                     JsvValue::Array(arr) => {
-                        let mut borrowed = arr.borrow_mut();
+                        let mut borrowed = arr.try_borrow_mut().map_err(|_| {
+                            "InvalidStateError: typed array is reentrantly borrowed".to_string()
+                        })?;
                         for item in borrowed.iter_mut() {
                             *item = JsvValue::Number(f64::from(random_u8()));
                         }
                     }
                     JsvValue::TypedArray(arr) => {
-                        let view = arr.borrow();
+                        let view = arr.try_borrow().map_err(|_| {
+                            "InvalidStateError: typed array is reentrantly borrowed".to_string()
+                        })?;
                         // Only the view's own region may be written: a small
                         // subarray view used to randomize the WHOLE backing
                         // buffer, corrupting sibling views.
                         let start = view.byte_offset;
                         let end = start.saturating_add(view.length);
-                        let mut buffer = view.buffer.borrow_mut();
+                        let mut buffer = view.buffer.try_borrow_mut().map_err(|_| {
+                            "InvalidStateError: typed array buffer is reentrantly borrowed"
+                                .to_string()
+                        })?;
                         let region = buffer
                             .bytes
                             .get_mut(start..end)
@@ -5033,6 +5051,17 @@ impl JsvHost for RuntimeHost<'_> {
                 if !self.state.capabilities.contains(&HostCapability::Canvas2D) {
                     return Ok(JsvValue::Null);
                 }
+                // getContext returns the SAME context per canvas (spec);
+                // minting a new one reset fill/stroke/font state and leaked
+                // a record per call until the quota broke the API.
+                if let Some((existing_id, _)) = self
+                    .state
+                    .canvas_contexts
+                    .iter()
+                    .find(|(_, context)| context.canvas == node)
+                {
+                    return Ok(JsvValue::HostObject(*existing_id));
+                }
                 if self.state.canvas_contexts.len() >= MAX_EVENT_RECORDS {
                     return Err("QuotaExceededError: canvas context budget exceeded".to_string());
                 }
@@ -5266,8 +5295,9 @@ impl JsvHost for RuntimeHost<'_> {
                 self.state.custom_elements.insert(tag.clone(), constructor);
                 if let Some(waiters) = self.state.custom_element_waiters.remove(&tag) {
                     for promise in waiters {
-                        *promise.borrow_mut() =
-                            crate::javascript::JsvPromiseState::Fulfilled(JsvValue::Undefined);
+                        *promise.try_borrow_mut().map_err(|_| {
+                            "InvalidStateError: promise is reentrantly borrowed".to_string()
+                        })? = crate::javascript::JsvPromiseState::Fulfilled(JsvValue::Undefined);
                     }
                 }
                 self.record_platform_operation(format!("customElements.define({tag})"));
@@ -5616,7 +5646,13 @@ impl PageRuntime {
         let callbacks = std::mem::take(&mut self.state.animation_frame_callbacks);
         let mut executed = 0usize;
         let now = self.state.now_ms as f64;
-        for (_id, cb) in callbacks {
+        for (id, cb) in callbacks {
+            // Per-pump execution cap: everything not run stays queued for
+            // the next pump instead of stretching a single frame unbounded.
+            if executed >= 256 {
+                self.state.animation_frame_callbacks.insert(id, cb);
+                continue;
+            }
             let outcome = {
                 let mut host = RuntimeHost::new(
                     &mut self.live_dom,
@@ -6268,6 +6304,13 @@ impl PageRuntime {
     pub fn flush_pending(&mut self) -> Result<usize, String> {
         let mut total = 0usize;
         for _ in 0..MAX_PENDING_TASKS {
+            // Cumulative work budget: a listener that queues another
+            // dispatch refilled the queue every round (~1M dispatches on
+            // the UI thread). 1024 total dispatches per turn, then truncate.
+            if total >= MAX_PENDING_TASKS {
+                self.report.truncated = true;
+                break;
+            }
             let pending = std::mem::take(&mut self.state.pending_dispatches);
             let had_dispatches = !pending.is_empty();
             for dispatch in pending {
@@ -6301,6 +6344,11 @@ impl PageRuntime {
         {
             self.report.truncated = true;
         }
+        // Persist origin storage ONCE per drained turn: the per-operation
+        // persist inside every put/add/delete re-serialized the entire
+        // origin database each record (O(n^2) I/O hang on bulk writes).
+        self.state.indexeddb.persist()?;
+        self.state.cache_storage.persist()?;
         Ok(total)
     }
 

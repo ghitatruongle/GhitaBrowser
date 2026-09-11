@@ -26,6 +26,7 @@ impl WindowsCredentialStore {
         let mut username_wide = wide_null(username);
         let mut password_bytes = password.as_bytes().to_vec();
         if password_bytes.len() > 5 * 512 {
+            zeroize_bytes(&mut password_bytes);
             return Err("Credential password exceeds Windows generic credential limit".to_string());
         }
         let credential = CREDENTIALW {
@@ -37,8 +38,11 @@ impl WindowsCredentialStore {
             UserName: PWSTR(username_wide.as_mut_ptr()),
             ..Default::default()
         };
-        unsafe { CredWriteW(&credential, 0) }
-            .map_err(|error| format!("Windows Credential Manager write failed: {error}"))
+        let result = unsafe { CredWriteW(&credential, 0) }
+            .map_err(|error| format!("Windows Credential Manager write failed: {error}"));
+        // Never leave the plaintext on the stack/heap longer than needed.
+        zeroize_bytes(&mut password_bytes);
+        result
     }
 
     #[cfg(not(windows))]
@@ -67,6 +71,12 @@ impl WindowsCredentialStore {
         }
         let credential = unsafe { &*raw };
         let stored_username = unsafe { credential.UserName.to_string() };
+        // Cap OS-controlled sizes before slicing: a corrupt vault entry must
+        // not cause a multi-GB allocation.
+        if credential.CredentialBlobSize > 5 * 512 {
+            unsafe { CredFree(raw.cast()) };
+            return Err("Credential blob exceeds Windows generic credential limit".to_string());
+        }
         let password_bytes = if credential.CredentialBlobSize == 0 {
             Vec::new()
         } else {
@@ -150,6 +160,41 @@ fn credential_target(profile: &str, origin: &str, username: &str) -> Result<Stri
     Ok(format!("GhitaBrowser/{profile}/{origin}/{username}"))
 }
 
+/// Best-effort volatile zeroization for transient plaintext buffers.
+/// Prevents the compiler from eliding the wipe as a dead store.
+fn zeroize_bytes(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Normalize a lookup host for credential matching: accept bare hosts or
+/// full URLs, strip ports, trim dots/spaces and lowercase. Returns None for
+/// empty/invalid inputs so callers fail closed.
+fn normalize_lookup_host(input: &str) -> Option<String> {
+    let trimmed = input.trim().trim_matches('.').trim();
+    if trimmed.is_empty() || trimmed.len() > 253 {
+        return None;
+    }
+    // Accept full URLs (https://host:port/path) as well as bare hosts.
+    let host = if trimmed.contains("://") {
+        url::Url::parse(trimmed).ok()?.host_str()?.to_string()
+    } else {
+        // Strip port if present and valid (host:port), keep bare IPv6.
+        if let Ok(url) = url::Url::parse(&format!("https://{trimmed}")) {
+            url.host_str()?.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let host = host.trim_matches('.').trim().to_ascii_lowercase();
+    if host.is_empty() || host.contains([' ', '/', '\\', '@', '?', '#']) {
+        return None;
+    }
+    Some(host)
+}
+
 #[cfg(windows)]
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -168,6 +213,16 @@ pub struct SavedPassword {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PasswordStore {
+    /// 2.0.7 disposition (audit 2026-08-26): intentionally UNSHIPPED and
+    /// MUST STAY SO until this store is backed by the OS credential vault
+    /// (`WindowsCredentialStore` above) instead of XOR obfuscation.
+    /// Contract, enforced by review + tests:
+    ///   1. NEVER persist this struct to `StorageState`/profile disk files —
+    ///      the obfuscation is trivially reversible (CHANGELOG promise).
+    ///   2. NEVER wire it into form autofill or any UI surface.
+    ///
+    /// Any change touching these rules is release-blocking for personal
+    /// builds; see README "Deliberate limitations" and SECURITY.md.
     pub entries: Vec<SavedPassword>,
     /// Monotonic id counter so two saves within the same millisecond can't
     /// collide on the same id (delete/pin operations would act on the wrong
@@ -222,12 +277,17 @@ impl PasswordStore {
     /// substring containment, which would match "evil-example.com" for
     /// "example.com" and offer credentials to attacker-controlled hosts.
     pub fn find_for_domain(&self, domain: &str) -> Vec<&SavedPassword> {
-        let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        let normalized = normalize_lookup_host(domain);
+        let Some(normalized) = normalized else {
+            return Vec::new();
+        };
         self.entries
             .iter()
             .filter(|e| {
-                let stored = e.domain.trim_start_matches('.').to_ascii_lowercase();
-                domain == stored || domain.ends_with(&format!(".{}", stored))
+                let Some(stored) = normalize_lookup_host(&e.domain) else {
+                    return false;
+                };
+                normalized == stored || normalized.ends_with(&format!(".{}", stored))
             })
             .collect()
     }

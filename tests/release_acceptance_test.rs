@@ -78,6 +78,9 @@ fn document_pipeline_handles_deep_input_without_unbounded_tree() {
 
 #[test]
 fn runtime_version_matches_package_version() {
+    // The runtime version must always mirror Cargo.toml (single source of
+    // truth); no release-pinned literal here — the packaging gate asserts
+    // the staged binaries report the declared version.
     assert_eq!(ghitabrowser::VERSION, env!("CARGO_PKG_VERSION"));
-    assert_eq!(ghitabrowser::VERSION, "2.0.6");
+    assert!(!ghitabrowser::VERSION.is_empty());
 }

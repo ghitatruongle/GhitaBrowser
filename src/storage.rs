@@ -72,7 +72,11 @@ impl Cookie {
         for (i, part) in parts.iter().enumerate() {
             let trimmed = part.trim();
             if let Some(eq_pos) = trimmed.find('=') {
-                let key = trimmed[..eq_pos].trim().to_lowercase();
+                // Cookie names are case-sensitive (RFC 6265 §5.2): only the
+                // attribute keys are compared case-insensitively. Keep the
+                // raw name so `SessionID` is not collapsed to `sessionid`.
+                let key_raw = trimmed[..eq_pos].trim();
+                let key = key_raw.to_ascii_lowercase();
                 let val = trimmed[eq_pos + 1..].trim().to_string();
 
                 match key.as_str() {
@@ -89,7 +93,15 @@ impl Cookie {
                             domain = format!(".{}", d);
                         }
                     }
-                    "path" => path = val,
+                    // RFC 6265 §5.2.4: a Path attribute that does not start
+                    // with '/' is treated as the default path '/'.
+                    "path" => {
+                        path = if val.starts_with('/') && !val.is_empty() {
+                            val
+                        } else {
+                            "/".to_string()
+                        }
+                    }
                     "expires" => {
                         // Parse the standard HTTP-date (RFC 7231). Unparseable
                         // dates are ignored per RFC 6265 (cookie stays a
@@ -116,7 +128,7 @@ impl Cookie {
                     _ => {
                         // First name=value is the cookie itself
                         if i == 0 && name.is_empty() {
-                            name = key;
+                            name = key_raw.to_string();
                             value = val;
                         }
                     }
@@ -182,8 +194,16 @@ impl Cookie {
         // Path match: the cookie path must be a path-prefix of the request
         // path (RFC 6265), with a '/' boundary unless the cookie path itself
         // ends in '/' (so path "/app" matches "/app/x" but not "/appx").
+        // A stored path that is empty or does not start with '/' is
+        // normalized to '/' so legacy jars cannot produce a prefix that
+        // matches every path.
         let request_path = parsed.path();
-        let cookie_path = if self.path.is_empty() {
+        let request_path = if request_path.is_empty() {
+            "/"
+        } else {
+            request_path
+        };
+        let cookie_path = if self.path.is_empty() || !self.path.starts_with('/') {
             "/"
         } else {
             self.path.as_str()
@@ -277,10 +297,38 @@ impl CookieStore {
     /// name/domain/path) always succeeds.
     pub fn add_cookie(&mut self, cookie: Cookie) {
         const MAX_COOKIES_PER_DOMAIN: usize = 180;
+        // Browsers cap the jar globally (~3000); without it a wildcard-DNS
+        // origin mints one 180-cookie domain key per subdomain unbounded.
+        const MAX_TOTAL_COOKIES: usize = 3_000;
         if cookie.name.is_empty() {
             return;
         }
         let domain = cookie.domain.clone();
+        let replacing = self
+            .cookies
+            .get(&domain)
+            .is_some_and(|set| set.contains(&cookie));
+        if !replacing {
+            let total: usize = self.cookies.values().map(|set| set.len()).sum();
+            if total >= MAX_TOTAL_COOKIES {
+                let mut oldest: Option<(String, Cookie)> = None;
+                for (d, set) in &self.cookies {
+                    for candidate in set {
+                        if oldest
+                            .as_ref()
+                            .is_none_or(|(_, o)| candidate.created_at < o.created_at)
+                        {
+                            oldest = Some((d.clone(), candidate.clone()));
+                        }
+                    }
+                }
+                if let Some((d, o)) = oldest {
+                    if let Some(set) = self.cookies.get_mut(&d) {
+                        set.remove(&o);
+                    }
+                }
+            }
+        }
         let entry = self.cookies.entry(domain.clone()).or_default();
         if !entry.contains(&cookie) && entry.len() >= MAX_COOKIES_PER_DOMAIN {
             warn!(
@@ -289,6 +337,11 @@ impl CookieStore {
             );
             return;
         }
+        // HashSet::insert is a NO-OP when an equal key is present, and
+        // Cookie's Eq/Hash covers only (name, domain, path) — so updates
+        // (new value, refreshed expiry) and deletions (Max-Age=0) must
+        // remove the old entry first or they are silently discarded.
+        entry.remove(&cookie);
         entry.insert(cookie);
     }
 
@@ -325,6 +378,26 @@ impl CookieStore {
         }
 
         result
+    }
+
+    /// Get cookies valid for a full URL, enforcing Secure/Path/SameSite via
+    /// [`Cookie::matches_url`] in addition to the domain lookup. A request
+    /// path that is empty or does not start with '/' is normalized to '/'
+    /// before matching (the normalization itself lives in `matches_url`;
+    /// this wrapper only extracts the host case-insensitively).
+    pub fn get_cookies_for_url(&self, url: &str) -> Vec<Cookie> {
+        let parsed = match url::Url::parse(url) {
+            Ok(u) => u,
+            Err(_) => return Vec::new(),
+        };
+        let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+        if host.is_empty() {
+            return Vec::new();
+        }
+        self.get_cookies(&host)
+            .into_iter()
+            .filter(|c| c.matches_url(url))
+            .collect()
     }
 
     /// Remove all cookies for a domain, covering both the bare and the
@@ -368,15 +441,9 @@ impl CookieStore {
 /// SameSite=Strict). Used by the GUI fetch path to avoid deep-cloning the
 /// whole jar into the blocking task.
 pub fn cookie_header_for(store: &CookieStore, url: &str) -> String {
-    let parsed = match url::Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return String::new(),
-    };
-    let domain = parsed.host_str().unwrap_or("");
     store
-        .get_cookies(domain)
+        .get_cookies_for_url(url)
         .iter()
-        .filter(|c| c.matches_url(url))
         .map(|c| c.to_header_value())
         .collect::<Vec<_>>()
         .join("; ")
@@ -418,8 +485,14 @@ impl LocalStorage {
     /// origin past its quota (replacing an existing key only charges the
     /// delta; the write is refused entirely rather than partially applied).
     pub fn set(&mut self, key: &str, value: &str) -> bool {
-        let old = self.data.get(key).map(|v| v.len()).unwrap_or(0);
-        if self.total_bytes() + key.len() + value.len() - old > LOCAL_STORAGE_QUOTA {
+        // total_bytes() already counts key.len() + old for a replaced
+        // entry; the old formula charged key.len() a second time, refusing
+        // shrinking writes under large keys.
+        let projected = match self.data.get(key) {
+            Some(existing) => self.total_bytes() + value.len().saturating_sub(existing.len()),
+            None => self.total_bytes() + key.len() + value.len(),
+        };
+        if projected > LOCAL_STORAGE_QUOTA {
             warn!(
                 "localStorage quota exceeded for origin {} ({} bytes)",
                 self.origin, LOCAL_STORAGE_QUOTA
@@ -841,10 +914,22 @@ impl StorageManager {
         }
     }
 
-    /// Read and parse a storage file, returning None if unreadable or corrupt
+    /// Read and parse a storage file, returning None if unreadable or corrupt.
+    /// The read is bounded to 64 MiB (one extra byte detects oversize) so a
+    /// huge `storage.json` cannot exhaust RAM, matching the
+    /// `updater::read_bounded_json` pattern via `File::take`.
     fn read_state(path: &std::path::Path) -> Option<StorageState> {
-        let json = std::fs::read_to_string(path).ok()?;
-        let state = serde_json::from_str::<StorageState>(&json).ok()?;
+        use std::io::Read;
+        const MAX_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
+        let file = std::fs::File::open(path).ok()?;
+        let mut limited = file.take(MAX_STORAGE_BYTES + 1);
+        let mut buf = Vec::new();
+        limited.read_to_end(&mut buf).ok()?;
+        if buf.len() as u64 > MAX_STORAGE_BYTES {
+            log::error!("Storage file exceeds 64 MiB bound: {:?}", path);
+            return None;
+        }
+        let state = serde_json::from_slice::<StorageState>(&buf).ok()?;
         (state.schema_version <= STORAGE_SCHEMA_VERSION).then_some(state)
     }
 
@@ -889,6 +974,21 @@ impl StorageManager {
         };
 
         if !path.exists() {
+            // save() renames path→backup and then tmp→path; a crash between
+            // the two renames leaves only the backup. Load it instead of
+            // starting from defaults (the next Drop-save would otherwise
+            // delete the last good copy).
+            let backup = path.with_extension("json.bak");
+            if backup.exists() {
+                match Self::read_state(&backup) {
+                    Some(state) => {
+                        self.apply_state(state);
+                        info!("Storage restored from backup {:?}", backup);
+                        return;
+                    }
+                    None => warn!("Backup at {:?} was unreadable", backup),
+                }
+            }
             info!("No saved storage found at {:?}", path);
             return;
         }
@@ -1344,13 +1444,16 @@ mod tests {
 
     #[test]
     fn test_max_age_overflow_is_capped() {
-        // A max-age near i64::MAX must not overflow `now + secs`.
+        // A max-age near i64::MAX must saturate to a far-future expiry
+        // (capped, saturating_add) instead of overflowing `now + secs`.
         let cookie =
             Cookie::from_set_cookie_header("k=v; Max-Age=9223372036854775807", "example.com");
-        match cookie.expires {
-            Some(ts) => assert!(ts > chrono::Utc::now().timestamp()),
-            None => panic!("huge Max-Age must produce a far-future expiry, not overflow"),
-        }
+        assert!(
+            cookie
+                .expires
+                .is_some_and(|ts| ts > chrono::Utc::now().timestamp()),
+            "huge Max-Age must produce a far-future expiry, not overflow"
+        );
     }
 
     #[test]

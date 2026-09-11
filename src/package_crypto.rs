@@ -118,11 +118,71 @@ pub fn validate_key_id(key_id: &str) -> Result<(), PackageCryptoError> {
     Ok(())
 }
 
+/// Windows reserved device basenames (case-insensitive, without extension).
+fn is_reserved_basename(segment: &str) -> bool {
+    let base = segment.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(
+        base.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
 /// Accept only a relative sequence of normal components. This rejects parent
 /// traversal, drive/prefix paths, absolute paths and empty package paths.
+/// Additionally rejects backslashes, colons (Windows separators, drive
+/// letters and ADS `file:stream` on any platform) and Windows reserved
+/// device basenames (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
+/// `LPT1`-`LPT9`, with or without extension) explicitly so validation does
+/// not depend on the host OS path parser.
 pub fn validate_package_path(path: &str) -> Result<(), PackageCryptoError> {
     if path.is_empty() || path.len() > MAX_PACKAGE_PATH_BYTES {
         return Err(PackageCryptoError::UnsafePath(path.to_string()));
+    }
+    // Reject Windows separators / drive / ADS syntax on every platform:
+    // on Unix `\\` and `:` are otherwise valid filename characters.
+    if path.contains('\\') || path.contains(':') || path.contains('\0') {
+        return Err(PackageCryptoError::UnsafePath(path.to_string()));
+    }
+    // Reject empty segments (`//`, leading/trailing `/`) explicitly: the
+    // OS parser silently collapses them, which would hide `a//b` tricks.
+    if path.split('/').any(|segment| segment.is_empty()) {
+        return Err(PackageCryptoError::UnsafePath(path.to_string()));
+    }
+    for segment in path.split('/') {
+        // Reject `.` / `..` lexically as well (covered by components, but
+        // explicit for non-OS parsers) and reserved devices.
+        if segment == "." || segment == ".." {
+            return Err(PackageCryptoError::UnsafePath(path.to_string()));
+        }
+        // Windows also strips trailing dots/spaces (`file.`, `file `);
+        // reject them to avoid aliasing distinct package entries.
+        if segment.ends_with('.') || segment.ends_with(' ') {
+            return Err(PackageCryptoError::UnsafePath(path.to_string()));
+        }
+        if is_reserved_basename(segment) {
+            return Err(PackageCryptoError::UnsafePath(path.to_string()));
+        }
     }
     let parsed = Path::new(path);
     if parsed.is_absolute() {

@@ -137,7 +137,15 @@ fn browser_profile_restores_trust_extension_and_reviewed_app() {
             .unwrap();
     }
     {
-        let browser = Browser::new_with_profile(&root, "Work").unwrap();
+        let mut browser = Browser::new_with_profile(&root, "Work").unwrap();
+        // Extension trust is binary-pinned now (profile files no longer
+        // grant it). Re-insert the session publisher and reload — the
+        // record/storage/apps still persist with the profile.
+        browser
+            .extension_manager
+            .trust_publisher("product-test-key", key().verifying_key().to_bytes())
+            .unwrap();
+        browser.extension_manager.reload_installed().unwrap();
         assert!(browser
             .extension_manager
             .get_extension("persistent_product_extension")

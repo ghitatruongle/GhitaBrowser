@@ -18,7 +18,10 @@ pub enum WasmValue {
 pub const MAX_INTERPRETER_STEPS: u64 = 1_000_000;
 
 pub const MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_CALL_DEPTH_WASM: usize = 512;
+/// Capped at 256 (not 512) so debug builds cannot overflow the 1 MiB test
+/// thread stack via Rust run_function->execute_frame recursion before the
+/// guard fires. fact(2000) still fails closed with a depth error.
+pub const MAX_CALL_DEPTH_WASM: usize = 256;
 pub const MAX_STACK_VALUES: usize = 10_000;
 pub const MAX_LABELS: usize = 1_024;
 
@@ -71,8 +74,45 @@ impl WasmInstance {
         &self.memory
     }
 
-    pub fn memory_mut(&mut self) -> &mut [u8] {
-        &mut self.memory
+    /// Bounded host write into linear memory. Re-validates bounds and the
+    /// global memory cap so hosts cannot smuggle oversized memories.
+    pub fn write_memory(&mut self, offset: usize, bytes: &[u8]) -> Result<(), String> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| "Memory write offset overflow".to_string())?;
+        if end > self.memory.len() || self.memory.len() > MAX_MEMORY_BYTES {
+            return Err("Memory write out of bounds".to_string());
+        }
+        self.memory[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Bounded host read from linear memory.
+    pub fn read_memory(&self, offset: usize, len: usize) -> Result<&[u8], String> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| "Memory read offset overflow".to_string())?;
+        self.memory
+            .get(offset..end)
+            .ok_or_else(|| "Memory read out of bounds".to_string())
+    }
+
+    /// Bounded memory growth in 64KiB pages, capped at 16 MiB.
+    pub fn grow_memory(&mut self, delta_pages: u32) -> Result<u32, String> {
+        let old_pages = (self.memory.len() / PAGE_SIZE) as u32;
+        let delta_bytes = (delta_pages as usize)
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(|| "Memory growth overflow".to_string())?;
+        let new_len = self
+            .memory
+            .len()
+            .checked_add(delta_bytes)
+            .ok_or_else(|| "Memory growth overflow".to_string())?;
+        if new_len > MAX_MEMORY_BYTES {
+            return Err("Memory growth exceeds 16 MiB".to_string());
+        }
+        self.memory.resize(new_len, 0);
+        Ok(old_pages)
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -83,11 +123,43 @@ impl WasmInstance {
         &self.table
     }
 
+    /// Number of imported functions (they occupy global indices first).
+    pub fn imported_function_count(&self) -> usize {
+        self.module
+            .imports
+            .iter()
+            .filter(|import| matches!(import.kind, crate::wasm::ImportKind::Function(_)))
+            .count()
+    }
+
+    /// Translate a global function index to a defined-body index.
+    fn defined_body_index(&self, function_index: u32) -> Option<usize> {
+        let imported = self.imported_function_count();
+        let idx = function_index as usize;
+        if idx < imported {
+            return None;
+        }
+        Some(idx - imported)
+    }
+
     pub fn function_type(&self, function_index: u32) -> Option<&FuncType> {
-        let type_index = self
-            .module
-            .function_type_indices
-            .get(function_index as usize)?;
+        let idx = function_index as usize;
+        let imported = self.imported_function_count();
+        if idx < imported {
+            // Imported function: find the idx-th function import's type.
+            let mut seen = 0usize;
+            for import in &self.module.imports {
+                if let crate::wasm::ImportKind::Function(type_index) = import.kind {
+                    if seen == idx {
+                        return self.module.types.get(type_index as usize);
+                    }
+                    seen += 1;
+                }
+            }
+            return None;
+        }
+        let defined = idx - imported;
+        let type_index = self.module.function_type_indices.get(defined)?;
         self.module.types.get(*type_index as usize)
     }
 
@@ -177,15 +249,17 @@ impl WasmInstance {
                 0x42 => value = Some(WasmValue::I64(cursor.read_leb_i64()?)),
                 0x43 => {
                     let bytes = cursor.read_bytes(4)?;
-                    value = Some(WasmValue::F32(f32::from_le_bytes(
-                        bytes.try_into().expect("4 bytes"),
-                    )));
+                    let arr: [u8; 4] = bytes.try_into().map_err(|_| {
+                        "Constant expression produced invalid f32 bytes".to_string()
+                    })?;
+                    value = Some(WasmValue::F32(f32::from_le_bytes(arr)));
                 }
                 0x44 => {
                     let bytes = cursor.read_bytes(8)?;
-                    value = Some(WasmValue::F64(f64::from_le_bytes(
-                        bytes.try_into().expect("8 bytes"),
-                    )));
+                    let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+                        "Constant expression produced invalid f64 bytes".to_string()
+                    })?;
+                    value = Some(WasmValue::F64(f64::from_le_bytes(arr)));
                 }
                 0x23 => {
                     let index = cursor.read_leb_u32()? as usize;
@@ -209,10 +283,13 @@ impl WasmInstance {
         function_index: u32,
         args: &[WasmValue],
     ) -> Result<Vec<WasmValue>, String> {
+        let defined = self.defined_body_index(function_index).ok_or_else(|| {
+            "Cannot invoke an imported function (host imports unsupported)".to_string()
+        })?;
         let type_index = self
             .module
             .function_type_indices
-            .get(function_index as usize)
+            .get(defined)
             .copied()
             .ok_or_else(|| "Function index out of range or is an import".to_string())?;
         let func_type = self
@@ -224,13 +301,14 @@ impl WasmInstance {
         if args.len() != func_type.parameters.len() {
             return Err("Argument count does not match function type".to_string());
         }
-        if self.module.bodies.get(function_index as usize).is_none() {
+        if self.module.bodies.get(defined).is_none() {
             return Err(
                 "Cannot invoke an imported function (host imports unsupported)".to_string(),
             );
         }
         let mut frames: Vec<Frame> = Vec::new();
-        let results = self.run_function(function_index, args, &mut frames)?;
+        let mut total_steps: u64 = 0;
+        let results = self.run_function(function_index, args, &mut frames, &mut total_steps)?;
         if results.len() != func_type.results.len() {
             return Err("Result count does not match function type".to_string());
         }
@@ -242,14 +320,18 @@ impl WasmInstance {
         function_index: u32,
         args: &[WasmValue],
         frames: &mut Vec<Frame>,
+        total_steps: &mut u64,
     ) -> Result<Vec<WasmValue>, String> {
         if frames.len() >= MAX_CALL_DEPTH_WASM {
             return Err("WASM call depth exceeded".to_string());
         }
+        let defined = self
+            .defined_body_index(function_index)
+            .ok_or_else(|| "Function has no body (import)".to_string())?;
         let body = self
             .module
             .bodies
-            .get(function_index as usize)
+            .get(defined)
             .ok_or_else(|| "Function has no body (import)".to_string())?
             .clone();
         let mut locals = args.to_vec();
@@ -273,20 +355,37 @@ impl WasmInstance {
             stack_height: 0,
             steps: 0,
         });
-        self.execute_frame(frames)
+        self.execute_frame(frames, total_steps)
     }
 
-    fn execute_frame(&mut self, frames: &mut Vec<Frame>) -> Result<Vec<WasmValue>, String> {
+    fn execute_frame(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        total_steps: &mut u64,
+    ) -> Result<Vec<WasmValue>, String> {
         loop {
-            let frame = frames.last_mut().expect("frame exists");
+            let frame = frames
+                .last_mut()
+                .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
             frame.steps += 1;
-            if frame.steps > MAX_INTERPRETER_STEPS {
+            *total_steps += 1;
+            if *total_steps > MAX_INTERPRETER_STEPS {
                 return Err("WASM step budget exceeded".to_string());
             }
             if frame.stack.len() > MAX_STACK_VALUES {
                 return Err("WASM operand stack budget exceeded".to_string());
             }
-            let code = self.module.bodies[frame.function_index as usize]
+            let defined = self
+                .defined_body_index(frame.function_index)
+                .ok_or_else(|| "Function has no body (import)".to_string())?;
+            // Clone the body for this step so `exec_instruction(&mut self)`
+            // does not alias `&self.module`. Per-step clone is O(n) but keeps
+            // the borrow checker sound; bodies are capped by MAX_MODULE_BYTES.
+            let code = self
+                .module
+                .bodies
+                .get(defined)
+                .ok_or_else(|| "Function has no body (import)".to_string())?
                 .code
                 .clone();
             if frame.pc >= code.len() {
@@ -296,13 +395,17 @@ impl WasmInstance {
             frame.pc += 1;
             if opcode == 0x0B {
                 // end: close the innermost control frame, or finish the function.
-                let frame = frames.last_mut().expect("frame exists");
+                let frame = frames
+                    .last_mut()
+                    .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
                 if frame.controls.is_empty() {
                     let results = frame.stack[frame.stack_height..].to_vec();
                     frames.pop();
                     return Ok(results);
                 }
-                let control = frame.controls.pop().expect("control exists");
+                let control = frame.controls.pop().ok_or_else(|| {
+                    "InvalidStateError: WASM control stack is detached".to_string()
+                })?;
                 let base = control.stack_height;
                 let above = frame.stack.split_off(base);
                 let result_count = control.result_count.min(above.len());
@@ -318,11 +421,23 @@ impl WasmInstance {
             match action {
                 Action::Continue => {}
                 Action::Branch(label) => {
-                    let frame = frames.last_mut().expect("frame exists");
-                    let control_index = frame.controls.len().saturating_sub(1 + label as usize);
-                    if control_index >= frame.controls.len() {
-                        return Err("br label out of range".to_string());
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
+                    let label = label as usize;
+                    if label == frame.controls.len() {
+                        // Branch to the function label: return the values
+                        // above the function-entry stack height.
+                        let results = frame.stack[frame.stack_height..].to_vec();
+                        frames.pop();
+                        return Ok(results);
                     }
+                    let control_index = frame
+                        .controls
+                        .len()
+                        .checked_sub(1 + label)
+                        .filter(|v| *v < frame.controls.len())
+                        .ok_or_else(|| "br label out of range".to_string())?;
                     let control = frame.controls[control_index].clone();
                     let is_loop = control.kind == ControlKind::Loop;
                     let target = if is_loop {
@@ -340,15 +455,11 @@ impl WasmInstance {
                     frame.stack.truncate(control.stack_height);
                     frame.stack.extend(keep);
                     // Remove controls above the target; the target itself is
-                    // left for the end handler to close (or returned for the
-                    // function-level branch).
+                    // left in place — for non-loop targets the pc lands on
+                    // its `end`, whose handler closes it while continuing
+                    // AFTER the block (the old early-return skipped every
+                    // instruction following an outermost block).
                     frame.controls.truncate(control_index + 1);
-                    if control_index == 0 && !is_loop {
-                        // Branch to the function's outermost block: return.
-                        let results = frame.stack[frame.stack_height..].to_vec();
-                        frames.pop();
-                        return Ok(results);
-                    }
                     frame.pc = target;
                 }
                 Action::Call(index) => {
@@ -357,21 +468,26 @@ impl WasmInstance {
                         .ok_or_else(|| "Function index out of range".to_string())?
                         .parameters
                         .len();
-                    let frame = frames.last_mut().expect("frame exists");
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
                     if frame.stack.len() < param_count {
                         return Err("call missing arguments on stack".to_string());
                     }
                     let split_at = frame.stack.len() - param_count;
                     let callee_args = frame.stack.split_off(split_at);
-                    let callee_results = self.run_function(index, &callee_args, frames)?;
+                    let callee_results =
+                        self.run_function(index, &callee_args, frames, total_steps)?;
                     frames
                         .last_mut()
-                        .expect("frame exists")
+                        .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?
                         .stack
                         .extend(callee_results);
                 }
                 Action::CallIndirect(type_index) => {
-                    let frame = frames.last_mut().expect("frame exists");
+                    let frame = frames
+                        .last_mut()
+                        .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
                     let table_value = frame
                         .stack
                         .pop()
@@ -387,10 +503,13 @@ impl WasmInstance {
                         .get(index as usize)
                         .and_then(|entry| *entry)
                         .ok_or_else(|| "call_indirect null or out of range".to_string())?;
+                    let callee_defined = self
+                        .defined_body_index(entry)
+                        .ok_or_else(|| "call_indirect target is an import".to_string())?;
                     let callee_type_index = self
                         .module
                         .function_type_indices
-                        .get(entry as usize)
+                        .get(callee_defined)
                         .copied()
                         .ok_or_else(|| "call_indirect target is an import".to_string())?;
                     if callee_type_index != type_index {
@@ -407,15 +526,18 @@ impl WasmInstance {
                     }
                     let split_at = frame.stack.len() - param_count;
                     let callee_args = frame.stack.split_off(split_at);
-                    let callee_results = self.run_function(entry, &callee_args, frames)?;
+                    let callee_results =
+                        self.run_function(entry, &callee_args, frames, total_steps)?;
                     frames
                         .last_mut()
-                        .expect("frame exists")
+                        .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?
                         .stack
                         .extend(callee_results);
                 }
                 Action::Return => {
-                    let frame = frames.last().expect("frame exists");
+                    let frame = frames
+                        .last()
+                        .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
                     let results = frame.stack[frame.stack_height..].to_vec();
                     frames.pop();
                     return Ok(results);
@@ -495,7 +617,9 @@ impl WasmInstance {
             Ok(result)
         };
 
-        let frame = frames.last_mut().expect("frame exists");
+        let frame = frames
+            .last_mut()
+            .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
         match opcode {
             // ---- Control ----
             0x02..=0x04 => {
@@ -609,11 +733,11 @@ impl WasmInstance {
                     labels.push(read_leb_u32(frame)?);
                 }
                 let default_label = read_leb_u32(frame)?;
-                let index = frame
+                let index_value = frame
                     .stack
                     .pop()
                     .ok_or_else(|| "br_table missing index".to_string())?;
-                let WasmValue::I32(index) = index else {
+                let WasmValue::I32(index) = index_value else {
                     return Err("br_table index must be i32".to_string());
                 };
                 let label = if index >= 0 && (index as usize) < labels.len() {
@@ -654,7 +778,9 @@ impl WasmInstance {
                 Ok(Action::Continue)
             }
             0x1B => {
-                let frame = frames.last_mut().expect("frame exists");
+                let frame = frames
+                    .last_mut()
+                    .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
                 let condition = frame
                     .stack
                     .pop()
@@ -742,7 +868,9 @@ impl WasmInstance {
                 let offset = read_leb_u32(frame)?;
                 let _ = align;
                 let address = self.effective_address(frame, offset as usize)?;
-                let frame = frames.last_mut().expect("frame exists");
+                let frame = frames
+                    .last_mut()
+                    .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
                 let value = self.memory_load(address, opcode)?;
                 frame.stack.push(value);
                 Ok(Action::Continue)
@@ -751,7 +879,9 @@ impl WasmInstance {
                 let align = read_leb_u32(frame)?;
                 let offset = read_leb_u32(frame)?;
                 let _ = align;
-                let frame = frames.last_mut().expect("frame exists");
+                let frame = frames
+                    .last_mut()
+                    .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
                 let value = frame
                     .stack
                     .pop()
@@ -821,9 +951,10 @@ impl WasmInstance {
                     .get(frame.pc..frame.pc + 4)
                     .ok_or_else(|| "f32.const missing bytes".to_string())?;
                 frame.pc += 4;
-                frame.stack.push(WasmValue::F32(f32::from_le_bytes(
-                    bytes.try_into().expect("4"),
-                )));
+                let arr: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| "f32.const has invalid byte length".to_string())?;
+                frame.stack.push(WasmValue::F32(f32::from_le_bytes(arr)));
                 Ok(Action::Continue)
             }
             0x44 => {
@@ -831,9 +962,10 @@ impl WasmInstance {
                     .get(frame.pc..frame.pc + 8)
                     .ok_or_else(|| "f64.const missing bytes".to_string())?;
                 frame.pc += 8;
-                frame.stack.push(WasmValue::F64(f64::from_le_bytes(
-                    bytes.try_into().expect("8"),
-                )));
+                let arr: [u8; 8] = bytes
+                    .try_into()
+                    .map_err(|_| "f64.const has invalid byte length".to_string())?;
+                frame.stack.push(WasmValue::F64(f64::from_le_bytes(arr)));
                 Ok(Action::Continue)
             }
             // ---- Numeric: comparison and arithmetic (pop/push on stack) ----
@@ -875,20 +1007,20 @@ impl WasmInstance {
             Ok(u64::from_le_bytes(bytes))
         };
         match opcode {
-            0x28 => Ok(WasmValue::I32(read(4)? as u32 as i32)),
-            0x29 => Ok(WasmValue::I64(read(8)? as i64)),
+            0x28 => Ok(WasmValue::I32(read(4)? as u32 as i32)), // i32.load
+            0x29 => Ok(WasmValue::I64(read(8)? as i64)),        // i64.load
             0x2A => Ok(WasmValue::F32(f32::from_bits(read(4)? as u32))),
             0x2B => Ok(WasmValue::F64(f64::from_bits(read(8)?))),
-            0x2C => Ok(WasmValue::I32(read(1)? as u8 as i32)),
-            0x2D => Ok(WasmValue::I32(read(2)? as u16 as i32)),
-            0x2E => Ok(WasmValue::I32(read(1)? as u8 as i8 as i32)),
-            0x2F => Ok(WasmValue::I32(read(2)? as u16 as i16 as i32)),
-            0x30 => Ok(WasmValue::I64(read(1)? as u8 as i64)),
-            0x31 => Ok(WasmValue::I64(read(2)? as u16 as i64)),
-            0x32 => Ok(WasmValue::I64(read(4)? as u32 as i64)),
-            0x33 => Ok(WasmValue::I64(read(1)? as u8 as i8 as i64)),
-            0x34 => Ok(WasmValue::I64(read(2)? as u16 as i16 as i64)),
-            0x35 => Ok(WasmValue::I64(read(4)? as u32 as i32 as i64)),
+            0x2C => Ok(WasmValue::I32(read(1)? as u8 as i8 as i32)), // i32.load8_s
+            0x2D => Ok(WasmValue::I32(read(1)? as u8 as i32)),       // i32.load8_u
+            0x2E => Ok(WasmValue::I32(read(2)? as u16 as i16 as i32)), // i32.load16_s
+            0x2F => Ok(WasmValue::I32(read(2)? as u16 as i32)),      // i32.load16_u
+            0x30 => Ok(WasmValue::I64(read(1)? as u8 as i8 as i64)), // i64.load8_s
+            0x31 => Ok(WasmValue::I64(read(1)? as u8 as i64)),       // i64.load8_u
+            0x32 => Ok(WasmValue::I64(read(2)? as u16 as i16 as i64)), // i64.load16_s
+            0x33 => Ok(WasmValue::I64(read(2)? as u16 as i64)),      // i64.load16_u
+            0x34 => Ok(WasmValue::I64(read(4)? as u32 as i32 as i64)), // i64.load32_s
+            0x35 => Ok(WasmValue::I64(read(4)? as u32 as i64)),      // i64.load32_u
             other => Err(format!("Unknown load opcode 0x{other:02X}")),
         }
     }
@@ -923,7 +1055,9 @@ impl WasmInstance {
     }
 
     fn exec_numeric(&mut self, opcode: u8, frames: &mut [Frame]) -> Result<(), String> {
-        let frame = frames.last_mut().expect("frame exists");
+        let frame = frames
+            .last_mut()
+            .ok_or_else(|| "InvalidStateError: WASM frame is detached".to_string())?;
         let mut pop = |frame: &mut Frame| -> Result<WasmValue, String> {
             frame
                 .stack
@@ -934,85 +1068,93 @@ impl WasmInstance {
             frame.stack.push(value);
         };
         match opcode {
-            // i32 comparisons
+            // i32 comparisons (spec §numeric: 0x45 eqz pops ONE value)
             0x45 => {
-                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a == b)));
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(i32::from(a == 0)));
             }
             0x46 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a != b)));
+                push(&mut *frame, WasmValue::I32(i32::from(a == b)));
             }
             0x47 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a < b)));
+                push(&mut *frame, WasmValue::I32(i32::from(a != b)));
             }
             0x48 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a > b)));
+                push(&mut *frame, WasmValue::I32(i32::from(a < b)));
             }
             0x49 => {
-                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a <= b)));
-            }
-            0x4A => {
-                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a >= b)));
-            }
-            0x4B => {
                 let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a < b)));
             }
-            0x4C => {
+            0x4A => {
+                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(i32::from(a > b)));
+            }
+            0x4B => {
                 let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a > b)));
+            }
+            0x4C => {
+                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(i32::from(a <= b)));
             }
             0x4D => {
                 let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a <= b)));
             }
             0x4E => {
+                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(i32::from(a >= b)));
+            }
+            0x4F => {
                 let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a >= b)));
             }
-            // i64 comparisons
+            // i64 comparisons (0x50 eqz pops ONE i64 and pushes an i32)
             0x50 => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a == b)));
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(i32::from(a == 0)));
             }
             0x51 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a != b)));
+                push(&mut *frame, WasmValue::I32(i32::from(a == b)));
             }
             0x52 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a < b)));
+                push(&mut *frame, WasmValue::I32(i32::from(a != b)));
             }
             0x53 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a > b)));
+                push(&mut *frame, WasmValue::I32(i32::from(a < b)));
             }
             0x54 => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a <= b)));
-            }
-            0x55 => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(i32::from(a >= b)));
-            }
-            0x56 => {
                 let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a < b)));
             }
-            0x57 => {
+            0x55 => {
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(i32::from(a > b)));
+            }
+            0x56 => {
                 let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a > b)));
+            }
+            0x57 => {
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(i32::from(a <= b)));
             }
             0x58 => {
                 let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a <= b)));
             }
             0x59 => {
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(i32::from(a >= b)));
+            }
+            0x5A => {
                 let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a >= b)));
             }
@@ -1066,410 +1208,457 @@ impl WasmInstance {
                 let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(i32::from(a >= b)));
             }
-            // i32 arithmetic
+            // i32 arithmetic (spec §numeric)
             0x67 => {
-                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(a.wrapping_add(b)));
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(a.leading_zeros() as i32));
             }
             0x68 => {
-                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(a.wrapping_sub(b)));
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(a.trailing_zeros() as i32));
             }
             0x69 => {
-                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I32(a.wrapping_mul(b)));
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(a.count_ones() as i32));
             }
             0x6A => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
-                if b == 0 {
-                    return Err("i32.div_s by zero".to_string());
-                }
-                push(&mut *frame, WasmValue::I32(a.wrapping_div(b)));
+                push(&mut *frame, WasmValue::I32(a.wrapping_add(b)));
             }
             0x6B => {
-                let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
-                if b == 0 {
-                    return Err("i32.div_u by zero".to_string());
-                }
-                push(&mut *frame, WasmValue::I32((a / b) as i32));
+                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(a.wrapping_sub(b)));
             }
             0x6C => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I32(a.wrapping_mul(b)));
+            }
+            0x6D => {
+                // div_s traps on zero AND on MIN / -1 (the result is not
+                // representable); wrapping_div alone silently returned MIN.
+                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 if b == 0 {
-                    return Err("i32.rem_s by zero".to_string());
+                    return Err("integer divide by zero".to_string());
+                }
+                if a == i32::MIN && b == -1 {
+                    return Err("integer overflow".to_string());
+                }
+                push(&mut *frame, WasmValue::I32(a.wrapping_div(b)));
+            }
+            0x6E => {
+                let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
+                if b == 0 {
+                    return Err("integer divide by zero".to_string());
+                }
+                push(&mut *frame, WasmValue::I32((a / b) as i32));
+            }
+            0x6F => {
+                // rem_s by zero traps; MIN % -1 is defined as 0.
+                let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
+                if b == 0 {
+                    return Err("integer divide by zero".to_string());
                 }
                 push(&mut *frame, WasmValue::I32(a.wrapping_rem(b)));
             }
-            0x6D => {
+            0x70 => {
                 let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
                 if b == 0 {
-                    return Err("i32.rem_u by zero".to_string());
+                    return Err("integer divide by zero".to_string());
                 }
                 push(&mut *frame, WasmValue::I32((a % b) as i32));
             }
-            0x6E => {
+            0x71 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(a & b));
             }
-            0x6F => {
+            0x72 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(a | b));
             }
-            0x70 => {
+            0x73 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(a ^ b));
             }
-            0x71 => {
+            0x74 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(a << (b as u32 & 31)));
             }
-            0x72 => {
+            0x75 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(a >> (b as u32 & 31)));
             }
-            0x73 => {
+            0x76 => {
                 let (b, a) = (pop_u32(&mut pop, frame)?, pop_u32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32((a >> (b & 31)) as i32));
             }
-            0x74 => {
+            0x77 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(a.rotate_left(b as u32 & 31)));
             }
-            0x75 => {
+            0x78 => {
                 let (b, a) = (pop_i32(&mut pop, frame)?, pop_i32(&mut pop, frame)?);
                 push(&mut *frame, WasmValue::I32(a.rotate_right(b as u32 & 31)));
             }
-            0x76 => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(a.wrapping_neg()));
-            }
-            0x77 => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(!a));
-            }
-            0x78 => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(i32::from(a == 0)));
-            }
-            // i64 arithmetic
+            // i64 arithmetic (spec §numeric)
             0x79 => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a.wrapping_add(b)));
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(a.leading_zeros() as i64));
             }
             0x7A => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a.wrapping_sub(b)));
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(a.trailing_zeros() as i64));
             }
             0x7B => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a.wrapping_mul(b)));
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(a.count_ones() as i64));
             }
             0x7C => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                if b == 0 {
-                    return Err("i64.div_s by zero".to_string());
-                }
-                push(&mut *frame, WasmValue::I64(a.wrapping_div(b)));
+                push(&mut *frame, WasmValue::I64(a.wrapping_add(b)));
             }
             0x7D => {
-                let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
-                if b == 0 {
-                    return Err("i64.div_u by zero".to_string());
-                }
-                push(&mut *frame, WasmValue::I64((a / b) as i64));
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I64(a.wrapping_sub(b)));
             }
             0x7E => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                if b == 0 {
-                    return Err("i64.rem_s by zero".to_string());
-                }
-                push(&mut *frame, WasmValue::I64(a.wrapping_rem(b)));
+                push(&mut *frame, WasmValue::I64(a.wrapping_mul(b)));
             }
             0x7F => {
-                let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
                 if b == 0 {
-                    return Err("i64.rem_u by zero".to_string());
+                    return Err("integer divide by zero".to_string());
                 }
-                push(&mut *frame, WasmValue::I64((a % b) as i64));
+                if a == i64::MIN && b == -1 {
+                    return Err("integer overflow".to_string());
+                }
+                push(&mut *frame, WasmValue::I64(a.wrapping_div(b)));
             }
             0x80 => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a & b));
+                let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
+                if b == 0 {
+                    return Err("integer divide by zero".to_string());
+                }
+                push(&mut *frame, WasmValue::I64((a / b) as i64));
             }
             0x81 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a | b));
+                if b == 0 {
+                    return Err("integer divide by zero".to_string());
+                }
+                push(&mut *frame, WasmValue::I64(a.wrapping_rem(b)));
             }
             0x82 => {
-                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a ^ b));
+                let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
+                if b == 0 {
+                    return Err("integer divide by zero".to_string());
+                }
+                push(&mut *frame, WasmValue::I64((a % b) as i64));
             }
             0x83 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a << (b as u32 & 63)));
+                push(&mut *frame, WasmValue::I64(a & b));
             }
             0x84 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a >> (b as u32 & 63)));
+                push(&mut *frame, WasmValue::I64(a | b));
             }
             0x85 => {
-                let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64((a >> (b & 63)) as i64));
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I64(a ^ b));
             }
             0x86 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a.rotate_left(b as u32 & 63)));
+                push(&mut *frame, WasmValue::I64(a << (b as u64 & 63)));
             }
             0x87 => {
                 let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::I64(a.rotate_right(b as u32 & 63)));
+                push(&mut *frame, WasmValue::I64(a >> (b as u64 & 63)));
             }
             0x88 => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64(a.wrapping_neg()));
+                let (b, a) = (pop_u64(&mut pop, frame)?, pop_u64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I64((a >> (b & 63)) as i64));
             }
             0x89 => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64(!a));
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I64(a.rotate_left(b as u32 & 63)));
             }
             0x8A => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(i32::from(a == 0)));
+                let (b, a) = (pop_i64(&mut pop, frame)?, pop_i64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::I64(a.rotate_right(b as u32 & 63)));
             }
-            // f32 arithmetic
+            // f32 arithmetic (spec §numeric)
             0x8B => {
-                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F32(a + b));
-            }
-            0x8C => {
-                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F32(a - b));
-            }
-            0x8D => {
-                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F32(a * b));
-            }
-            0x8E => {
-                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F32(a / b));
-            }
-            0x8F => {
-                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F32(a % b));
-            }
-            0x90 => {
-                let a = pop_f32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F32(-a));
-            }
-            0x91 => {
                 let a = pop_f32(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F32(a.abs()));
             }
-            0x92 => {
+            0x8C => {
+                let a = pop_f32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F32(-a));
+            }
+            0x8D => {
                 let a = pop_f32(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F32(a.ceil()));
             }
-            0x93 => {
+            0x8E => {
                 let a = pop_f32(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F32(a.floor()));
             }
-            0x94 => {
+            0x8F => {
                 let a = pop_f32(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F32(a.trunc()));
             }
-            0x95 => {
+            0x90 => {
+                // nearest: round ties to EVEN (Rust round() goes half-away).
                 let a = pop_f32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F32(a.round()));
+                push(&mut *frame, WasmValue::F32(a.round_ties_even()));
             }
-            0x96 => {
+            0x91 => {
                 let a = pop_f32(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F32(a.sqrt()));
             }
+            0x92 => {
+                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F32(a + b));
+            }
+            0x93 => {
+                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F32(a - b));
+            }
+            0x94 => {
+                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F32(a * b));
+            }
+            0x95 => {
+                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F32(a / b));
+            }
+            0x96 => {
+                let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F32(wasm_min_f32(a, b)));
+            }
             0x97 => {
                 let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F32(a.min(b)));
+                push(&mut *frame, WasmValue::F32(wasm_max_f32(a, b)));
             }
             0x98 => {
                 let (b, a) = (pop_f32(&mut pop, frame)?, pop_f32(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F32(a.max(b)));
+                push(&mut *frame, WasmValue::F32(a.copysign(b)));
             }
-            // f64 arithmetic
+            // f64 arithmetic (spec §numeric)
             0x99 => {
-                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F64(a + b));
-            }
-            0x9A => {
-                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F64(a - b));
-            }
-            0x9B => {
-                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F64(a * b));
-            }
-            0x9C => {
-                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F64(a / b));
-            }
-            0x9D => {
-                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F64(a % b));
-            }
-            0x9E => {
-                let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F64(-a));
-            }
-            0x9F => {
                 let a = pop_f64(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F64(a.abs()));
             }
-            0xA0 => {
+            0x9A => {
+                let a = pop_f64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F64(-a));
+            }
+            0x9B => {
                 let a = pop_f64(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F64(a.ceil()));
             }
-            0xA1 => {
+            0x9C => {
                 let a = pop_f64(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F64(a.floor()));
             }
-            0xA2 => {
+            0x9D => {
                 let a = pop_f64(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F64(a.trunc()));
             }
-            0xA3 => {
+            0x9E => {
                 let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F64(a.round()));
+                push(&mut *frame, WasmValue::F64(a.round_ties_even()));
             }
-            0xA4 => {
+            0x9F => {
                 let a = pop_f64(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F64(a.sqrt()));
             }
+            0xA0 => {
+                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F64(a + b));
+            }
+            0xA1 => {
+                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F64(a - b));
+            }
+            0xA2 => {
+                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F64(a * b));
+            }
+            0xA3 => {
+                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F64(a / b));
+            }
+            0xA4 => {
+                let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
+                push(&mut *frame, WasmValue::F64(wasm_min_f64(a, b)));
+            }
             0xA5 => {
                 let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F64(a.min(b)));
+                push(&mut *frame, WasmValue::F64(wasm_max_f64(a, b)));
             }
             0xA6 => {
                 let (b, a) = (pop_f64(&mut pop, frame)?, pop_f64(&mut pop, frame)?);
-                push(&mut *frame, WasmValue::F64(a.max(b)));
+                push(&mut *frame, WasmValue::F64(a.copysign(b)));
             }
-            // Conversions (bounded subset)
+            // Conversions (spec §numeric; trunc ops TRAP on NaN/out-of-range
+            // instead of silently saturating like a Rust `as` cast)
             0xA7 => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64(a as i64));
+                // i32.wrap_i64
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(a as i32));
             }
             0xA8 => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64((a as u32 as u64) as i64));
+                // i32.trunc_f32_s
+                let a = pop_f32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(trunc_f64_to_i32(a as f64)?));
             }
             0xA9 => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F32(a as f32));
+                // i32.trunc_f32_u
+                let a = pop_f32(&mut pop, frame)?;
+                push(
+                    &mut *frame,
+                    WasmValue::I32(trunc_f64_to_u32(a as f64)? as i32),
+                );
             }
             0xAA => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F32((a as u32) as f32));
+                // i32.trunc_f64_s
+                let a = pop_f64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(trunc_f64_to_i32(a)?));
             }
             0xAB => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F64(a as f64));
+                // i32.trunc_f64_u
+                let a = pop_f64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(trunc_f64_to_u32(a)? as i32));
             }
             0xAC => {
+                // i64.extend_i32_s
                 let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F64((a as u32) as f64));
+                push(&mut *frame, WasmValue::I64(a as i64));
             }
             0xAD => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(a as i32));
+                // i64.extend_i32_u
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(a as u32 as u64 as i64));
             }
             0xAE => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32((a as u64 as u32) as i32));
+                // i64.trunc_f32_s
+                let a = pop_f32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(trunc_f64_to_i64(a as f64)?));
             }
             0xAF => {
+                // i64.trunc_f32_u
+                let a = pop_f32(&mut pop, frame)?;
+                push(
+                    &mut *frame,
+                    WasmValue::I64(trunc_f64_to_u64(a as f64)? as i64),
+                );
+            }
+            0xB0 => {
+                // i64.trunc_f64_s
+                let a = pop_f64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(trunc_f64_to_i64(a)?));
+            }
+            0xB1 => {
+                // i64.trunc_f64_u
+                let a = pop_f64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(trunc_f64_to_u64(a)? as i64));
+            }
+            0xB2 => {
+                // f32.convert_i32_s
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F32(a as f32));
+            }
+            0xB3 => {
+                // f32.convert_i32_u
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F32(a as u32 as f32));
+            }
+            0xB4 => {
+                // f32.convert_i64_s
                 let a = pop_i64(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F32(a as f32));
             }
-            0xB0 => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F32((a as u64) as f32));
-            }
-            0xB1 => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F64(a as f64));
-            }
-            0xB2 => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F64((a as u64) as f64));
-            }
-            0xB3 => {
-                let a = pop_f32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(a as i32));
-            }
-            0xB4 => {
-                let a = pop_f32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32((a as u32) as i32));
-            }
             0xB5 => {
-                let a = pop_f32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64(a as i64));
+                // f32.convert_i64_u
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F32(a as u64 as f32));
             }
             0xB6 => {
-                let a = pop_f32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64((a as u64) as i64));
+                // f32.demote_f64
+                let a = pop_f64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F32(a as f32));
             }
             0xB7 => {
-                let a = pop_f32(&mut pop, frame)?;
+                // f64.convert_i32_s
+                let a = pop_i32(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::F64(a as f64));
             }
             0xB8 => {
-                let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(a as i32));
+                // f64.convert_i32_u
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F64(a as u32 as f64));
             }
             0xB9 => {
-                let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32((a as u32) as i32));
+                // f64.convert_i64_s
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F64(a as f64));
             }
             0xBA => {
-                let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64(a as i64));
+                // f64.convert_i64_u
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F64(a as u64 as f64));
             }
             0xBB => {
-                let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I64((a as u64) as i64));
+                // f64.promote_f32
+                let a = pop_f32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F64(a as f64));
             }
             0xBC => {
-                let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F32(a as f32));
-            }
-            0xBD => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(i32::from(a == 0)));
-            }
-            0xBE => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(i32::from(a == 0)));
-            }
-            0xBF => {
-                let a = pop_f32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(i32::from(a == 0.0)));
-            }
-            0xC0 => {
-                let a = pop_f64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::I32(i32::from(a == 0.0)));
-            }
-            0xC1 => {
-                let a = pop_i32(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F32(f32::from_bits(a as u32)));
-            }
-            0xC2 => {
-                let a = pop_i64(&mut pop, frame)?;
-                push(&mut *frame, WasmValue::F64(f64::from_bits(a as u64)));
-            }
-            0xC3 => {
+                // i32.reinterpret_f32
                 let a = pop_f32(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::I32(a.to_bits() as i32));
             }
-            0xC4 => {
+            0xBD => {
+                // i64.reinterpret_f64
                 let a = pop_f64(&mut pop, frame)?;
                 push(&mut *frame, WasmValue::I64(a.to_bits() as i64));
+            }
+            0xBE => {
+                // f32.reinterpret_i32
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F32(f32::from_bits(a as u32)));
+            }
+            0xBF => {
+                // f64.reinterpret_i64
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::F64(f64::from_bits(a as u64)));
+            }
+            0xC0 => {
+                // i32.extend8_s
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(a as i8 as i32));
+            }
+            0xC1 => {
+                // i32.extend16_s
+                let a = pop_i32(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I32(a as i16 as i32));
+            }
+            0xC2 => {
+                // i64.extend8_s
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(a as i8 as i64));
+            }
+            0xC3 => {
+                // i64.extend16_s
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(a as i16 as i64));
+            }
+            0xC4 => {
+                // i64.extend32_s
+                let a = pop_i64(&mut pop, frame)?;
+                push(&mut *frame, WasmValue::I64(a as i32 as i64));
             }
             other => return Err(format!("Unsupported numeric opcode 0x{other:02X}")),
         }
@@ -1531,39 +1720,237 @@ fn pop_f64(
     }
 }
 
+// ===== Spec-exact float semantics =====
+//
+// Rust's f32::min/max return the non-NaN operand and ignore signed zeros,
+// while wasm requires NaN propagation and min(±0)=−0 / max(±0)=+0.
+
+fn wasm_min_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { a } else { b };
+    }
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+fn wasm_max_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_positive() { a } else { b };
+    }
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+fn wasm_min_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() { a } else { b };
+    }
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+fn wasm_max_f64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_positive() { a } else { b };
+    }
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Trapping float→i32 (signed). NaN is an "invalid conversion" trap; values
+/// outside [−2³¹, 2³¹) after truncation are an "integer overflow" trap.
+/// A Rust `as` cast saturates instead, which contradicts the spec.
+fn trunc_f64_to_i32(value: f64) -> Result<i32, String> {
+    if value.is_nan() {
+        return Err("invalid conversion to integer".to_string());
+    }
+    let truncated = value.trunc();
+    if !(-2_147_483_648.0..2_147_483_648.0).contains(&truncated) {
+        return Err("integer overflow".to_string());
+    }
+    Ok(truncated as i32)
+}
+
+/// Trapping float→u32. The truncated value may be −0 but not below −1.
+fn trunc_f64_to_u32(value: f64) -> Result<u32, String> {
+    if value.is_nan() {
+        return Err("invalid conversion to integer".to_string());
+    }
+    let truncated = value.trunc();
+    if !(truncated > -1.0 && truncated < 4_294_967_296.0) {
+        return Err("integer overflow".to_string());
+    }
+    Ok(truncated as u32)
+}
+
+/// Trapping float→i64 over [−2⁶³, 2⁶³).
+fn trunc_f64_to_i64(value: f64) -> Result<i64, String> {
+    if value.is_nan() {
+        return Err("invalid conversion to integer".to_string());
+    }
+    let truncated = value.trunc();
+    if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&truncated) {
+        return Err("integer overflow".to_string());
+    }
+    Ok(truncated as i64)
+}
+
+/// Trapping float→u64 over [0, 2⁶⁴).
+fn trunc_f64_to_u64(value: f64) -> Result<u64, String> {
+    if value.is_nan() {
+        return Err("invalid conversion to integer".to_string());
+    }
+    let truncated = value.trunc();
+    if !(truncated > -1.0 && truncated < 18_446_744_073_709_551_616.0) {
+        return Err("integer overflow".to_string());
+    }
+    Ok(truncated as u64)
+}
+
+/// Advance `pc` past the immediates of the instruction whose opcode byte
+/// starts at `pc`, mirroring the immediate layout of `validate_code`.
+/// Scanners that walk raw bytes otherwise misread constant bytes such as
+/// `i32.const 11` (0x41 0x0B) as an `end` opcode.
+fn skip_immediates(code: &[u8], pc: usize) -> Result<usize, String> {
+    let opcode = *code
+        .get(pc)
+        .ok_or_else(|| "Truncated instruction".to_string())?;
+    let mut cursor = pc + 1;
+    // Count the bytes of one LEB128 value starting at `cursor`.
+    let leb = |cursor: &mut usize, max: usize| -> Result<(), String> {
+        for _ in 0..max {
+            let byte = *code
+                .get(*cursor)
+                .ok_or_else(|| "Truncated immediate".to_string())?;
+            *cursor += 1;
+            if byte & 0x80 == 0 {
+                return Ok(());
+            }
+        }
+        Err("Immediate too long".to_string())
+    };
+    match opcode {
+        // block/loop/if: block type is a single byte (0x40 or a value type)
+        // unless it is a positive type index encoded as a signed LEB.
+        0x02..=0x04 => {
+            let block_type = *code
+                .get(cursor)
+                .ok_or_else(|| "Missing block type".to_string())?;
+            cursor += 1;
+            if !matches!(block_type, 0x40 | 0x7F | 0x7E | 0x7D | 0x7C) {
+                leb(&mut cursor, 5)?;
+            }
+        }
+        0x0C | 0x0D | 0x10 | 0x12 | 0x13 => leb(&mut cursor, 5)?,
+        0x11 => {
+            leb(&mut cursor, 5)?;
+            leb(&mut cursor, 5)?;
+        }
+        0x0E => {
+            let mut count = 0u32;
+            for shift in (0..20).step_by(7) {
+                let byte = *code
+                    .get(cursor)
+                    .ok_or_else(|| "Truncated br_table".to_string())?;
+                cursor += 1;
+                count |= u32::from(byte & 0x7F) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+            for _ in 0..=count.min(MAX_LABELS as u32) {
+                leb(&mut cursor, 5)?;
+            }
+        }
+        0x1C => {
+            let mut count = 0u32;
+            for shift in (0..20).step_by(7) {
+                let byte = *code
+                    .get(cursor)
+                    .ok_or_else(|| "Truncated select_t".to_string())?;
+                cursor += 1;
+                count |= u32::from(byte & 0x7F) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+            cursor = cursor.saturating_add(count.min(4) as usize);
+        }
+        0x20..=0x24 => leb(&mut cursor, 5)?,
+        0x28..=0x3E => {
+            leb(&mut cursor, 5)?;
+            leb(&mut cursor, 5)?;
+        }
+        0x3F | 0x40 => cursor += 1,
+        0x41 | 0x42 => leb(&mut cursor, 10)?,
+        0x43 => cursor += 4,
+        0x44 => cursor += 8,
+        _ => {}
+    }
+    Ok(cursor)
+}
+
 /// Scan forward from `pc` for the `end` (0x0B) matching the block opened at
-/// the current depth, honouring nested blocks. Returns the pc just past end.
-fn find_end(code: &[u8], mut pc: usize) -> Result<usize, String> {
+/// the current depth, honouring nested blocks and skipping immediates so
+/// constant bytes cannot be mistaken for control opcodes. Returns the pc of
+/// the end opcode itself.
+fn find_end(code: &[u8], pc: usize) -> Result<usize, String> {
+    let mut cursor = pc;
     let mut depth = 0usize;
-    while pc < code.len() {
-        match code[pc] {
+    while cursor < code.len() {
+        match code[cursor] {
             0x02..=0x04 => depth += 1,
             0x0B => {
                 if depth == 0 {
-                    return Ok(pc);
+                    return Ok(cursor);
                 }
                 depth -= 1;
             }
             _ => {}
         }
-        pc += 1;
+        cursor = skip_immediates(code, cursor)?;
     }
     Err("Unbalanced block: missing end".to_string())
 }
 
-/// Scan for the `else` or `end` of the block starting at `pc` (depth 0 at
-/// the block itself), returning pc just past it.
-fn find_else_or_end(code: &[u8], mut pc: usize) -> Result<usize, String> {
+/// Scan for the `else` or `end` closing the `if` whose body starts at `pc`,
+/// skipping immediates. Returns the pc just past the found delimiter.
+fn find_else_or_end(code: &[u8], pc: usize) -> Result<usize, String> {
+    let mut cursor = pc;
     let mut depth = 0usize;
-    while pc < code.len() {
-        match code[pc] {
+    while cursor < code.len() {
+        match code[cursor] {
             0x02..=0x04 => depth += 1,
-            0x05 if depth == 0 => return Ok(pc + 1),
-            0x0B if depth == 0 => return Ok(pc + 1),
+            0x05 if depth == 0 => return Ok(cursor + 1),
+            0x0B if depth == 0 => return Ok(cursor + 1),
             0x0B => depth -= 1,
             _ => {}
         }
-        pc += 1;
+        cursor = skip_immediates(code, cursor)?;
     }
     Err("Unbalanced block: missing end".to_string())
 }
@@ -1612,7 +1999,7 @@ mod tests {
         bytes.extend(b"add");
         bytes.extend([0x00, 0x00]);
         // code: locals 0; local.get 0; local.get 1; i32.add; end
-        let body = body_no_locals(&[0x20, 0x00, 0x20, 0x01, 0x67]); // i32.add
+        let body = body_no_locals(&[0x20, 0x00, 0x20, 0x01, 0x6A]); // i32.add
         bytes.extend(code_section(&[body]));
         parse_module(&bytes).expect("module must parse")
     }
@@ -1636,8 +2023,8 @@ mod tests {
         //   local.get 0; local.get 0; i32.const 1; i32.sub; call 0; i32.mul
         // end
         let body = body_no_locals(&[
-            0x20, 0x00, 0x41, 0x02, 0x47, 0x04, 0x7F, 0x41, 0x01, 0x05, 0x20, 0x00, 0x20, 0x00,
-            0x41, 0x01, 0x68, 0x10, 0x00, 0x69, 0x0B, // sub=0x68, mul=0x69
+            0x20, 0x00, 0x41, 0x02, 0x48, 0x04, 0x7F, 0x41, 0x01, 0x05, 0x20, 0x00, 0x20, 0x00,
+            0x41, 0x01, 0x6B, 0x10, 0x00, 0x6C, 0x0B, // sub=0x6B, mul=0x6C
         ]);
         bytes.extend(code_section(&[body]));
         parse_module(&bytes).expect("module must parse")

@@ -105,7 +105,18 @@ pub fn parse_media_segment(
         .iter()
         .find(|item| item.kind == *b"mdat")
         .ok_or_else(|| "ISO-BMFF media segment has no mdat box".to_string())?;
-    let runs = parse_movie_fragment(moof.payload)?;
+    for track in tracks {
+        if track.timescale == 0 {
+            // The in-crate SourceBuffer path rejects this during init
+            // parsing; the public contract must not divide by zero either.
+            return Err("ISO-BMFF track timescale must be non-zero".to_string());
+        }
+    }
+    // The cumulative budget is enforced INSIDE the fragment walk too: many
+    // trun boxes each declaring 100k samples allocated ~10 GB before this
+    // post-hoc check ever ran.
+    let mut cumulative_samples = 0usize;
+    let runs = parse_movie_fragment(moof.payload, &mut cumulative_samples)?;
     let sample_count = runs.iter().map(|run| run.samples.len()).sum::<usize>();
     if sample_count == 0 || sample_count > MAX_SAMPLES_PER_SEGMENT {
         return Err("ISO-BMFF sample count budget exceeded".to_string());
@@ -223,7 +234,10 @@ fn parse_sample_entry_codec(minf: &[u8]) -> Result<MediaCodec, String> {
     })
 }
 
-fn parse_movie_fragment(bytes: &[u8]) -> Result<Vec<TrackRun>, String> {
+fn parse_movie_fragment(
+    bytes: &[u8],
+    cumulative_samples: &mut usize,
+) -> Result<Vec<TrackRun>, String> {
     let mut runs = Vec::new();
     for item in parse_boxes(bytes)? {
         if item.kind != *b"traf" {
@@ -242,6 +256,14 @@ fn parse_movie_fragment(bytes: &[u8]) -> Result<Vec<TrackRun>, String> {
         let base_decode_time = parse_tfdt(tfdt.payload)?;
         let mut next_time = base_decode_time;
         for trun in children.iter().filter(|item| item.kind == *b"trun") {
+            // Enforce the cumulative budget BEFORE allocating: thousands of
+            // trun boxes each claiming 100k samples amplified ~64 KB of
+            // input into ~10 GB of pre-budget Vec::with_capacity memory.
+            let declared = read_be_u32(trun.payload, 4)? as usize;
+            *cumulative_samples = cumulative_samples.saturating_add(declared);
+            if *cumulative_samples > MAX_SAMPLES_PER_SEGMENT {
+                return Err("ISO-BMFF sample count budget exceeded".to_string());
+            }
             let samples = parse_trun(trun.payload, defaults)?;
             let run_duration = samples
                 .iter()

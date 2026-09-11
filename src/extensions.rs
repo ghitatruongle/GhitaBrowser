@@ -236,8 +236,10 @@ impl ParsedMatchPattern {
         if self.path_is_exact {
             path == self.path_prefix
         } else {
-            // Prefix must end at a segment boundary so "/a*" does not match
-            // "/abc"; the pattern's own trailing slash covers the common case.
+            // Trailing `*` is a true wildcard (Chrome match-pattern
+            // semantics): "/login*" intentionally matches "/login2" and
+            // "/login/reset"; the pattern's own trailing slash covers the
+            // directory case ("/app/*" keeps "/app" itself out).
             path.starts_with(&self.path_prefix)
         }
     }
@@ -646,13 +648,23 @@ impl ExtensionManager {
         let profile_dir = absolute_path(profile_dir)?;
         let extensions_dir = profile_dir.join("extensions");
         fs::create_dir_all(&extensions_dir).map_err(storage_error)?;
-        let trust_path = extensions_dir.join("trusted_publishers.json");
-        if trust_path.exists() {
-            let persisted: std::collections::BTreeMap<String, [u8; 32]> =
-                read_bounded_json(&trust_path, 64 * 1024)?;
-            let persisted = PublisherTrustStore::import_ed25519(persisted)?;
-            for (key_id, key) in persisted.export_ed25519() {
-                trust.insert_ed25519(key_id, key)?;
+        // The profile is untrusted input: `trusted_publishers.json` used to
+        // be imported unconditionally, so any profile write implied code
+        // execution via attacker-"signed" extensions auto-loading at every
+        // startup. Trust now starts from the binary-pinned release keys
+        // (the same root as the updater); the profile file is never
+        // consulted for trust decisions. Runtime additions remain possible
+        // through `trust_publisher` for the current session only.
+        for (key_id, key_hex) in crate::updater::PINNED_RELEASE_KEYS {
+            match crate::package_crypto::decode_hex_exact::<32>(key_hex) {
+                Ok(key) => {
+                    if let Err(error) = trust.insert_ed25519(*key_id, key) {
+                        log::error!("pinned extension publisher key {key_id} rejected: {error:?}");
+                    }
+                }
+                Err(error) => {
+                    log::error!("pinned extension publisher key {key_id} has bad hex: {error:?}")
+                }
             }
         }
         let mut manager = Self {
@@ -979,6 +991,14 @@ impl ExtensionManager {
         Ok(())
     }
 
+    /// Re-scan the profile extensions directory (e.g. after runtime trust
+    /// changes via `trust_publisher`). Already-loaded ids are skipped by the
+    /// insert below (HashMap overwrite is harmless but wasteful), so a
+    /// caller may invoke this repeatedly.
+    pub fn reload_installed(&mut self) -> Result<(), ExtensionError> {
+        self.load_installed()
+    }
+
     fn load_installed(&mut self) -> Result<(), ExtensionError> {
         let Some(profile_dir) = &self.profile_dir else {
             return Ok(());
@@ -991,15 +1011,34 @@ impl ExtensionManager {
                 continue;
             }
             let directory_name = entry.file_name().to_string_lossy().into_owned();
-            validate_component_id(&directory_name, "extension directory")?;
+            // One stray or corrupt directory must not silently uninstall
+            // every other extension for the session: skip + log it.
+            let loaded = self.load_installed_directory(&entry.path(), &directory_name);
+            if let Err(error) = loaded {
+                log::warn!("Skipping extension directory {directory_name:?}: {error:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Load one extension directory (record/storage/files) after verifying
+    /// its signature and digest. Shared by `load_installed` and re-loading
+    /// after runtime trust changes.
+    fn load_installed_directory(
+        &mut self,
+        directory: &Path,
+        directory_name: &str,
+    ) -> Result<(), ExtensionError> {
+        {
+            validate_component_id(directory_name, "extension directory")?;
             let record: ExtensionRecord =
-                read_bounded_json(&entry.path().join("record.json"), 256 * 1024)?;
+                read_bounded_json(&directory.join("record.json"), 256 * 1024)?;
             let storage: ExtensionStorage = read_bounded_json(
-                &entry.path().join("storage.json"),
+                &directory.join("storage.json"),
                 MAX_EXTENSION_STORAGE_BYTES + 512 * 1024,
             )?;
             let files: HashMap<String, String> = read_bounded_json(
-                &entry.path().join("files.json"),
+                &directory.join("files.json"),
                 MAX_EXTENSION_PACKAGE_BYTES + 512 * 1024,
             )?;
             if record.manifest.id != directory_name {
@@ -1029,9 +1068,9 @@ impl ExtensionManager {
             record
                 .granted_network_origins
                 .retain(|origin| declared_origins.contains(origin));
-            self.extensions.insert(directory_name.clone(), record);
-            self.storages.insert(directory_name.clone(), storage);
-            self.files.insert(directory_name, files);
+            self.extensions.insert(directory_name.to_string(), record);
+            self.storages.insert(directory_name.to_string(), storage);
+            self.files.insert(directory_name.to_string(), files);
         }
         Ok(())
     }

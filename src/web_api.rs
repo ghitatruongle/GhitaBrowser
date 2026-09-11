@@ -170,7 +170,14 @@ fn normalize_header_value(value: &str) -> Result<String, FetchError> {
             "header values cannot contain line breaks".to_string(),
         ));
     }
-    Ok(value.trim().chars().take(MAX_HEADER_BYTES).collect())
+    let trimmed = value.trim();
+    // Fail closed instead of silently truncating: truncation would let a
+    // script smuggle an over-long value past the byte budget as a shorter,
+    // differently-authorized value.
+    if trimmed.len() > MAX_HEADER_BYTES {
+        return Err(FetchError::QuotaExceeded("header value budget exceeded"));
+    }
+    Ok(trimmed.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -982,8 +989,16 @@ impl FetchRuntime {
 }
 
 fn validate_request(request: &WebRequest) -> Result<(), FetchError> {
-    let origin = request.url.origin()?;
-    let _ = origin;
+    // Reject non-HTTP(S) schemes early: Origin::from_url would too, but an
+    // explicit scheme gate keeps file/data/blob URLs from reaching CORS or
+    // cookie logic even if origin handling changes.
+    if !matches!(request.url.protocol(), "http" | "https") {
+        return Err(FetchError::InvalidUrl(format!(
+            "unsupported fetch scheme: {}",
+            request.url.protocol()
+        )));
+    }
+    let _ = request.url.origin()?;
     validate_method(&request.method)?;
     if request.body.len() > MAX_BODY_BYTES {
         return Err(FetchError::QuotaExceeded("request body exceeds 50 MB"));
@@ -1213,9 +1228,20 @@ impl XmlHttpRequest {
                 "XHR headers require OPENED state before send".to_string(),
             ));
         }
+        // Forbidden headers (cookie, origin, content-length, ...) are
+        // browser-controlled. Reject them here instead of silently dropping
+        // them at send time, so scripts cannot believe they overrode them.
+        let lowered = name.trim().to_ascii_lowercase();
+        if is_forbidden_request_header(&lowered) {
+            return Err(FetchError::InvalidHeader(format!(
+                "forbidden header cannot be set: {name}"
+            )));
+        }
         self.request
             .as_mut()
-            .expect("OPENED state has request")
+            .ok_or_else(|| {
+                FetchError::InvalidRequest("XHR has no request in OPENED state".to_string())
+            })?
             .headers
             .append(name, value)
     }
@@ -1234,7 +1260,9 @@ impl XmlHttpRequest {
                 "XHR send requires a fresh OPENED state".to_string(),
             ));
         }
-        let request = self.request.as_mut().expect("OPENED state has request");
+        let request = self.request.as_mut().ok_or_else(|| {
+            FetchError::InvalidRequest("XHR has no request in OPENED state".to_string())
+        })?;
         request.credentials = if self.with_credentials {
             CredentialsMode::Include
         } else {

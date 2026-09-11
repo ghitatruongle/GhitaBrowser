@@ -72,6 +72,9 @@ pub struct WindowsIntegration {
     pub crash_consent: CrashReportConsent,
     notifications: VecDeque<BrowserNotification>,
     next_notification_id: u64,
+    /// Last successful `persist_state` write; used to debounce rapid
+    /// successive sync writes from UI-thread callers.
+    last_persist: Option<std::time::Instant>,
 }
 
 impl WindowsIntegration {
@@ -83,6 +86,7 @@ impl WindowsIntegration {
             crash_consent: CrashReportConsent::Prompt,
             notifications: VecDeque::new(),
             next_notification_id: 1,
+            last_persist: None,
         };
         manager.init_default_associations();
         manager
@@ -97,6 +101,7 @@ impl WindowsIntegration {
             crash_consent: CrashReportConsent::Prompt,
             notifications: VecDeque::new(),
             next_notification_id: 1,
+            last_persist: None,
         };
         manager.init_default_associations();
         manager.load_state()?;
@@ -356,7 +361,13 @@ impl WindowsIntegration {
         self.persist_state()
     }
 
-    fn persist_state(&self) -> Result<(), String> {
+    fn persist_state(&mut self) -> Result<(), String> {
+        // NOTE: sync file writes run on the caller (today: the UI thread via
+        // `set_crash_consent` / `push_notification` / `clear_notifications`).
+        // A time-based debounce must NOT silently drop writes: back-to-back
+        // set_crash_consent + push_notification would lose notifications.
+        // Persist synchronously (files are tiny); move to spawn_blocking if
+        // profiling shows UI jank.
         let Some(profile_dir) = &self.profile_dir else {
             return Ok(());
         };
@@ -364,6 +375,7 @@ impl WindowsIntegration {
         fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
         atomic_json_write(&directory.join("crash_consent.json"), &self.crash_consent)?;
         atomic_json_write(&directory.join("notifications.json"), &self.notifications)?;
+        self.last_persist = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -626,16 +638,32 @@ pub fn validate_signer_identity(
             actual.subject, expected_subject
         ));
     }
-    if !actual
-        .thumbprint_sha256
-        .eq_ignore_ascii_case(expected_thumbprint)
-    {
+    // Constant-time thumbprint comparison: the thumbprint is the
+    // cryptographic binding, so its equality must not short-circuit on the
+    // first differing byte (timing side-channel).
+    if !constant_time_hex_eq(&actual.thumbprint_sha256, expected_thumbprint) {
         return Err(format!(
             "signed certificate thumbprint '{}' does not match the approved '{}'",
             actual.thumbprint_sha256, expected_thumbprint
         ));
     }
     Ok(())
+}
+
+/// Case-insensitive constant-time hex-digest equality (ASCII only).
+/// Length mismatch fails fast (lengths are public); content comparison folds
+/// XOR differences without early exit.
+fn constant_time_hex_eq(actual: &str, expected: &str) -> bool {
+    let a = actual.trim().as_bytes();
+    let b = expected.trim().as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
+    }
+    diff == 0
 }
 
 fn is_sha256_hex(value: &str) -> bool {
@@ -736,7 +764,12 @@ fn signed_executable_signer(path: &Path) -> Result<SignerIdentity, String> {
         )
         .map_err(|error| format!("cannot read signer info: {error}"))?;
     }
-    let signer = unsafe { &*(signer_bytes.as_ptr().cast::<CMSG_SIGNER_INFO>()) };
+    // `CryptMsgGetParam` returns a packed byte blob with no alignment
+    // guarantee, so the `CMSG_SIGNER_INFO` header must be copied out with an
+    // unaligned read — never `&*(ptr as *const T)`. The copy keeps borrowing
+    // pointers into `signer_bytes`, which must outlive `signer`.
+    let signer: CMSG_SIGNER_INFO =
+        unsafe { std::ptr::read_unaligned(signer_bytes.as_ptr().cast::<CMSG_SIGNER_INFO>()) };
     let find = CertFindIssuerSerial {
         issuer: signer.Issuer,
         serial_number: signer.SerialNumber,

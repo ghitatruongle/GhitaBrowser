@@ -15,10 +15,20 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// staging file (a fixed ".tmp" suffix let two managers rename foreign bytes).
 fn temporary_path(path: &Path) -> std::path::PathBuf {
     let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // The counter alone is process-local; two browser processes sharing a
+    // profile would otherwise stage into the same ".0.tmp" and interleave
+    // bytes, so mix the pid in.
     let name = path
         .file_name()
-        .map(|name| format!("{}.{}.tmp", name.to_string_lossy(), unique))
-        .unwrap_or_else(|| format!("ghita-{}.tmp", unique));
+        .map(|name| {
+            format!(
+                "{}.{}.{}.tmp",
+                name.to_string_lossy(),
+                std::process::id(),
+                unique
+            )
+        })
+        .unwrap_or_else(|| format!("ghita-{}-{}.tmp", std::process::id(), unique));
     path.with_file_name(name)
 }
 
@@ -131,12 +141,17 @@ mod tests {
 
         // Occupy upcoming temp names with directories so the staged write
         // cannot be created. Candidate names are derived directly from the
-        // counter (calling temporary_path would itself advance it). A wide
-        // window absorbs concurrent tests incrementing the counter.
+        // counter plus this process's pid (calling temporary_path would
+        // itself advance it). A wide window absorbs concurrent tests
+        // incrementing the counter.
         let start = TEMP_COUNTER.load(Ordering::Relaxed);
         let mut blocked = Vec::new();
         for offset in 0u64..24 {
-            let candidate = dir.join(format!("keep.json.{}.tmp", start + offset));
+            let candidate = dir.join(format!(
+                "keep.json.{}.{}.tmp",
+                std::process::id(),
+                start + offset
+            ));
             if std::fs::create_dir_all(&candidate).is_ok() {
                 blocked.push(candidate);
             }

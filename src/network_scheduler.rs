@@ -91,11 +91,16 @@ impl CancellationToken {
 
     pub(crate) async fn cancelled(&self) {
         loop {
+            // Register the waiter BEFORE the check (tokio's documented
+            // pattern): notify_waiters() only wakes already-pinned waiters,
+            // so a cancel landing between check and await was lost and the
+            // abort of in-flight requests waited for the transport timeout.
             let notified = self.notification.notified();
+            tokio::pin!(notified);
             if self.is_cancelled() {
                 return;
             }
-            notified.await;
+            notified.as_mut().await;
         }
     }
 }
@@ -132,7 +137,7 @@ impl NetworkTransport for UreqTransport {
         &'a self,
         request: &'a ScheduledRequest,
         cancellation: &'a CancellationToken,
-        _max_response_bytes: usize,
+        max_response_bytes: usize,
     ) -> Pin<Box<dyn Future<Output = Result<FetchResult, String>> + Send + 'a>> {
         let agent = self.agent.clone();
         let request = request.clone();
@@ -141,7 +146,7 @@ impl NetworkTransport for UreqTransport {
             if cancellation.is_cancelled() {
                 return Err("request cancelled before transport start".to_string());
             }
-            tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 crate::network::fetch_with_agent_and_retry(
                     &agent,
                     &request.url,
@@ -150,7 +155,15 @@ impl NetworkTransport for UreqTransport {
                 )
             })
             .await
-            .map_err(|error| format!("blocking compatibility transport failed: {error}"))?
+            .map_err(|error| format!("blocking compatibility transport failed: {error}"))??;
+            // Enforce the scheduler budget even on the compatibility path.
+            let body_len = result.body.len();
+            if body_len > max_response_bytes {
+                return Err(format!(
+                    "Response exceeds the {max_response_bytes}-byte budget ({body_len} bytes)"
+                ));
+            }
+            Ok(result)
         })
     }
 }
@@ -189,6 +202,7 @@ impl ReqwestTransport {
         let original = url::Url::parse(&request.url).map_err(|error| error.to_string())?;
         let mut current = original.clone();
         let mut set_cookie_headers = Vec::new();
+        let mut set_cookie_hosts = Vec::new();
 
         for hop in 0..=MAX_REDIRECTS {
             let mut builder = self.client.get(current.clone());
@@ -204,6 +218,7 @@ impl ReqwestTransport {
                 if let Ok(value) = value.to_str() {
                     if !value.trim().is_empty() {
                         set_cookie_headers.push(value.trim().to_string());
+                        set_cookie_hosts.push(current.host_str().unwrap_or("").to_string());
                     }
                 }
             }
@@ -278,6 +293,7 @@ impl ReqwestTransport {
                 headers,
                 bytes,
                 set_cookie_headers,
+                set_cookie_hosts,
                 started.elapsed().as_millis() as u64,
                 request.response_mode == ResponseMode::Binary,
             );
@@ -538,6 +554,8 @@ pub async fn fetch_document_bundle(
     cancellation: CancellationToken,
 ) -> Result<FetchResult, String> {
     const MAX_EXTERNAL_RESOURCES: usize = 64;
+    const MAX_TOTAL_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_SINGLE_RESOURCE_BYTES: usize = 2 * 1024 * 1024;
     let subresource_cookie_header = cookie_header.clone();
     let mut document = fetch_shared(
         url,
@@ -560,20 +578,23 @@ pub async fn fetch_document_bundle(
 
     let mut dom = crate::parser::parse_html(&document.body);
     let document_url = url::Url::parse(&document.url).map_err(|error| error.to_string())?;
-    let base_url = dom
+    let resolved_base = dom
         .find_tag("base")
         .and_then(|element| element.get_attr("href"))
         .and_then(|href| document_url.join(href).ok())
-        .unwrap_or(document_url);
+        .unwrap_or_else(|| document_url.clone());
     let mut resources = Vec::new();
-    collect_external_resources(&dom, &base_url, &mut resources, MAX_EXTERNAL_RESOURCES);
+    collect_external_resources(&dom, &resolved_base, &mut resources, MAX_EXTERNAL_RESOURCES);
     let mut tasks = Vec::with_capacity(resources.len());
     for resource in resources {
         let token = cancellation.clone();
         let resource_url = url::Url::parse(&resource.url).ok();
+        // The document's cookies may only ride along to the DOCUMENT's own
+        // origin. Gating on <base href> let any page redirect its cookie
+        // stream to an attacker origin with a single tag.
         let cookie_header = resource_url
             .as_ref()
-            .filter(|resource_url| same_origin(&base_url, resource_url))
+            .filter(|resource_url| same_origin(&document_url, resource_url))
             .map(|_| subresource_cookie_header.clone())
             .unwrap_or_default();
         tasks.push(tokio::spawn(async move {
@@ -594,19 +615,33 @@ pub async fn fetch_document_bundle(
         std::collections::VecDeque<String>,
     >::new();
     let mut failures = 0_usize;
+    let mut total_bytes: usize = 0;
     for task in tasks {
         match task.await {
-            Ok((resource, Ok(response))) => bodies
-                .entry((resource.kind, resource.url))
-                .or_default()
-                .push_back(response.body),
+            Ok((resource, Ok(response))) => {
+                // Enforce per-resource and cumulative bundle budgets so 64
+                // subresources cannot inline gigabytes into the DOM.
+                if response.body.len() > MAX_SINGLE_RESOURCE_BYTES {
+                    failures = failures.saturating_add(1);
+                    continue;
+                }
+                if total_bytes.saturating_add(response.body.len()) > MAX_TOTAL_BUNDLE_BYTES {
+                    failures = failures.saturating_add(1);
+                    continue;
+                }
+                total_bytes += response.body.len();
+                bodies
+                    .entry((resource.kind, resource.url))
+                    .or_default()
+                    .push_back(response.body)
+            }
             _ => failures = failures.saturating_add(1),
         }
     }
     if cancellation.is_cancelled() {
         return Err("Cancelled".to_string());
     }
-    inject_external_resources(&mut dom, &base_url, &mut bodies);
+    inject_external_resources(&mut dom, &resolved_base, &mut bodies);
     document.body = dom.to_html();
     document.headers.insert(
         "x-ghita-external-resource-failures".to_string(),
@@ -716,15 +751,18 @@ pub async fn fetch_shared(
     response_mode: ResponseMode,
     cancellation: CancellationToken,
 ) -> Result<FetchResult, String> {
-    static SHARED_SCHEDULER: OnceLock<NetworkScheduler<ReqwestTransport>> = OnceLock::new();
+    static SHARED_SCHEDULER: OnceLock<Result<NetworkScheduler<ReqwestTransport>, String>> =
+        OnceLock::new();
     static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let scheduler = SHARED_SCHEDULER.get_or_init(|| {
-        NetworkScheduler::new(
-            ReqwestTransport::new().expect("async transport must initialize"),
-            SchedulerLimits::default(),
-        )
-        .expect("default network scheduler limits must be valid")
+        let transport = ReqwestTransport::new()?;
+        let scheduler = NetworkScheduler::new(transport, SchedulerLimits::default())
+            .map_err(|e| format!("invalid scheduler limits: {e}"))?;
+        Ok(scheduler)
     });
+    let scheduler = scheduler
+        .as_ref()
+        .map_err(|e| format!("async transport unavailable: {e}"))?;
     let response = scheduler
         .fetch(
             ScheduledRequest {
@@ -892,6 +930,7 @@ mod tests {
                     headers: Default::default(),
                     fetch_time_ms: 1,
                     set_cookie_headers: Vec::new(),
+                    set_cookie_hosts: Vec::new(),
                 })
             })
         }

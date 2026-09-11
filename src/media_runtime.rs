@@ -37,7 +37,7 @@ impl Default for MediaRuntimeLimits {
             max_events: 2_048,
             max_video_frames: 1_200,
             max_audio_frames: 16_384,
-            max_decoded_bytes: 64 * 1024 * 1024,
+            max_decoded_bytes: crate::media_budget::MAX_DECODED_BYTES,
             sync_tolerance_us: 40_000,
         }
     }
@@ -84,7 +84,7 @@ pub struct BoundedStreamingDecoder {
 
 impl BoundedStreamingDecoder {
     pub fn new(max_input_bytes: usize) -> Result<Self, String> {
-        if max_input_bytes == 0 || max_input_bytes > 64 * 1024 * 1024 {
+        if max_input_bytes == 0 || max_input_bytes > crate::media_budget::MAX_INPUT_BYTES {
             return Err("Streaming decoder input budget is invalid".to_string());
         }
         Ok(Self {
@@ -672,10 +672,10 @@ mod tests {
     }
 
     #[test]
-    fn default_media_budget_is_64_mb() {
+    fn default_media_budget_matches_the_shared_ceiling() {
         assert_eq!(
             MediaRuntimeLimits::default().max_decoded_bytes,
-            64 * 1024 * 1024
+            crate::media_budget::MAX_DECODED_BYTES
         );
     }
 

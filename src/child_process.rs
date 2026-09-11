@@ -74,7 +74,7 @@ impl ChildProcessManager {
         let generation = self
             .processes
             .get(&pid)
-            .expect("logical child exists")
+            .ok_or_else(|| "Internal error: logical child vanished after spawn".to_string())?
             .metadata
             .generation;
         let encoded_role = serde_json::to_string(&role).map_err(|error| error.to_string())?;
@@ -101,7 +101,7 @@ impl ChildProcessManager {
         let containment = self
             .processes
             .get_mut(&pid)
-            .expect("logical child exists")
+            .ok_or_else(|| "Internal error: logical child vanished after spawn".to_string())?
             .sandbox
             .assign_native_process(&child);
         if let Err(error) = containment {
@@ -136,7 +136,7 @@ impl ChildProcessManager {
         );
         self.processes
             .get_mut(&pid)
-            .expect("logical child exists")
+            .ok_or_else(|| "Internal error: logical child vanished after spawn".to_string())?
             .native_program = Some(program.to_path_buf());
         Ok(pid)
     }
@@ -238,7 +238,10 @@ impl ChildProcessManager {
         let meta = ProcessMetadata::new(pid, role.clone(), gen);
         let policy = SandboxPolicy::default_for_role(&role);
         let mut sandbox = JobObjectSandbox::new(job_id, policy);
-        sandbox.assign_process(pid).expect("assign pid");
+        // Logical spawn must never panic: OS enforcement happens later in
+        // spawn_native_process via assign_native_process (which returns
+        // Result). A missing native job only means fail-closed later.
+        let _ = sandbox.assign_process(pid);
 
         let ipc = IpcChannel::new(pid.0, ProcessId(0), gen, pid, gen);
 
@@ -331,7 +334,9 @@ impl ChildProcessManager {
 /// though reading happens off the caller's thread.
 fn spawn_reply_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
     let (sender, receiver) = mpsc::channel();
-    std::thread::Builder::new()
+    // Fail closed without panicking: if the reader thread cannot spawn,
+    // drop the sender so `recv_timeout` surfaces a hang as a timeout.
+    if std::thread::Builder::new()
         .name("native-child-ipc-reader".into())
         .spawn(move || {
             use std::io::Read;
@@ -349,7 +354,10 @@ fn spawn_reply_reader(stdout: ChildStdout) -> mpsc::Receiver<String> {
                 }
             }
         })
-        .expect("spawn native IPC reader thread");
+        .is_err()
+    {
+        // sender dropped here -> receiver immediately errors instead of hanging.
+    }
     receiver
 }
 

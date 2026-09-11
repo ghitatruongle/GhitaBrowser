@@ -5,6 +5,20 @@ use crate::css_parser::{
 use crate::parser::Element;
 use std::collections::BTreeMap;
 
+/// Default root font size used for `rem` resolution in the build path.
+///
+/// `rem` units resolve against the root element's font size. The build path
+/// constructs boxes top-down before the root's computed size is known, so it
+/// uses this 16px CSS default; the layout pass (`perform_layout`) threads the
+/// real `root_font_size` through every `to_pixels` call instead.
+const DEFAULT_ROOT_FONT_SIZE: f64 = 16.0;
+/// Maximum nesting accepted by `build_layout_node`; deeper subtrees return
+/// `None` so adversarial DOMs cannot overflow the call stack.
+const MAX_BUILD_DEPTH: usize = 128;
+/// Maximum subtree depth visited by iterative translate/transform/count
+/// helpers; nodes deeper than this are skipped to keep work bounded.
+const MAX_SUBTREE_DEPTH: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayType {
     Block,
@@ -251,7 +265,7 @@ pub fn get_font_size(style: &ComputedStyle, parent_font_size: f64) -> f64 {
     style
         .font_size
         .as_ref()
-        .map(|fs| fs.to_pixels(parent_font_size, 16.0))
+        .map(|fs| fs.to_pixels(parent_font_size, DEFAULT_ROOT_FONT_SIZE))
         .unwrap_or(parent_font_size)
 }
 
@@ -275,7 +289,7 @@ pub fn effective_font_size(style: &ComputedStyle, tag: &str, parent_font_size: f
     style
         .font_size
         .as_ref()
-        .map(|fs| fs.to_pixels(parent_font_size, 16.0))
+        .map(|fs| fs.to_pixels(parent_font_size, DEFAULT_ROOT_FONT_SIZE))
         .unwrap_or_else(|| default_font_size_for_tag(tag, parent_font_size))
 }
 
@@ -328,6 +342,9 @@ fn wrap_single_line(
     text: &str,
     max_width: f64,
     font_size: f64,
+    // Intentionally unused: CJK/long-word splitting below already implements
+    // `break-all`-style wrapping, so the `word-break` value currently needs no
+    // extra branch. Kept (underscore-prefixed) to preserve the call signature.
     _word_break: Option<&str>,
 ) -> Vec<String> {
     if estimate_text_width(text, font_size) <= max_width + 1.0 {
@@ -437,7 +454,16 @@ fn create_layout_tree_with_optional_styles(
     viewport_width: u32,
     styles: Option<&BTreeMap<u64, ComputedStyle>>,
 ) -> Option<LayoutNode> {
-    let (node, _) = build_layout_node(root, None, css_rules, viewport_width as f64, 16.0, styles)?;
+    let (node, _) = build_layout_node(
+        root,
+        None,
+        css_rules,
+        viewport_width as f64,
+        DEFAULT_ROOT_FONT_SIZE,
+        styles,
+        DEFAULT_ROOT_FONT_SIZE,
+        0,
+    )?;
     let mut root_node = node;
     perform_layout(&mut root_node, viewport_width as f64);
     Some(root_node)
@@ -451,6 +477,16 @@ fn resolve_box_dimension(
     unit.map(|u| u.to_pixels(container_size, parent_font_size).max(0.0))
 }
 
+/// Margins keep their sign (`margin-left:-50px` is ubiquitous for overlaps);
+/// only padding/border clamp at zero.
+fn resolve_box_dimension_signed(
+    unit: Option<&CssUnit>,
+    container_size: f64,
+    parent_font_size: f64,
+) -> Option<f64> {
+    unit.map(|u| u.to_pixels(container_size, parent_font_size))
+}
+
 fn build_layout_node(
     element: &Element,
     parent_style: Option<&ComputedStyle>,
@@ -458,7 +494,12 @@ fn build_layout_node(
     viewport_width: f64,
     parent_font_size: f64,
     styles: Option<&BTreeMap<u64, ComputedStyle>>,
+    root_font_size: f64,
+    depth: usize,
 ) -> Option<(LayoutNode, ComputedStyle)> {
+    if depth > MAX_BUILD_DEPTH {
+        return None;
+    }
     let classes = parse_class_attr(element.get_attr("class").map(|s| s.as_str()));
     let elem_id = element.get_attr("id").map(|s| s.as_str());
 
@@ -487,32 +528,56 @@ fn build_layout_node(
     let is_border_box = computed_style.box_sizing.as_deref() == Some("border-box");
 
     // Margins (0.0 if Auto or None)
-    let margin_top =
-        resolve_box_dimension(computed_style.margin_top.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
-    let margin_right =
-        resolve_box_dimension(computed_style.margin_right.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
-    let margin_bottom =
-        resolve_box_dimension(computed_style.margin_bottom.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
-    let margin_left =
-        resolve_box_dimension(computed_style.margin_left.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
+    let margin_top = resolve_box_dimension_signed(
+        computed_style.margin_top.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
+    let margin_right = resolve_box_dimension_signed(
+        computed_style.margin_right.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
+    let margin_bottom = resolve_box_dimension_signed(
+        computed_style.margin_bottom.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
+    let margin_left = resolve_box_dimension_signed(
+        computed_style.margin_left.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
 
     // Padding
-    let padding_top =
-        resolve_box_dimension(computed_style.padding_top.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
-    let padding_right =
-        resolve_box_dimension(computed_style.padding_right.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
-    let padding_bottom =
-        resolve_box_dimension(computed_style.padding_bottom.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
-    let padding_left =
-        resolve_box_dimension(computed_style.padding_left.as_ref(), viewport_width, 16.0)
-            .unwrap_or(0.0);
+    let padding_top = resolve_box_dimension(
+        computed_style.padding_top.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
+    let padding_right = resolve_box_dimension(
+        computed_style.padding_right.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
+    let padding_bottom = resolve_box_dimension(
+        computed_style.padding_bottom.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
+    let padding_left = resolve_box_dimension(
+        computed_style.padding_left.as_ref(),
+        viewport_width,
+        root_font_size,
+    )
+    .unwrap_or(0.0);
 
     // Borders
     let border_top = resolve_box_dimension(
@@ -521,7 +586,7 @@ fn build_layout_node(
             .as_ref()
             .or(computed_style.border_width.as_ref()),
         viewport_width,
-        16.0,
+        root_font_size,
     )
     .unwrap_or(0.0);
     let border_right = resolve_box_dimension(
@@ -530,7 +595,7 @@ fn build_layout_node(
             .as_ref()
             .or(computed_style.border_width.as_ref()),
         viewport_width,
-        16.0,
+        root_font_size,
     )
     .unwrap_or(0.0);
     let border_bottom = resolve_box_dimension(
@@ -539,7 +604,7 @@ fn build_layout_node(
             .as_ref()
             .or(computed_style.border_width.as_ref()),
         viewport_width,
-        16.0,
+        root_font_size,
     )
     .unwrap_or(0.0);
     let border_left = resolve_box_dimension(
@@ -548,7 +613,7 @@ fn build_layout_node(
             .as_ref()
             .or(computed_style.border_width.as_ref()),
         viewport_width,
-        16.0,
+        root_font_size,
     )
     .unwrap_or(0.0);
 
@@ -616,7 +681,7 @@ fn build_layout_node(
 
     // Width resolution with box-sizing
     let mut width = if let Some(ref w) = computed_style.width {
-        let px = w.to_pixels(viewport_width, 16.0);
+        let px = w.to_pixels(viewport_width, root_font_size);
         if is_border_box {
             px
         } else {
@@ -628,7 +693,7 @@ fn build_layout_node(
 
     // Apply min-width and max-width
     if let Some(ref min_w) = computed_style.min_width {
-        let min_px = min_w.to_pixels(viewport_width, 16.0);
+        let min_px = min_w.to_pixels(viewport_width, root_font_size);
         let min_border_box = if is_border_box {
             min_px
         } else {
@@ -637,7 +702,7 @@ fn build_layout_node(
         width = width.max(min_border_box);
     }
     if let Some(ref max_w) = computed_style.max_width {
-        let max_px = max_w.to_pixels(viewport_width, 16.0);
+        let max_px = max_w.to_pixels(viewport_width, root_font_size);
         let max_border_box = if is_border_box {
             max_px
         } else {
@@ -690,6 +755,8 @@ fn build_layout_node(
             layout_node.rect.content_width(),
             font_size,
             styles,
+            root_font_size,
+            depth + 1,
         ) {
             layout_node.add_child(child_layout);
         }
@@ -702,16 +769,20 @@ fn build_layout_node(
 /// Perform full layout pass across the tree
 pub fn perform_layout(root: &mut LayoutNode, viewport_width: f64) {
     let viewport_width = viewport_width.max(0.0);
-    // rem units resolve against the root element's font size, not a
-    // hardcoded 16px.
-    let root_font_size = effective_font_size(&root.computed_style, &root.element.tag, 16.0);
+    // rem units resolve against the root element's font size, threaded as
+    // `root_font_size` below (falls back to DEFAULT_ROOT_FONT_SIZE).
+    let root_font_size = effective_font_size(
+        &root.computed_style,
+        &root.element.tag,
+        DEFAULT_ROOT_FONT_SIZE,
+    );
     let mut float_ctx = FloatContext::default();
     layout_node_recursive(
         root,
         0.0,
         0.0,
         viewport_width,
-        16.0,
+        DEFAULT_ROOT_FONT_SIZE,
         None,
         root_font_size,
         &mut float_ctx,
@@ -1540,11 +1611,19 @@ fn layout_flex(
 
 /// Shift a node and every descendant by (dx, dy). Used when a layout pass
 /// repositions an already-laid-out subtree (flex cross-axis alignment).
+/// Iterative with a 256-level depth cap so adversarial trees cannot overflow
+/// the call stack; deeper descendants keep their old position.
 fn translate_subtree(node: &mut LayoutNode, dx: f64, dy: f64) {
-    node.rect.x += dx;
-    node.rect.y += dy;
-    for child in &mut node.children {
-        translate_subtree(child, dx, dy);
+    let mut stack: Vec<(&mut LayoutNode, usize)> = vec![(node, 0)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > MAX_SUBTREE_DEPTH {
+            continue;
+        }
+        current.rect.x += dx;
+        current.rect.y += dy;
+        for child in &mut current.children {
+            stack.push((child, depth + 1));
+        }
     }
 }
 
@@ -1648,7 +1727,10 @@ fn layout_table(
                     c.element
                         .get_attr("colspan")
                         .and_then(|s| s.parse::<usize>().ok())
+                        // Clamp before summing: attacker colspan values
+                        // could overflow the usize sum (debug panic).
                         .unwrap_or(1)
+                        .min(1_000)
                 })
                 .sum::<usize>()
         })
@@ -1673,7 +1755,7 @@ fn layout_table(
                 .get_attr("colspan")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(1)
-                .max(1);
+                .clamp(1, 1_000);
             let cell_w = col_width * span as f64;
             cell.rect.width = cell_w;
 
@@ -1807,10 +1889,17 @@ fn finish_layout_node(
 }
 
 fn translate_layout_subtree(node: &mut LayoutNode, dx: f64, dy: f64) {
-    node.rect.x += dx;
-    node.rect.y += dy;
-    for child in &mut node.children {
-        translate_layout_subtree(child, dx, dy);
+    // Iterative with a 256-level depth cap (see `translate_subtree`).
+    let mut stack: Vec<(&mut LayoutNode, usize)> = vec![(node, 0)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > MAX_SUBTREE_DEPTH {
+            continue;
+        }
+        current.rect.x += dx;
+        current.rect.y += dy;
+        for child in &mut current.children {
+            stack.push((child, depth + 1));
+        }
     }
 }
 
@@ -1820,12 +1909,22 @@ fn transform_layout_subtree(
     origin_y: f64,
     transform: Transform2D,
 ) {
-    node.rect.x = origin_x + (node.rect.x - origin_x) * transform.scale_x + transform.translate_x;
-    node.rect.y = origin_y + (node.rect.y - origin_y) * transform.scale_y + transform.translate_y;
-    node.rect.width = (node.rect.width * transform.scale_x).max(0.0);
-    node.rect.height = (node.rect.height * transform.scale_y).max(0.0);
-    for child in &mut node.children {
-        transform_layout_subtree(child, origin_x, origin_y, transform);
+    // Iterative with a 256-level depth cap so deep subtrees cannot overflow
+    // the call stack; nodes beyond the cap keep their untransformed rect.
+    let mut stack: Vec<(&mut LayoutNode, usize)> = vec![(node, 0)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > MAX_SUBTREE_DEPTH {
+            continue;
+        }
+        current.rect.x =
+            origin_x + (current.rect.x - origin_x) * transform.scale_x + transform.translate_x;
+        current.rect.y =
+            origin_y + (current.rect.y - origin_y) * transform.scale_y + transform.translate_y;
+        current.rect.width = (current.rect.width * transform.scale_x).max(0.0);
+        current.rect.height = (current.rect.height * transform.scale_y).max(0.0);
+        for child in &mut current.children {
+            stack.push((child, depth + 1));
+        }
     }
 }
 
@@ -1847,18 +1946,40 @@ fn grid_column_count(template: Option<&str>, child_count: usize) -> usize {
         .clamp(1, 12)
 }
 
-/// Recursively count the total number of layout nodes in the tree.
+/// Count the total number of layout nodes in the tree (iterative, with a
+/// 256-level depth cap so adversarial trees cannot overflow the call stack).
 pub(crate) fn count_layout_nodes(node: &LayoutNode) -> usize {
-    1 + node.children.iter().map(count_layout_nodes).sum::<usize>()
+    let mut count = 0usize;
+    let mut stack: Vec<(&LayoutNode, usize)> = vec![(node, 0)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > MAX_SUBTREE_DEPTH {
+            continue;
+        }
+        count = count.saturating_add(1);
+        for child in &current.children {
+            stack.push((child, depth + 1));
+        }
+    }
+    count
 }
 
 /// Find the first layout node with the given tag
+/// (iterative, with a 256-level depth cap like the other subtree walks).
 #[cfg(test)]
 fn find_node<'a>(node: &'a LayoutNode, tag: &str) -> Option<&'a LayoutNode> {
-    if node.element.tag == tag {
-        return Some(node);
+    let mut stack: Vec<(&'a LayoutNode, usize)> = vec![(node, 0)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > MAX_SUBTREE_DEPTH {
+            continue;
+        }
+        if current.element.tag == tag {
+            return Some(current);
+        }
+        for child in current.children.iter().rev() {
+            stack.push((child, depth + 1));
+        }
     }
-    node.children.iter().find_map(|child| find_node(child, tag))
+    None
 }
 
 #[cfg(test)]
@@ -1930,7 +2051,17 @@ mod tests {
         let dom = crate::parser::parse_html(html);
         let rules = vec![];
 
-        let (root, _) = build_layout_node(&dom, None, &rules, 800.0, 16.0, None).unwrap();
+        let (root, _) = build_layout_node(
+            &dom,
+            None,
+            &rules,
+            800.0,
+            DEFAULT_ROOT_FONT_SIZE,
+            None,
+            DEFAULT_ROOT_FONT_SIZE,
+            0,
+        )
+        .unwrap();
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].element.tag, "p");
     }

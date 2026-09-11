@@ -38,16 +38,35 @@ fn cache_storage_crud_and_match() {
 fn service_worker_lifecycle_state_transitions() {
     let mut sw_container = ServiceWorkerContainer::new("https://example.com");
 
-    let reg = sw_container
-        .register(
-            "https://example.com/sw.js",
-            Some(ServiceWorkerRegistrationOptions {
-                scope: "/app/".to_string(),
-            }),
-        )
-        .expect("register sw");
+    let scope = {
+        let reg = sw_container
+            .register(
+                "https://example.com/sw.js",
+                Some(ServiceWorkerRegistrationOptions {
+                    scope: "/app/".to_string(),
+                }),
+            )
+            .expect("register sw");
 
-    assert_eq!(reg.scope, "/app/");
+        assert_eq!(reg.scope, "/app/");
+        // Spec-correct: registration starts Installing, not Active.
+        assert_eq!(reg.state, ServiceWorkerState::Installing);
+        reg.scope.clone()
+    };
+    // Drive explicit lifecycle to Active.
+    {
+        let reg = sw_container
+            .registrations
+            .get_mut(&scope)
+            .expect("registration");
+        reg.transition_to(ServiceWorkerState::Installed);
+        reg.transition_to(ServiceWorkerState::Activating);
+        reg.transition_to(ServiceWorkerState::Active);
+    }
+    let reg = sw_container
+        .registrations
+        .get(&scope)
+        .expect("registration");
     assert_eq!(reg.state, ServiceWorkerState::Active);
 
     // Matching fetch requests
@@ -82,15 +101,27 @@ fn service_worker_fetch_interception_fallback() {
         )
         .expect("put json");
 
-    // Register active SW
-    sw_container
-        .register(
-            "https://example.com/sw.js",
-            Some(ServiceWorkerRegistrationOptions {
-                scope: "/app/".to_string(),
-            }),
-        )
-        .expect("register");
+    // Register SW (starts Installing) then activate explicitly.
+    let scope = {
+        let reg = sw_container
+            .register(
+                "https://example.com/sw.js",
+                Some(ServiceWorkerRegistrationOptions {
+                    scope: "/app/".to_string(),
+                }),
+            )
+            .expect("register");
+        reg.scope.clone()
+    };
+    {
+        let reg = sw_container
+            .registrations
+            .get_mut(&scope)
+            .expect("registration");
+        reg.transition_to(ServiceWorkerState::Installed);
+        reg.transition_to(ServiceWorkerState::Activating);
+        reg.transition_to(ServiceWorkerState::Active);
+    }
 
     // Intercept fetch
     let intercepted = sw_container

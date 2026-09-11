@@ -180,7 +180,7 @@ impl WebTransportRegistry {
         session
             .streams
             .get_mut(&stream_id)
-            .expect("stream was validated")
+            .ok_or_else(|| "InvalidStateError: WebTransport stream is detached".to_string())?
             .outbound
             .push_back(bytes);
         Ok(())
@@ -208,7 +208,7 @@ impl WebTransportRegistry {
         session
             .streams
             .get_mut(&stream_id)
-            .expect("stream was validated")
+            .ok_or_else(|| "InvalidStateError: WebTransport stream is detached".to_string())?
             .inbound
             .push_back(bytes);
         Ok(())

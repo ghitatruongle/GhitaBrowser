@@ -231,6 +231,12 @@ impl WindowsWasapiSink {
         let target = unsafe { self.render.GetBuffer(frames_u32) }
             .map_err(|error| format!("Cannot acquire a WASAPI render buffer: {error}"))?;
         if target.is_null() {
+            // A GetBuffer MUST be paired with a ReleaseBuffer even on this
+            // path; skipping it wedged the sink permanently
+            // (AUDCLNT_E_OUT_OF_ORDER on every later GetBuffer).
+            unsafe {
+                let _ = self.render.ReleaseBuffer(frames_u32, 0);
+            }
             return Err("WASAPI returned a null render buffer".to_string());
         }
         let samples = frames.saturating_mul(usize::from(self.channels));

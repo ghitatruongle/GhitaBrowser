@@ -216,9 +216,11 @@ fn decode_media_foundation_source(
 
     const MAX_VIDEO_FRAMES: usize = 1_200;
     const MAX_AUDIO_FRAMES: usize = 16_384;
-    const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
-    const MAX_VIDEO_DECODED_BYTES: usize = MAX_DECODED_BYTES * 3 / 4;
-    const MAX_AUDIO_DECODED_BYTES: usize = MAX_DECODED_BYTES - MAX_VIDEO_DECODED_BYTES;
+    // Decoded-byte caps come from the shared budget module so the decoder can
+    // never accept more than the page pipeline would keep (64 MB total).
+    use crate::media_budget::{
+        MAX_AUDIO_DECODED_BYTES, MAX_DECODED_BYTES, MAX_VIDEO_DECODED_BYTES,
+    };
     const MAX_DIMENSION: u32 = 4_096;
     const MAX_RETAINED_VIDEO_WIDTH: u32 = 256;
     const MAX_RETAINED_VIDEO_HEIGHT: u32 = 144;
@@ -250,10 +252,22 @@ fn decode_media_foundation_source(
                 .Lock(&mut pointer, None, Some(&mut length))
                 .map_err(|error| format!("Media Foundation buffer lock failed: {error}"))?;
         }
-        let result = if pointer.is_null() || length as usize > max_bytes {
-            Err("Decoded Media Foundation buffer exceeds its budget".to_string())
+        // Checked lengths: u32 -> usize can overflow on 16-bit targets and a
+        // null pointer with length 0 must not become an empty slice. Unlock is
+        // still executed below so no early `?` before it.
+        let length_usize = usize::try_from(length)
+            .map_err(|_| "Decoded Media Foundation buffer length overflow".to_string())?;
+        let result = if pointer.is_null() {
+            Err("Decoded Media Foundation buffer has a null pointer".to_string())
+        } else if length_usize > max_bytes {
+            Err(format!(
+                "Decoded Media Foundation buffer of {length} bytes exceeds the {} MB budget",
+                max_bytes / (1024 * 1024)
+            ))
         } else {
-            Ok(unsafe { std::slice::from_raw_parts(pointer, length as usize) }.to_vec())
+            // SAFETY: pointer is non-null and Lock guarantees at least
+            // `length` readable bytes for the lock lifetime (this scope).
+            Ok(unsafe { std::slice::from_raw_parts(pointer, length_usize) }.to_vec())
         };
         unsafe {
             buffer
@@ -312,8 +326,12 @@ fn decode_media_foundation_source(
             (Some(wide), None)
         }
         MediaFoundationSource::Memory(bytes) => {
-            if bytes.is_empty() || bytes.len() > 64 * 1024 * 1024 {
-                return Err("In-memory media source exceeds the 64 MB input budget".to_string());
+            if bytes.is_empty() || bytes.len() > crate::media_budget::MAX_INPUT_BYTES {
+                return Err(format!(
+                    "In-memory media source of {} bytes exceeds the {} MB input budget",
+                    bytes.len(),
+                    crate::media_budget::MAX_INPUT_BYTES / (1024 * 1024)
+                ));
             }
             (None, Some(bytes))
         }
@@ -342,7 +360,9 @@ fn decode_media_foundation_source(
         unsafe { MFCreateSourceReaderFromURL(PCWSTR(wide.as_ptr()), &attributes) }
             .map_err(|error| format!("Media Foundation source reader failed: {error}"))?
     } else {
-        let bytes = memory.expect("validated in-memory source");
+        let bytes = memory.ok_or_else(|| {
+            "In-memory media source is missing (validated before decoding)".to_string()
+        })?;
         let stream = unsafe {
             CreateStreamOnHGlobal(
                 windows::Win32::Foundation::HGLOBAL::default(),
@@ -499,7 +519,10 @@ fn decode_media_foundation_source(
                     .checked_add(rgba.len())
                     .ok_or_else(|| "Decoded media byte count overflow".to_string())?;
                 if decoded_video_bytes > MAX_VIDEO_DECODED_BYTES {
-                    return Err("Decoded media byte budget exceeded".to_string());
+                    return Err(format!(
+                        "Decoded video of {decoded_video_bytes} bytes exceeds the {} MB budget",
+                        MAX_VIDEO_DECODED_BYTES / (1024 * 1024)
+                    ));
                 }
                 output.video_frames.push(DecodedVideoFrame {
                     timestamp_us,
@@ -539,7 +562,10 @@ fn decode_media_foundation_source(
                     .checked_add(bytes.len())
                     .ok_or_else(|| "Decoded media byte count overflow".to_string())?;
                 if decoded_audio_bytes > MAX_AUDIO_DECODED_BYTES {
-                    return Err("Decoded media byte budget exceeded".to_string());
+                    return Err(format!(
+                        "Decoded audio of {decoded_audio_bytes} bytes exceeds the {} MB budget",
+                        MAX_AUDIO_DECODED_BYTES / (1024 * 1024)
+                    ));
                 }
                 output.audio_frames.push(DecodedAudioFrame {
                     timestamp_us: timestamp_100ns / 10,

@@ -2,7 +2,10 @@
 
 #define MyAppName "GhitaBrowser"
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.6"
+  ; No hardcoded fallback: the version's single source of truth is
+  ; Cargo.toml, and packaging/package.ps1 compiles this file with
+  ; /DMyAppVersion=<version> read from cargo metadata.
+  #error "Compile via packaging/package.ps1 (or pass /DMyAppVersion=x.y.z)"
 #endif
 #define MyAppPublisher "GhitaBrowser contributors"
 #define MyAppURL "https://github.com/GhitaBrowser/ghitabrowser"

@@ -149,7 +149,10 @@ impl ByteRange {
     }
 
     pub fn is_empty(self) -> bool {
-        false
+        // `new` rejects start > end, but the fields are public so a literal
+        // `ByteRange { start: 5, end_inclusive: 4 }` can still express an
+        // empty range. Report emptiness structurally instead of `false`.
+        self.start > self.end_inclusive
     }
 }
 

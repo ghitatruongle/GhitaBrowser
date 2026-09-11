@@ -17,12 +17,21 @@ use crate::paint::DisplayList;
 use crate::parser::Element;
 
 const MAX_LIVE_NODES: usize = 50_000;
+/// Tree-depth budget: refresh/layout/drop recursion is recursive, so an
+/// unbounded depth (chained `set_inner_html` grows it one level per call)
+/// overflowed the stack far below the node-count quota.
+const MAX_LIVE_DEPTH: usize = 256;
 const MAX_EVENT_LISTENERS: usize = 10_000;
 const MAX_EVENT_PATH: usize = 256;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_ATTRIBUTE_BYTES: usize = 64 * 1024;
 const MAX_SHADOW_ROOTS: usize = 128;
 const MAX_SHADOW_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// Global budget: maximum attributes retained per element on import.
+const MAX_ATTRS_PER_ELEMENT: usize = 64;
+/// Guard against `preferred` id jumps: a preferred id more than this far
+/// ahead of `next_node_id` is ignored and allocation falls back to sequential.
+const MAX_PREFERRED_ID_JUMP: u64 = 100_000;
 
 pub type NodeId = u64;
 pub type ListenerId = u64;
@@ -267,9 +276,10 @@ impl LiveDocument {
             shadows: BTreeMap::new(),
             canvas_shapes: BTreeMap::new(),
         };
-        let root_id = document
-            .import_element(root, None)
-            .expect("root fits empty document");
+        let Ok(root_id) = document.import_element(root, None) else {
+            document.refresh();
+            return document;
+        };
         document.root = root_id;
         document.refresh();
         document
@@ -463,7 +473,18 @@ impl LiveDocument {
     }
 
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
-        self.query_selector(&format!("#{}", id))
+        // Direct linear scan: never build a `#id` selector string, which
+        // breaks on spaces/brackets and pays selector-parse cost per lookup.
+        for node in self.document_order() {
+            if let Some(LiveNodeKind::Element { attrs, .. }) =
+                self.nodes.get(&node).map(|entry| &entry.kind)
+            {
+                if attrs.get("id").map(String::as_str) == Some(id) {
+                    return Some(node);
+                }
+            }
+        }
+        None
     }
 
     pub fn create_element(&mut self, tag: &str) -> Result<NodeId, String> {
@@ -519,16 +540,20 @@ impl LiveDocument {
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), String> {
         self.require_element(parent)?;
         self.require_node(child)?;
+        self.depth_budget_ok(parent)?;
         if parent == child || self.is_ancestor(child, parent) {
             return Err("HierarchyRequestError: append would create a cycle".to_string());
         }
         self.detach(child)?;
         self.nodes
             .get_mut(&parent)
-            .expect("validated parent")
+            .ok_or_else(|| "InvalidStateError: parent is no longer in the document".to_string())?
             .children
             .push(child);
-        self.nodes.get_mut(&child).expect("validated child").parent = Some(parent);
+        self.nodes
+            .get_mut(&child)
+            .ok_or_else(|| "InvalidStateError: child is no longer in the document".to_string())?
+            .parent = Some(parent);
         self.mark_mutated();
         Ok(())
     }
@@ -542,10 +567,13 @@ impl LiveDocument {
             .ok_or_else(|| "NotFoundError: node is not a child of parent".to_string())?;
         self.nodes
             .get_mut(&parent)
-            .expect("validated parent")
+            .ok_or_else(|| "InvalidStateError: parent is no longer in the document".to_string())?
             .children
             .remove(position);
-        self.nodes.get_mut(&child).expect("validated child").parent = None;
+        self.nodes
+            .get_mut(&child)
+            .ok_or_else(|| "InvalidStateError: child is no longer in the document".to_string())?
+            .parent = None;
         self.mark_mutated();
         Ok(())
     }
@@ -554,15 +582,18 @@ impl LiveDocument {
         self.require_node(node)?;
         let text = bounded_text(value);
         if matches!(self.nodes[&node].kind, LiveNodeKind::Text(_)) {
-            self.nodes.get_mut(&node).expect("validated node").kind = LiveNodeKind::Text(text);
+            self.nodes
+                .get_mut(&node)
+                .ok_or_else(|| "InvalidStateError: node is no longer in the document".to_string())?
+                .kind = LiveNodeKind::Text(text);
         } else {
             let previous = self.nodes[&node].children.clone();
             for child in previous {
-                self.nodes.get_mut(&child).expect("existing child").parent = None;
+                self.free_subtree(child);
             }
             self.nodes
                 .get_mut(&node)
-                .expect("validated node")
+                .ok_or_else(|| "InvalidStateError: node is no longer in the document".to_string())?
                 .children
                 .clear();
             if !text.is_empty() {
@@ -585,7 +616,7 @@ impl LiveDocument {
         let name = normalize_attribute_name(name)?;
         let element = self.require_element_mut(node)?;
         let LiveNodeKind::Element { attrs, .. } = &mut element.kind else {
-            unreachable!("require_element_mut returned text node")
+            return Err("InvalidStateError: node is not an element".to_string());
         };
         attrs.insert(name.clone(), bounded_attribute(value));
         self.mark_attribute_mutated(name.as_str(), value);
@@ -596,7 +627,7 @@ impl LiveDocument {
         let name = normalize_attribute_name(name)?;
         let element = self.require_element_mut(node)?;
         let LiveNodeKind::Element { attrs, .. } = &mut element.kind else {
-            unreachable!("require_element_mut returned text node")
+            return Err("InvalidStateError: node is not an element".to_string());
         };
         attrs.remove(&name);
         self.mark_attribute_mutated(name.as_str(), "");
@@ -650,11 +681,15 @@ impl LiveDocument {
             .ok_or_else(|| "NotFoundError: node is not a shadow root".to_string())?;
         let previous = self.nodes[&root].children.clone();
         for child in previous {
-            self.nodes.get_mut(&child).expect("existing child").parent = None;
+            // Mirror `set_inner_html`: freed subtrees release their ids back
+            // to the node budget instead of leaking as detached orphans.
+            self.free_subtree(child);
         }
         self.nodes
             .get_mut(&root)
-            .expect("validated root")
+            .ok_or_else(|| {
+                "InvalidStateError: shadow root is no longer in the document".to_string()
+            })?
             .children
             .clear();
         let parsed = crate::parser::parse_html(html);
@@ -693,17 +728,27 @@ impl LiveDocument {
         self.require_node(node)?;
         let previous = self.nodes[&node].children.clone();
         for child in previous {
-            self.nodes.get_mut(&child).expect("existing child").parent = None;
+            self.free_subtree(child);
         }
         self.nodes
             .get_mut(&node)
-            .expect("validated node")
+            .ok_or_else(|| "InvalidStateError: node is no longer in the document".to_string())?
             .children
             .clear();
         let parsed = crate::parser::parse_html(html);
         self.append_parsed_fragment(&parsed, node)?;
         self.mark_mutated();
         Ok(())
+    }
+
+    /// Serialize an element's children as HTML (the `innerHTML` getter).
+    /// The old getter returned TEXT content, so the round-trip idiom
+    /// `el.innerHTML = el.innerHTML` destroyed nested markup.
+    pub fn inner_html(&self, node: NodeId) -> Result<String, String> {
+        let element = self
+            .export_element(node)
+            .ok_or_else(|| "InvalidStateError: node is no longer in the document".to_string())?;
+        Ok(compact_children_html(&element))
     }
 
     /// The shadow root attached to a host, honoring closed-mode visibility.
@@ -939,6 +984,35 @@ impl LiveDocument {
         self.allocate_preferred(kind, None)
     }
 
+    /// Recursively remove an unlinked subtree from the node store. Detached
+    /// nodes used to stay forever, so churn like
+    /// `setInterval(() => body.innerHTML = "")` hit the 50k-node quota and
+    /// killed the page permanently. Destructive clears only: a plain
+    /// removeChild may be re-appended by the page, so it must NOT free.
+    fn free_subtree(&mut self, root: NodeId) {
+        let Some(entry) = self.nodes.remove(&root) else {
+            return;
+        };
+        for child in entry.children {
+            self.free_subtree(child);
+        }
+    }
+
+    /// Depth check for `node`'s ancestors, failing closed when the walk
+    /// exceeds `MAX_LIVE_DEPTH` (the tree is already too deep to extend).
+    fn depth_budget_ok(&self, node: NodeId) -> Result<(), String> {
+        let mut current = self.nodes.get(&node).and_then(|entry| entry.parent);
+        let mut depth = 1usize;
+        while depth < MAX_LIVE_DEPTH {
+            let Some(id) = current else {
+                return Ok(());
+            };
+            depth += 1;
+            current = self.nodes.get(&id).and_then(|entry| entry.parent);
+        }
+        Err("HierarchyRequestError: DOM nesting depth budget exceeded".to_string())
+    }
+
     fn allocate_preferred(
         &mut self,
         kind: LiveNodeKind,
@@ -947,9 +1021,15 @@ impl LiveDocument {
         if self.nodes.len() >= MAX_LIVE_NODES {
             return Err("QuotaExceededError: live DOM node budget exceeded".to_string());
         }
-        let id = preferred
-            .filter(|candidate| *candidate != 0 && !self.nodes.contains_key(candidate))
-            .unwrap_or(self.next_node_id);
+        // Ignore a preferred id that jumps far ahead of the sequential
+        // cursor: accepting it would burn the id space and force every later
+        // allocation to start past the jump.
+        let preferred = preferred.filter(|candidate| {
+            *candidate != 0
+                && !self.nodes.contains_key(candidate)
+                && *candidate <= self.next_node_id.saturating_add(MAX_PREFERRED_ID_JUMP)
+        });
+        let id = preferred.unwrap_or(self.next_node_id);
         self.next_node_id = self
             .next_node_id
             .max(id)
@@ -972,13 +1052,17 @@ impl LiveDocument {
         element: &Element,
         parent: Option<NodeId>,
     ) -> Result<NodeId, String> {
+        // Global budget: retain at most MAX_ATTRS_PER_ELEMENT attributes per
+        // element (BTreeMap order keeps this deterministic). Text stays
+        // bounded via `bounded_text` below.
         let id = self.allocate_preferred(
             LiveNodeKind::Element {
                 tag: element.tag.clone(),
                 attrs: element
                     .attrs
                     .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .take(MAX_ATTRS_PER_ELEMENT)
+                    .map(|(name, value)| (name.clone(), bounded_attribute(value)))
                     .collect(),
                 is_void: element.is_void,
             },
@@ -1004,12 +1088,16 @@ impl LiveDocument {
     ) -> Result<(), String> {
         self.require_element(parent)?;
         self.require_node(child)?;
+        self.depth_budget_ok(parent)?;
         self.nodes
             .get_mut(&parent)
-            .expect("validated parent")
+            .ok_or_else(|| "InvalidStateError: parent is no longer in the document".to_string())?
             .children
             .push(child);
-        self.nodes.get_mut(&child).expect("validated child").parent = Some(parent);
+        self.nodes
+            .get_mut(&child)
+            .ok_or_else(|| "InvalidStateError: child is no longer in the document".to_string())?
+            .parent = Some(parent);
         Ok(())
     }
 
@@ -1019,10 +1107,15 @@ impl LiveDocument {
             let children = &mut self
                 .nodes
                 .get_mut(&parent)
-                .expect("existing parent")
+                .ok_or_else(|| {
+                    "InvalidStateError: parent is no longer in the document".to_string()
+                })?
                 .children;
             children.retain(|candidate| *candidate != child);
-            self.nodes.get_mut(&child).expect("existing child").parent = None;
+            self.nodes
+                .get_mut(&child)
+                .ok_or_else(|| "InvalidStateError: child is no longer in the document".to_string())?
+                .parent = None;
         }
         Ok(())
     }
@@ -1242,7 +1335,10 @@ impl LiveDocument {
             }
             current = self.nodes.get(&id).and_then(|entry| entry.parent);
         }
-        true
+        // Walk exhausted past the step cap without finding the candidate:
+        // report false, not "assume ancestor" (the old true made every
+        // legitimate append fail as a bogus cycle on very deep trees).
+        false
     }
 
     /// The full ancestor chain for a dispatch, used by the host bridge to run
@@ -1828,6 +1924,54 @@ fn bounded_text(value: &str) -> String {
 
 fn bounded_attribute(value: &str) -> String {
     value.chars().take(MAX_ATTRIBUTE_BYTES).collect()
+}
+
+/// Compact HTML serialization used by the `innerHTML` getter (no pretty
+/// indentation — whitespace inside inline markup would corrupt rendering).
+fn compact_children_html(element: &crate::parser::Element) -> String {
+    let mut out = String::new();
+    if !element.text.is_empty() {
+        out.push_str(&escape_html_text(&element.text));
+    }
+    for child in &element.children {
+        out.push_str(&compact_element_html(child));
+    }
+    out
+}
+
+fn compact_element_html(element: &crate::parser::Element) -> String {
+    let mut out = format!("<{}", element.tag);
+    for (name, value) in &element.attrs {
+        out.push(' ');
+        out.push_str(&escape_html_text(name));
+        out.push('=');
+        out.push('"');
+        out.push_str(&escape_html_attr_value(value));
+        out.push('"');
+    }
+    out.push('>');
+    if element.is_void {
+        return out;
+    }
+    if !element.text.is_empty() {
+        out.push_str(&escape_html_text(&element.text));
+    }
+    for child in &element.children {
+        out.push_str(&compact_element_html(child));
+    }
+    out.push_str(&format!("</{}>", element.tag));
+    out
+}
+
+fn escape_html_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_html_attr_value(value: &str) -> String {
+    escape_html_text(value).replace('"', "&quot;")
 }
 
 #[cfg(test)]

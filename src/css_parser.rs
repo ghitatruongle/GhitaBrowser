@@ -44,7 +44,7 @@ pub enum CssOrigin {
 }
 
 /// Attribute matching operators in selectors.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AttributeMatch {
     Presence,  // [attr]
     Exact,     // [attr=val]
@@ -422,7 +422,7 @@ fn match_pseudo_class(pc: &PseudoClass, ctx: &ElementMatchingContext) -> bool {
         PseudoClass::Is(list) | PseudoClass::Where(list) => {
             list.iter().any(|sel| sel.matches_context(ctx))
         }
-        PseudoClass::Has(_) => true,
+        PseudoClass::Has(_) => false, // unimplemented: fail closed
         PseudoClass::Lang(target_lang) => {
             if let Some(lang) = ctx.attrs.get("lang") {
                 let lang_folded = lang.to_ascii_lowercase();
@@ -437,7 +437,7 @@ fn match_pseudo_class(pc: &PseudoClass, ctx: &ElementMatchingContext) -> bool {
                 false
             }
         }
-        PseudoClass::Custom(_) => true,
+        PseudoClass::Custom(_) => false, // unknown pseudo: match nothing
     }
 }
 
@@ -446,11 +446,11 @@ fn eval_nth(a: i32, b: i32, index: usize) -> bool {
     if a == 0 {
         index == b
     } else {
-        let diff = index - b;
+        let diff = (index as i64) - (b as i64);
         if a > 0 {
-            diff >= 0 && diff % a == 0
+            diff >= 0 && diff % (a as i64) == 0
         } else {
-            diff <= 0 && diff % a == 0
+            diff <= 0 && diff % (a as i64) == 0
         }
     }
 }
@@ -1039,12 +1039,23 @@ fn parse_single_compound(input: &str) -> (CompoundSelector, Vec<(String, String)
                     current.clear();
                     state = ' ';
 
+                    // Quote-aware scan so [title="]"] does not truncate.
                     let mut attr_content = String::new();
+                    let mut quote: Option<char> = None;
                     for inner in chars.by_ref() {
-                        if inner == ']' {
+                        if let Some(q) = quote {
+                            attr_content.push(inner);
+                            if inner == q {
+                                quote = None;
+                            }
+                        } else if inner == '"' || inner == '\'' {
+                            quote = Some(inner);
+                            attr_content.push(inner);
+                        } else if inner == ']' {
                             break;
+                        } else {
+                            attr_content.push(inner);
                         }
-                        attr_content.push(inner);
                     }
                     if let Some(attr) = parse_attr_selector(&attr_content) {
                         legacy_attrs.push((attr.name.clone(), attr.value.clone()));
@@ -1126,10 +1137,53 @@ fn parse_attr_selector(content: &str) -> Option<AttributeSelector> {
     ];
 
     let mut found_op = None;
-    for (sig, match_type) in op_signatures {
-        if let Some(pos) = trimmed.find(sig) {
-            found_op = Some((pos, sig.len(), match_type));
-            break;
+    // Scan for operators outside quotes so [title="a~=b"] is not split.
+    // Byte-indexed but char-boundary safe: advance by char length so `i`
+    // is always a valid slice boundary even with multi-byte input.
+    {
+        let bytes = trimmed.as_bytes();
+        let mut quote: Option<u8> = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            // Ensure `i` is a char boundary; skip continuation bytes.
+            if !trimmed.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'"' || b == b'\'' {
+                quote = Some(b);
+                i += 1;
+                continue;
+            }
+            let mut matched = None;
+            // `get(i..)` returns None on non-boundary instead of panicking.
+            if let Some(suffix) = trimmed.get(i..) {
+                for (sig, match_type) in &op_signatures {
+                    if suffix.starts_with(sig) {
+                        matched = Some((i, sig.len(), *match_type));
+                        break;
+                    }
+                }
+            }
+            if let Some(m) = matched {
+                found_op = Some(m);
+                break;
+            }
+            // Advance by full char width for multi-byte safety.
+            let ch_len = trimmed[i..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            i += ch_len;
         }
     }
 
@@ -1669,16 +1723,6 @@ impl CssUnit {
             rem_val.trim().parse::<f64>().ok().map(CssUnit::Rem)
         } else if let Some(em_val) = value.strip_suffix("em") {
             em_val.trim().parse::<f64>().ok().map(CssUnit::Em)
-        } else if let Some(vw_val) = value.strip_suffix("vw") {
-            vw_val.trim().parse::<f64>().ok().map(CssUnit::Vw)
-        } else if let Some(vh_val) = value.strip_suffix("vh") {
-            vh_val.trim().parse::<f64>().ok().map(CssUnit::Vh)
-        } else if let Some(vmin_val) = value.strip_suffix("vmin") {
-            vmin_val.trim().parse::<f64>().ok().map(CssUnit::Vmin)
-        } else if let Some(vmax_val) = value.strip_suffix("vmax") {
-            vmax_val.trim().parse::<f64>().ok().map(CssUnit::Vmax)
-        } else if let Some(pt_val) = value.strip_suffix("pt") {
-            pt_val.trim().parse::<f64>().ok().map(CssUnit::Pt)
         } else if let Some(dvw_val) = value
             .strip_suffix("dvw")
             .or_else(|| value.strip_suffix("svw"))
@@ -1691,6 +1735,16 @@ impl CssUnit {
             .or_else(|| value.strip_suffix("lvh"))
         {
             dvh_val.trim().parse::<f64>().ok().map(CssUnit::Vh)
+        } else if let Some(vw_val) = value.strip_suffix("vw") {
+            vw_val.trim().parse::<f64>().ok().map(CssUnit::Vw)
+        } else if let Some(vh_val) = value.strip_suffix("vh") {
+            vh_val.trim().parse::<f64>().ok().map(CssUnit::Vh)
+        } else if let Some(vmin_val) = value.strip_suffix("vmin") {
+            vmin_val.trim().parse::<f64>().ok().map(CssUnit::Vmin)
+        } else if let Some(vmax_val) = value.strip_suffix("vmax") {
+            vmax_val.trim().parse::<f64>().ok().map(CssUnit::Vmax)
+        } else if let Some(pt_val) = value.strip_suffix("pt") {
+            pt_val.trim().parse::<f64>().ok().map(CssUnit::Pt)
         } else {
             value.parse::<f64>().ok().map(CssUnit::Pixels)
         }
@@ -2551,6 +2605,12 @@ fn resolve_var_recursive(
             output.push_str(&expanded);
         }
 
+        if output.len() > 65_536 {
+            // Chained `--a: var(--b) var(--b)` doubles per level; cap the
+            // expanded text so 16 levels cannot materialize hundreds of MB
+            // per element per cascade pass.
+            return None;
+        }
         remaining = &after[close + 1..];
     }
 
@@ -2720,6 +2780,16 @@ fn eval_math_expression_bounded(
         }
     }
 
+    if trimmed.starts_with("calc(")
+        || trimmed.starts_with("min(")
+        || trimmed.starts_with("max(")
+        || trimmed.starts_with("clamp(")
+    {
+        // Malformed math (wrong arg count / unbalanced parens): fail closed.
+        // Re-parsing through CssUnit::parse re-entered to_pixels at depth 0
+        // and recursed until the stack overflowed.
+        return None;
+    }
     CssUnit::parse(trimmed).map(|u| u.to_pixels_with_viewport(parent_size, root_size, vw, vh))
 }
 
@@ -2810,6 +2880,20 @@ fn eval_calc_terms(
     Some(total)
 }
 
+/// Find `op` at paren depth 0, ignoring nested parentheses.
+fn find_top_level_op(term: &str, op: char) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in term.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if c == op && depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn eval_single_calc_term(
     term: &str,
     parent_size: f64,
@@ -2825,12 +2909,17 @@ fn eval_single_calc_term(
     if term.is_empty() {
         return Some(0.0);
     }
-    if let Some((left, right)) = term.split_once('*') {
+    // Split on * / only at paren_depth==0 so "(2*3)" is not mangled.
+    if let Some(pos) = find_top_level_op(term, '*') {
+        let (left, right) = term.split_at(pos);
+        let right = &right[1..];
         let lv = eval_single_calc_term(left.trim(), parent_size, root_size, vw, vh, depth + 1)?;
         let rv = eval_single_calc_term(right.trim(), parent_size, root_size, vw, vh, depth + 1)?;
         return Some(lv * rv);
     }
-    if let Some((left, right)) = term.split_once('/') {
+    if let Some(pos) = find_top_level_op(term, '/') {
+        let (left, right) = term.split_at(pos);
+        let right = &right[1..];
         let lv = eval_single_calc_term(left.trim(), parent_size, root_size, vw, vh, depth + 1)?;
         let rv = eval_single_calc_term(right.trim(), parent_size, root_size, vw, vh, depth + 1)?;
         if rv != 0.0 {
@@ -3226,9 +3315,15 @@ fn parse_css_with_context(
     visited_imports: &mut HashSet<String>,
     layer_map: &mut HashMap<String, usize>,
 ) -> Vec<CssRule> {
-    if recursion_depth > 16 || css.len() > 10_000_000 {
+    if recursion_depth > 16 {
         return Vec::new();
     }
+    // Truncate instead of dropping all author style on oversized sheets.
+    let css = if css.len() > 10_000_000 {
+        &css[..10_000_000]
+    } else {
+        css
+    };
 
     let mut rules = Vec::new();
     let stripped = strip_css_comments(css);
@@ -3802,7 +3897,7 @@ pub fn compute_computed_style_full(
             origin: CssOrigin::Author,
             layer_order: None,
             specificity: (1, 0, 0),
-            source_order: usize::MAX - 1000 + idx,
+            source_order: (usize::MAX - 1_000).saturating_add(idx),
             is_inline: true,
         });
     }
@@ -3827,15 +3922,18 @@ pub fn compute_computed_style_full(
         rank_a.cmp(&rank_b)
     });
 
+    // Borrow custom properties once instead of cloning per declaration.
+    let custom_props = style.custom_properties.clone();
     for item in &matched_declarations {
         if item.decl.property.trim().starts_with("--") {
-            style.apply_declaration_resolved(item.decl, &style.custom_properties.clone());
+            style.apply_declaration_resolved(item.decl, &custom_props);
         }
     }
-
+    // Re-snapshot after custom props settled, then apply the rest.
+    let custom_props = style.custom_properties.clone();
     for item in &matched_declarations {
         if !item.decl.property.trim().starts_with("--") {
-            style.apply_declaration_resolved(item.decl, &style.custom_properties.clone());
+            style.apply_declaration_resolved(item.decl, &custom_props);
         }
     }
 

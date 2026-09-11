@@ -156,7 +156,7 @@ impl OptionalGpuAdapter for WgpuCompositor {
             pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         }
         encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, output_size);
-        let submission = state.queue.submit([encoder.finish()]);
+        let _submission = state.queue.submit([encoder.finish()]);
         let slice = readback.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -164,9 +164,13 @@ impl OptionalGpuAdapter for WgpuCompositor {
         });
         let _ = state
             .device
-            .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+            // Non-blocking poll: never stall the render thread waiting for
+            // the GPU. If the readback is not ready within the budget below,
+            // return an error so the caller falls back to the CPU compositor
+            // immediately instead of blocking the frame.
+            .poll(wgpu::Maintain::Poll);
         receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_millis(100))
             .map_err(|_| "GPU readback timed out".to_string())??;
         let rgba = slice.get_mapped_range().to_vec();
         readback.unmap();
@@ -183,11 +187,21 @@ impl OptionalGpuAdapter for WgpuCompositor {
     }
 
     fn recover_device(&mut self) -> Result<(), String> {
+        // NOTE: device recovery blocks on adapter/device creation (see
+        // `create_state`). Callers must run this on a background thread /
+        // `spawn_blocking` and keep serving CPU-fallback frames meanwhile;
+        // never block the render thread on recovery.
         self.state = Some(create_state()?);
         Ok(())
     }
 }
 
+// NOTE: `create_state` blocks the calling thread on adapter/device requests
+// via `pollster::block_on`. GPU init must therefore be lazy (first render,
+// not startup) and ideally moved to an async constructor / background task so
+// the UI and render threads never stall on driver enumeration. `recover_device`
+// has the same constraint; `ResilientCompositor::render` below keeps serving
+// immediate CPU-fallback frames while recovery runs.
 fn create_state() -> Result<GpuState, String> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,

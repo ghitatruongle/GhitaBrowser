@@ -114,12 +114,17 @@ impl ServiceWorkerContainer {
         }
         let scope = scope_url.path().to_string();
 
-        let mut reg = ServiceWorkerRegistration::new(script.as_str(), &scope);
-        // Automatically transition installing -> active for bounded offline app support
-        reg.transition_to(ServiceWorkerState::Active);
+        let reg = ServiceWorkerRegistration::new(script.as_str(), &scope);
+        // Spec-correct: stay Installing until explicit activate(). Auto-activation
+        // would let an unvetted worker intercept fetches immediately.
+        // Callers must drive Installing -> Installed -> Activating -> Active
+        // via `transition_to` after install checks pass.
 
         self.registrations.insert(scope.clone(), reg);
-        Ok(self.registrations.get(&scope).expect("inserted"))
+        Ok(self
+            .registrations
+            .get(&scope)
+            .ok_or_else(|| "InvalidStateError: registration vanished".to_string())?)
     }
 
     pub fn unregister(&mut self, scope: &str) -> bool {
@@ -139,7 +144,19 @@ impl ServiceWorkerContainer {
         }
         let mut best_match: Option<(&String, &ServiceWorkerRegistration)> = None;
         for (scope, reg) in &self.registrations {
-            if client.path().starts_with(scope) {
+            // Scope match requires exact match or boundary `/` so `/app`
+            // does not match `/application`. A scope ending in `/` matches
+            // any path beneath it.
+            let scope_match = if *scope == "/" {
+                client.path().starts_with('/')
+            } else if scope.ends_with('/') {
+                client.path() == *scope || client.path().starts_with(scope)
+            } else {
+                client.path() == *scope
+                    || client.path().starts_with(scope)
+                        && client.path()[scope.len()..].starts_with('/')
+            };
+            if scope_match {
                 if let Some((best_scope, _)) = best_match {
                     if scope.len() > best_scope.len() {
                         best_match = Some((scope, reg));
@@ -180,15 +197,31 @@ mod tests {
     #[test]
     fn sw_registration_and_lifecycle_transitions() {
         let mut container = ServiceWorkerContainer::new("https://example.com");
-        let reg = container
-            .register(
-                "https://example.com/sw.js",
-                Some(ServiceWorkerRegistrationOptions {
-                    scope: "/app/".to_string(),
-                }),
-            )
-            .unwrap();
+        let scope = {
+            let reg = container
+                .register(
+                    "https://example.com/sw.js",
+                    Some(ServiceWorkerRegistrationOptions {
+                        scope: "/app/".to_string(),
+                    }),
+                )
+                .unwrap();
 
+            assert_eq!(reg.state, ServiceWorkerState::Installing);
+            assert_eq!(
+                reg.installing_worker.as_deref(),
+                Some("https://example.com/sw.js")
+            );
+            reg.scope.clone()
+        };
+        // Drive explicit lifecycle: Installing -> Installed -> Activating -> Active.
+        {
+            let reg = container.registrations.get_mut(&scope).unwrap();
+            reg.transition_to(ServiceWorkerState::Installed);
+            reg.transition_to(ServiceWorkerState::Activating);
+            reg.transition_to(ServiceWorkerState::Active);
+        }
+        let reg = container.registrations.get(&scope).unwrap();
         assert_eq!(reg.state, ServiceWorkerState::Active);
         assert_eq!(
             reg.active_worker.as_deref(),
@@ -199,5 +232,16 @@ mod tests {
             .get_registration("https://example.com/app/dashboard")
             .unwrap();
         assert_eq!(found.scope, "/app/");
+        // Scope boundary: /app must not match /application.
+        assert!(
+            container
+                .get_registration("https://example.com/application")
+                .is_none()
+                || container
+                    .get_registration("https://example.com/application")
+                    .unwrap()
+                    .scope
+                    != "/app/"
+        );
     }
 }

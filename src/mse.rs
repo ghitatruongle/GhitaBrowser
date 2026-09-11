@@ -6,12 +6,14 @@
 
 use crate::iso_bmff::{parse_init_segment, parse_media_segment, TrackInfo};
 use crate::media_backend::DecoderCapabilities;
+// Total queued ENCODED bytes come from the shared budget module; encoded
+// queues are a distinct (denser, evictable) resource from decoded bytes.
+use crate::media_budget::MAX_MSE_QUEUED_ENCODED_BYTES as MAX_TOTAL_MEDIA_BYTES;
 use crate::media_core::{parse_media_type, EncodedSample, MediaContainer, ParsedMediaType};
 
 const MAX_SOURCE_BUFFERS: usize = 8;
 const MAX_SAMPLES_PER_BUFFER: usize = 100_000;
 const MAX_BYTES_PER_BUFFER: usize = 128 * 1024 * 1024;
-const MAX_TOTAL_MEDIA_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MEDIA_TIME_US: i64 = 24 * 60 * 60 * 1_000_000;
 const RANGE_GAP_TOLERANCE_US: i64 = 50_000;
 
@@ -220,6 +222,10 @@ impl SourceBuffer {
                 return Err("SourceBuffer memory budget exceeded".to_string());
             }
             let before = self.samples.len();
+            // Incremental byte accounting (mirrors evict_before): the old
+            // unconditional full-buffer re-sum made every append O(n) in
+            // the whole buffer.
+            let mut evicted_bytes = 0usize;
             self.samples.retain(|existing| {
                 if existing.track_id != sample.track_id {
                     return true;
@@ -227,11 +233,15 @@ impl SourceBuffer {
                 let existing_end = existing
                     .presentation_timestamp_us
                     .saturating_add(existing.duration_us as i64);
-                existing_end <= sample.presentation_timestamp_us
-                    || existing.presentation_timestamp_us >= end
+                let keep = existing_end <= sample.presentation_timestamp_us
+                    || existing.presentation_timestamp_us >= end;
+                if !keep {
+                    evicted_bytes += existing.data.len();
+                }
+                keep
             });
             report.evicted_samples += before - self.samples.len();
-            self.queued_bytes = self.samples.iter().map(|item| item.data.len()).sum();
+            self.queued_bytes = self.queued_bytes.saturating_sub(evicted_bytes);
             self.queued_bytes = self.queued_bytes.saturating_add(sample.data.len());
             self.samples.push(sample);
             report.appended_samples += 1;

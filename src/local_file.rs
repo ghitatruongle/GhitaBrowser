@@ -84,6 +84,7 @@ pub fn fetch_local_document(url_str: &str) -> Result<FetchResult, String> {
         headers: Default::default(),
         fetch_time_ms: start.elapsed().as_millis() as u64,
         set_cookie_headers: Vec::new(),
+        set_cookie_hosts: Vec::new(),
     })
 }
 

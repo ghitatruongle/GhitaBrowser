@@ -82,22 +82,44 @@ fn public_suffix_label_count(labels: &[&str]) -> usize {
     1
 }
 
+/// Split `domain` into labels, fail-closed on empty labels.
+///
+/// If an `idna` implementation is available, callers should convert the host
+/// with `idna::domain_to_ascii` (UTS-46) before calling this function so the
+/// Public Suffix List (ASCII-only) lookup sees punycode. This crate has no
+/// `idna` dependency, so the fallback here is ASCII-lowercase plus strict
+/// rejection: `example..com`, `.example.com` or `example.com.`-internal
+/// empties return `None` instead of collapsing to `example.com`.
 fn normalized_labels(domain: &str) -> Option<Vec<&str>> {
+    // NOTE: when adding an `idna` dependency, convert with
+    // `idna::domain_to_ascii` (UTS-46) here so the ASCII-only PSL sees
+    // punycode. Until then the fallback is ASCII-lowercase (in callers)
+    // plus strict empty-label rejection below.
     let domain = domain.trim().trim_end_matches('.');
     if domain.is_empty() {
         return None;
     }
-    Some(
-        domain
-            .split('.')
-            .map(str::trim)
-            .filter(|label| !label.is_empty())
-            .collect(),
-    )
+    let mut labels = Vec::new();
+    for part in domain.split('.') {
+        let label = part.trim();
+        // Fail-closed: empty labels (from `..`, leading `.`, or
+        // whitespace-only labels) invalidate the whole host instead of
+        // being filtered out (so `example..com` yields None).
+        if label.is_empty() {
+            return None;
+        }
+        labels.push(label);
+    }
+    if labels.is_empty() {
+        return None;
+    }
+    Some(labels)
 }
 
 /// True when `domain` is itself a public suffix (e.g. `com`, `co.uk`,
 /// `github.io`). Unknown single-label TLDs count as public suffixes.
+/// Hosts with empty labels (`example..com`) are rejected fail-closed
+/// (`false`) via [`normalized_labels`] instead of collapsing.
 pub fn is_public_suffix(domain: &str) -> bool {
     let Some(labels) = normalized_labels(domain) else {
         return false;
@@ -109,7 +131,8 @@ pub fn is_public_suffix(domain: &str) -> bool {
 
 /// The registrable domain (eTLD+1) of `host`, or `None` when the host is
 /// entirely a public suffix. Falls back to `None` rather than guessing so
-/// callers can fail closed.
+/// callers can fail closed. Hosts with empty labels (`example..com`)
+/// return `None` instead of collapsing to the normalized form.
 pub fn registrable_domain(host: &str) -> Option<String> {
     let labels = normalized_labels(host)?;
     let lowered: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();

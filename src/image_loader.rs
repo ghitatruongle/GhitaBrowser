@@ -137,16 +137,19 @@ impl ImageCache {
         // fetching the same image) must not double-count its size or entry
         // count: subtract the old entry first, and only bump the count for a
         // genuinely new URL.
-        if let Some(old) = self.decoded.get(&url) {
+        // Drop any stale entry for this URL FIRST: leaving it in the map
+        // let the eviction below subtract its size a second time and
+        // decrement the count for an entry about to be re-inserted.
+        if let Some(old) = self.decoded.remove(&url) {
             self.current_size = self.current_size.saturating_sub(old.rgba_pixels.len());
-        } else {
-            self.decoded_count += 1;
+            self.decoded_count = self.decoded_count.saturating_sub(1);
         }
         // Evict if needed
         self.evict_for_space(size);
         // Evict if we've exceeded max decoded images
         self.evict_for_count();
         self.current_size += size;
+        self.decoded_count += 1;
         self.decoded.insert(url.clone(), data.clone());
         self.last_access.insert(url.clone(), Instant::now());
         // Update metadata
@@ -439,7 +442,25 @@ pub fn fetch_and_decode_image(url: &str) -> anyhow::Result<ImageData> {
         }
         bytes
     } else if let Some(path) = url.strip_prefix("file://") {
-        std::fs::read(path)?
+        const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+        // Bound local files like remote ones and refuse symlinks: a crafted
+        // src could otherwise pull an unbounded file or escape via a link to
+        // a sensitive path; the decode stage still caps dimensions/pixels.
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| anyhow::anyhow!("Cannot stat local image: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(anyhow::anyhow!("Refusing to load symlinked image file"));
+        }
+        if !metadata.is_file() {
+            return Err(anyhow::anyhow!("Local image path is not a file"));
+        }
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return Err(anyhow::anyhow!("Image exceeds the 50MB download limit"));
+        }
+        bytes
     } else {
         return Err(anyhow::anyhow!("Unsupported image URL scheme: {}", url));
     };
@@ -481,7 +502,13 @@ fn decode_image_bytes(url: &str, bytes: Vec<u8>) -> anyhow::Result<ImageData> {
     let dims = image::io::Reader::new(std::io::Cursor::new(&bytes)).with_guessed_format()?;
     let (w, h) = dims.into_dimensions()?;
     const MAX_IMAGE_DIMENSION: u32 = 8192;
-    if w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION {
+    // Pixel ceiling too: 8192^2 RGBA is ~268 MB per image, so a few-KB
+    // solid-color PNG could still OOM the decode pool.
+    const MAX_IMAGE_PIXELS: u64 = 16_777_216;
+    if w > MAX_IMAGE_DIMENSION
+        || h > MAX_IMAGE_DIMENSION
+        || (w as u64) * (h as u64) > MAX_IMAGE_PIXELS
+    {
         return Err(anyhow::anyhow!(
             "Image dimensions {}x{} exceed the {}px limit",
             w,

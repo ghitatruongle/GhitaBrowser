@@ -541,7 +541,9 @@ impl IDBDatabase {
         let store = IDBObjectStore::new(store_name.clone(), key_path, auto_increment);
         self.object_stores.insert(store_name.clone(), store);
         self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
-        Ok(self.object_stores.get_mut(&store_name).expect("inserted"))
+        self.object_stores
+            .get_mut(&store_name)
+            .ok_or_else(|| "InvalidStateError: object store vanished after insert".to_string())
     }
 
     pub fn delete_object_store(&mut self, name: &str) -> bool {
@@ -628,7 +630,10 @@ impl IndexedDBEngine {
                 .insert(name.to_string(), IDBDatabase::new(name, target_version));
         }
 
-        let db = self.databases.get_mut(name).expect("db exists");
+        let db = self
+            .databases
+            .get_mut(name)
+            .ok_or_else(|| "InvalidStateError: database vanished after insert".to_string())?;
         if is_new_or_upgrade && db.version != target_version {
             db.version = target_version;
             db.mutation_epoch = db.mutation_epoch.wrapping_add(1);

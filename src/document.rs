@@ -86,6 +86,8 @@ fn prepare_document_impl(
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| fallback_title.to_string());
     let style_start = Instant::now();
+    // Single clone of the caller-borrowed slice; inline `<style>` rules are
+    // appended in place so no second full copy is made.
     let mut all_rules = base_rules.to_vec();
     for style in dom.find_all_tags("style") {
         if !style.text.trim().is_empty() {
@@ -103,6 +105,9 @@ fn prepare_document_impl(
     // accessibility output. Later live mutations use the same refresh path.
     let live = crate::live_dom::LiveDocument::from_element(&dom, all_rules, viewport_width);
     let live_render = live.render_state();
+    // Three clones (dom/accessibility/layout) are intentional: `live` owns the
+    // retained render snapshot and is dropped at scope end, so the prepared
+    // document must take its own copies. Each field is cloned exactly once.
     let dom = live_render.dom.clone();
     let accessibility = live_render.accessibility.clone();
     let layout = live_render.layout.clone();
@@ -147,6 +152,7 @@ pub fn prepare_live_document(
 ) -> crate::live_dom::LiveDocument {
     let mut dom = parser::parse_html(html);
     let _runtime = crate::web_runtime::run_inline_scripts(&mut dom, base_url);
+    // Single clone of the borrowed base rules; style-tag rules extend in place.
     let mut rules = base_rules.to_vec();
     for style in dom.find_all_tags("style") {
         if !style.text.trim().is_empty() {
@@ -160,7 +166,15 @@ pub fn prepare_live_document(
 }
 
 fn count_dom_nodes(element: &Element) -> usize {
-    1 + element.children.iter().map(count_dom_nodes).sum::<usize>()
+    // Iterative pre-order walk: recursion here overflowed the stack on deep
+    // attacker-controlled DOMs.
+    let mut count = 0usize;
+    let mut stack: Vec<&Element> = vec![element];
+    while let Some(current) = stack.pop() {
+        count = count.saturating_add(1);
+        stack.extend(current.children.iter());
+    }
+    count
 }
 
 #[cfg(test)]

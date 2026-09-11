@@ -8,6 +8,15 @@ use std::collections::HashMap;
 // parsed tree below 128 levels prevents hostile markup from exhausting the
 // default worker-thread stack while preserving deeply nested real documents.
 pub const MAX_DOM_DEPTH: usize = 64;
+/// Maximum HTML input accepted by the parser (10 MiB). Larger documents are
+/// truncated so the `Vec<char>` duplication cannot OOM the tab process.
+pub const MAX_HTML_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum attributes per element and per name/value length.
+pub const MAX_ATTRS_PER_ELEMENT: usize = 128;
+pub const MAX_ATTR_NAME_LEN: usize = 128;
+pub const MAX_ATTR_VALUE_LEN: usize = 64 * 1024;
+/// Maximum raw-text capture (unterminated <script>/<style>) before truncate.
+pub const MAX_RAW_TEXT_LEN: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Element {
@@ -47,52 +56,66 @@ impl Element {
         self.children.push(child);
     }
 
-    /// Find element by tag recursively (first match)
+    /// Find element by tag recursively (first match) — iterative to avoid
+    /// stack overflow on hostile deep trees.
     pub fn find_tag(&self, tag: &str) -> Option<&Element> {
-        if self.tag == tag {
-            return Some(self);
-        }
-        for child in &self.children {
-            if let Some(found) = child.find_tag(tag) {
-                return Some(found);
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            if node.tag == tag {
+                return Some(node);
+            }
+            for child in node.children.iter().rev() {
+                stack.push(child);
             }
         }
         None
     }
 
-    /// Find all elements matching tag recursively
+    /// Find all elements matching tag recursively — iterative.
     pub fn find_all_tags(&self, tag: &str) -> Vec<&Element> {
         let mut results = Vec::new();
-        if self.tag == tag {
-            results.push(self);
-        }
-        for child in &self.children {
-            results.extend(child.find_all_tags(tag));
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            if node.tag == tag {
+                results.push(node);
+            }
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
         results
     }
 
-    /// Get element text content recursively
+    /// Get element text content — iterative with pre-sized buffer.
     pub fn text_content(&self) -> String {
         let mut result = String::new();
-        if !self.text.is_empty() {
-            result.push_str(&self.text);
+        let mut stack = vec![self];
+        // Pre-order walk that preserves document order without recursion.
+        let mut ordered: Vec<&Element> = Vec::new();
+        while let Some(node) = stack.pop() {
+            ordered.push(node);
+            for child in node.children.iter().rev() {
+                stack.push(child);
+            }
         }
-        for child in &self.children {
-            let child_text = child.text_content();
-            if child_text.is_empty() {
+        // `ordered` is root-first; text must be concatenated in DFS order.
+        // The stack above already yields DFS pre-order, so iterate in the
+        // order visited (reverse of push order handled above).
+        // NOTE: `ordered` currently holds pre-order; children were pushed
+        // reversed so popping yields document order.
+        for node in ordered {
+            // Only append each node's own text once; child texts are separate
+            // entries in `ordered`, avoiding the old O(n·depth) re-walk.
+            if node.text.is_empty() {
                 continue;
             }
-            // Text runs are stored trimmed, so adjacent runs would fuse
-            // words ("Hello <b>World</b>" -> "HelloWorld") without a
-            // separating space at element boundaries.
-            let needs_space = !result.is_empty()
+            if !result.is_empty()
                 && !result.ends_with(char::is_whitespace)
-                && !child_text.starts_with(char::is_whitespace);
-            if needs_space {
+                && !node.text.starts_with(char::is_whitespace)
+            {
                 result.push(' ');
             }
-            result.push_str(&child_text);
+            result.push_str(&node.text);
         }
         result
     }
@@ -191,6 +214,10 @@ fn decode_html_entities(text: &str) -> String {
                             // Try numeric character reference
                             if let Some(hex) = entity.strip_prefix("#x") {
                                 if let Ok(codepoint) = u32::from_str_radix(hex, 16) {
+                                    // HTML5 maps NUL (and other noncharacters)
+                                    // to U+FFFD: a literal NUL in DOM strings
+                                    // poisons any NUL-terminated bridge.
+                                    let codepoint = if codepoint == 0 { 0xFFFD } else { codepoint };
                                     if let Some(c) = char::from_u32(codepoint) {
                                         c.to_string()
                                     } else {
@@ -310,6 +337,12 @@ fn should_auto_close_parent(parent_tag: &str, child_tag: &str) -> bool {
 
 /// Improved HTML parser with error recovery and raw text support
 pub fn parse_html(html: &str) -> Element {
+    // Bound input before the 4x `Vec<char>` duplication.
+    let html = if html.len() > MAX_HTML_BYTES {
+        &html[..MAX_HTML_BYTES]
+    } else {
+        html
+    };
     let html = html.trim();
     if html.is_empty() {
         let mut body = Element::new("body");
@@ -354,14 +387,17 @@ pub fn parse_html(html: &str) -> Element {
                         if stack[depth].tag == close_tag {
                             // Pop elements down to and including the match
                             while stack.len() > depth + 1 {
-                                let completed = stack.pop().unwrap();
+                                let Some(completed) = stack.pop() else {
+                                    break;
+                                };
                                 if let Some(parent) = stack.last_mut() {
                                     parent.add_child(completed);
                                 }
                             }
-                            let completed = stack.pop().unwrap();
-                            if let Some(parent) = stack.last_mut() {
-                                parent.add_child(completed);
+                            if let Some(completed) = stack.pop() {
+                                if let Some(parent) = stack.last_mut() {
+                                    parent.add_child(completed);
+                                }
                             }
                             found = true;
                             break;
@@ -375,14 +411,28 @@ pub fn parse_html(html: &str) -> Element {
             } else if pos + 1 < len && (chars[pos + 1] == '!' || chars[pos + 1] == '?') {
                 // Comment or doctype or processing instruction
                 if chars_match_ci_at(&chars, pos, "<!--") {
-                    // HTML comment: skip until -->
+                    // HTML comment: skip until -->. "<!-->" and "<!--->"
+                    // are complete EMPTY comments per HTML5 - only skip a
+                    // "-->" that is actually at the scan position, otherwise
+                    // the old unconditional +3 ate the rest of the document.
                     pos += 4;
-                    while pos + 2 < len
-                        && !(chars[pos] == '-' && chars[pos + 1] == '-' && chars[pos + 2] == '>')
-                    {
+                    if pos < len && chars[pos] == '>' {
+                        // "<!-->" is a complete empty comment.
                         pos += 1;
+                    } else {
+                        while pos + 2 < len
+                            && !(chars[pos] == '-'
+                                && chars[pos + 1] == '-'
+                                && chars[pos + 2] == '>')
+                        {
+                            pos += 1;
+                        }
+                        if pos + 2 < len {
+                            pos += 3;
+                        } else {
+                            pos = len;
+                        }
                     }
-                    pos += 3; // skip -->
                 } else if chars_match_ci_at(&chars, pos, "<!doctype") {
                     // DOCTYPE: skip until >
                     while pos < len && chars[pos] != '>' {
@@ -458,18 +508,47 @@ pub fn parse_html(html: &str) -> Element {
                         break;
                     }
 
-                    // Attribute name
+                    // Attribute name. '<' also terminates it: `<div<p>`
+                    // must open a nested <p>, not swallow it as an
+                    // attribute named "<p".
                     let k_start = pos;
                     while pos < len
                         && chars[pos] != '='
                         && chars[pos] != '>'
                         && chars[pos] != '/'
+                        && chars[pos] != '<'
                         && !chars[pos].is_whitespace()
                     {
                         pos += 1;
                     }
+                    if pos < len && chars[pos] == '<' {
+                        // `<div<p>`: the name scan stopped at a tag-open;
+                        // end the attribute list so `<p>` parses as a child.
+                        break;
+                    }
                     let mut key: String = chars[k_start..pos].iter().collect();
                     key = key.to_lowercase();
+                    // Bound attribute names; oversized names are dropped.
+                    if key.len() > MAX_ATTR_NAME_LEN {
+                        // Skip its value then continue.
+                        while pos < len && chars[pos] != '>' && chars[pos] != '/' {
+                            if chars[pos] == '"' || chars[pos] == '\'' {
+                                let q = chars[pos];
+                                pos += 1;
+                                while pos < len && chars[pos] != q {
+                                    pos += 1;
+                                }
+                                if pos < len {
+                                    pos += 1;
+                                }
+                            } else if chars[pos].is_whitespace() {
+                                break;
+                            } else {
+                                pos += 1;
+                            }
+                        }
+                        continue;
+                    }
 
                     // Skip whitespace before =
                     while pos < len && chars[pos].is_whitespace() {
@@ -485,14 +564,29 @@ pub fn parse_html(html: &str) -> Element {
                         }
 
                         if pos < len && (chars[pos] == '"' || chars[pos] == '\'') {
-                            // Quoted attribute value
+                            // Quoted attribute value (bounded: unterminated
+                            // quotes cannot swallow the rest of the document).
                             let quote = chars[pos];
                             pos += 1;
                             let v_start = pos;
-                            while pos < len && chars[pos] != quote {
+                            let mut v_len = 0usize;
+                            while pos < len && chars[pos] != quote && v_len < MAX_ATTR_VALUE_LEN {
                                 pos += 1;
+                                v_len += 1;
                             }
                             val = chars[v_start..pos].iter().collect();
+                            // If we stopped on the length cap, skip to the
+                            // closing quote so parsing stays in sync.
+                            while pos < len && chars[pos] != quote && chars[pos] != '>' {
+                                // Avoid O(n^2) on hostile 10MB no-close values:
+                                // jump to the next quote or '>' in bulk.
+                                let mut next = pos + 1;
+                                while next < len && chars[next] != quote && chars[next] != '>' {
+                                    next += 1;
+                                }
+                                pos = next;
+                                break;
+                            }
                             if pos < len && chars[pos] == quote {
                                 pos += 1;
                             }
@@ -502,8 +596,14 @@ pub fn parse_html(html: &str) -> Element {
                             // only a self-closing marker when it is the last
                             // char before the '>'.
                             let v_start = pos;
-                            while pos < len && !chars[pos].is_whitespace() && chars[pos] != '>' {
+                            let mut v_len = 0usize;
+                            while pos < len
+                                && !chars[pos].is_whitespace()
+                                && chars[pos] != '>'
+                                && v_len < MAX_ATTR_VALUE_LEN
+                            {
                                 pos += 1;
+                                v_len += 1;
                             }
                             val = chars[v_start..pos].iter().collect();
                         }
@@ -512,7 +612,11 @@ pub fn parse_html(html: &str) -> Element {
                     }
                     // Boolean attribute (no =value)
                     if !key.is_empty() {
-                        elem.add_attr(&key, &val);
+                        if elem.attrs.len() >= MAX_ATTRS_PER_ELEMENT {
+                            // Drop excess attributes; keep parsing in sync.
+                        } else {
+                            elem.add_attr(&key, &val);
+                        }
                     }
                 }
 
@@ -530,11 +634,17 @@ pub fn parse_html(html: &str) -> Element {
                         pos = j;
                     }
                 }
-                while pos < len && chars[pos] != '>' {
-                    pos += 1;
-                }
-                if pos < len && chars[pos] == '>' {
-                    pos += 1;
+                if pos < len && chars[pos] == '<' {
+                    // The attribute scan stopped at a tag-open (`<div<p>`):
+                    // end THIS tag here and let the main loop parse `<p>` as
+                    // a child instead of skipping to the next '>'.
+                } else {
+                    while pos < len && chars[pos] != '>' {
+                        pos += 1;
+                    }
+                    if pos < len && chars[pos] == '>' {
+                        pos += 1;
+                    }
                 }
 
                 let is_void = is_void_tag(&tag_name);
@@ -544,9 +654,13 @@ pub fn parse_html(html: &str) -> Element {
                 // that must close (e.g. `<p><a><p>` closes <a> then <p>).
                 if !elem.is_void && stack.len() > 1 {
                     while stack.len() > 1
-                        && should_auto_close_parent(&stack.last().unwrap().tag, &tag_name)
+                        && stack
+                            .last()
+                            .is_some_and(|parent| should_auto_close_parent(&parent.tag, &tag_name))
                     {
-                        let completed = stack.pop().unwrap();
+                        let Some(completed) = stack.pop() else {
+                            break;
+                        };
                         if let Some(parent) = stack.last_mut() {
                             parent.add_child(completed);
                         }
@@ -583,13 +697,18 @@ pub fn parse_html(html: &str) -> Element {
 
                     match end_pos {
                         Some(end) => {
-                            let raw_text: String = chars[pos..end].iter().collect();
+                            let mut raw_text: String = chars[pos..end].iter().collect();
+                            if raw_text.len() > MAX_RAW_TEXT_LEN {
+                                raw_text.truncate(MAX_RAW_TEXT_LEN);
+                            }
                             elem.text = raw_text;
                             pos = end + close_len;
                         }
                         None => {
-                            // No closing tag: consume the rest as raw text
-                            let raw_text: String = chars[pos..len].iter().collect();
+                            // No closing tag: consume the rest as raw text,
+                            // capped so an unterminated <script> cannot OOM.
+                            let end = (pos + MAX_RAW_TEXT_LEN).min(len);
+                            let raw_text: String = chars[pos..end].iter().collect();
                             elem.text = raw_text;
                             pos = len;
                         }
@@ -635,7 +754,9 @@ pub fn parse_html(html: &str) -> Element {
 
     // Close all remaining open elements
     while stack.len() > 1 {
-        let completed = stack.pop().unwrap();
+        let Some(completed) = stack.pop() else {
+            break;
+        };
         if let Some(parent) = stack.last_mut() {
             parent.add_child(completed);
         }

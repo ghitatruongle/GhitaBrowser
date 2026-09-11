@@ -41,6 +41,7 @@ pub mod layout;
 pub mod live_dom;
 pub mod local_file;
 pub mod media_backend;
+pub mod media_budget;
 pub mod media_core;
 pub mod media_runtime;
 pub mod media_saver;
@@ -428,6 +429,11 @@ impl Browser {
             | https_upgrade::HttpsUpgradeResult::NonHttpScheme { url }
             | https_upgrade::HttpsUpgradeResult::ExemptLocal { url }
             | https_upgrade::HttpsUpgradeResult::InsecureAllowed { url } => url,
+            // Fail-closed: unparseable or explicitly blocked URLs never fall
+            // back to the raw insecure input for fetching. Surface a safe
+            // empty navigation instead of attempting the invalid URL.
+            https_upgrade::HttpsUpgradeResult::Invalid { .. }
+            | https_upgrade::HttpsUpgradeResult::InsecureBlocked { .. } => String::new(),
         }
     }
 
@@ -474,6 +480,12 @@ impl Browser {
     }
 
     /// Load a URL: fetch, parse, style, layout, render
+    ///
+    /// DEPRECATED for UI paths: this performs blocking network fetch plus a
+    /// synchronous CSS fetch loop on the caller (today: the UI thread). New
+    /// code should use `network_scheduler::fetch_document_bundle` (async,
+    /// cancellable, budgeted) followed by the worker document preparation,
+    /// keeping `Browser::load_url` for headless/tests only.
     pub fn load_url(&mut self, url: &str) -> Result<String, String> {
         let secure_url = self.secure_navigation_url(url);
         let url = secure_url.as_str();
@@ -790,7 +802,7 @@ impl Browser {
                 Some(t.id) != active_id
                     && t.can_sleep()
                     && t.seconds_since_active() >= sleep_delay_seconds
-                    && t.seconds_since_active() as u32 >= threshold_minutes * 60
+                    && t.seconds_since_active() as u32 >= threshold_minutes.saturating_mul(60)
             })
             .max_by_key(|t| t.seconds_since_active());
 
@@ -1015,9 +1027,16 @@ fn extract_title_from_dom(dom: &Element) -> String {
     "Untitled Page".to_string()
 }
 
-/// Count total elements in DOM tree
+/// Count total elements in DOM tree (iterative: deep pages must not overflow
+/// the stack via recursion).
 fn count_elements(element: &Element) -> usize {
-    1 + element.children.iter().map(count_elements).sum::<usize>()
+    let mut count = 0usize;
+    let mut stack: Vec<&Element> = vec![element];
+    while let Some(node) = stack.pop() {
+        count = count.saturating_add(1);
+        stack.extend(node.children.iter());
+    }
+    count
 }
 
 /// Resolve a relative URL against a base URL
@@ -1040,13 +1059,18 @@ fn resolve_url(base: &str, relative: &str) -> String {
         }
     }
 
-    // Fallback: simple string concatenation
+    // Fallback: simple string concatenation (panic-free: `strip_suffix`/`get`
+    // are used instead of raw slicing so malformed bases degrade to a
+    // best-effort join rather than panicking).
     let base_without_query = base.split('?').next().unwrap_or(base);
     let base_path = base_without_query
         .rsplit('/')
         .next()
         .unwrap_or(base_without_query);
-    let base_dir = &base[..base_without_query.len() - base_path.len()];
+    let base_dir = base_without_query
+        .strip_suffix(base_path)
+        .and_then(|dir| base.get(..dir.len()))
+        .unwrap_or(base_without_query);
 
     if relative.starts_with('/') {
         // Absolute path - extract origin from base

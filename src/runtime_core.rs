@@ -328,6 +328,11 @@ pub struct QueuedJob {
     sequence: u64,
 }
 
+/// Cap on consecutive microtasks returned by [`AgentEventLoop::pop_next_ready`]
+/// before a ready macrotask is interleaved. Without this, a script that
+/// re-queues a microtask on every turn starves timers/networking forever.
+const MAX_MICROTASKS_PER_TURN: usize = 100;
+
 #[derive(Debug)]
 pub struct AgentEventLoop {
     now_ms: u64,
@@ -337,6 +342,7 @@ pub struct AgentEventLoop {
     tasks: Vec<QueuedJob>,
     microtasks: VecDeque<QueuedJob>,
     truncated: bool,
+    consecutive_microtasks: usize,
 }
 
 impl AgentEventLoop {
@@ -349,6 +355,7 @@ impl AgentEventLoop {
             tasks: Vec::new(),
             microtasks: VecDeque::new(),
             truncated: false,
+            consecutive_microtasks: 0,
         }
     }
 
@@ -392,17 +399,30 @@ impl AgentEventLoop {
     }
 
     pub fn pop_next_ready(&mut self) -> Option<QueuedJob> {
+        // Microtask starvation guard: after MAX_MICROTASKS_PER_TURN consecutive
+        // microtasks, give a ready macrotask a turn if one exists.
+        if self.consecutive_microtasks >= MAX_MICROTASKS_PER_TURN {
+            if let Some(index) = self.ready_task_index() {
+                self.consecutive_microtasks = 0;
+                return Some(self.tasks.remove(index));
+            }
+        }
         if let Some(microtask) = self.microtasks.pop_front() {
+            self.consecutive_microtasks = self.consecutive_microtasks.saturating_add(1);
             return Some(microtask);
         }
-        let index = self
-            .tasks
+        let index = self.ready_task_index()?;
+        self.consecutive_microtasks = 0;
+        Some(self.tasks.remove(index))
+    }
+
+    fn ready_task_index(&self) -> Option<usize> {
+        self.tasks
             .iter()
             .enumerate()
             .filter(|(_, task)| task.due_ms <= self.now_ms)
             .min_by_key(|(_, task)| (task.due_ms, task.sequence))
-            .map(|(index, _)| index)?;
-        Some(self.tasks.remove(index))
+            .map(|(index, _)| index)
     }
 
     pub fn pending_len(&self) -> usize {
@@ -456,8 +476,30 @@ impl ExecutionBudget {
         self.call_depth = self.call_depth.saturating_sub(1);
     }
 
+    /// RAII variant of [`Self::enter_call`]: the returned guard calls
+    /// [`Self::exit_call`] on drop, so early `return Err(..)` paths cannot
+    /// leak call depth and permanently shrink the budget (enter/exit
+    /// asymmetry). Prefer this over manual enter/exit pairs.
+    pub fn enter_guarded(&mut self) -> Result<CallGuard<'_>, String> {
+        self.enter_call()?;
+        Ok(CallGuard { budget: self })
+    }
+
     pub fn remaining_instructions(&self) -> u64 {
         self.remaining_instructions
+    }
+}
+
+/// Decrements the [`ExecutionBudget`] call depth when dropped, guaranteeing
+/// exit-on-error for instrumented calls.
+#[derive(Debug)]
+pub struct CallGuard<'a> {
+    budget: &'a mut ExecutionBudget,
+}
+
+impl Drop for CallGuard<'_> {
+    fn drop(&mut self) {
+        self.budget.exit_call();
     }
 }
 
@@ -489,6 +531,12 @@ impl RuntimeRealm {
     }
 
     pub fn collect_garbage(&mut self) -> usize {
+        // TODO: trace task/microtask callback roots as well as global/document.
+        // QueuedJob only stores callback ids today (not HeapHandles), so there
+        // is no handle to root; if callbacks ever retain heap objects, those
+        // handles must be appended here or GC can free live task state.
+        // Bound: queues are capped by max_tasks/max_microtasks, so unrooted
+        // task state is at most a bounded transient leak, not unbounded growth.
         self.heap.collect_garbage(&[self.global, self.document])
     }
 }
