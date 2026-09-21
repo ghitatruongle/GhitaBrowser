@@ -126,7 +126,7 @@ impl CanvasFingerprintProtector {
                 if mixed != 0 {
                     return mixed;
                 }
-                return 0x9E37_79B9;
+                0x9E37_79B9
             }
             #[cfg(not(windows))]
             {

@@ -18,7 +18,7 @@ fn third_party_cookie_blocking_isolation() {
 
 #[test]
 fn canvas_fingerprint_noise_injection_preserves_alpha() {
-    let mut protector = CanvasFingerprintProtector::new(true);
+    let mut protector = CanvasFingerprintProtector::new_for_tests(true, 42);
 
     // Create 100 RGBA pixels
     let mut buffer = vec![128u8; 400];

@@ -3,30 +3,68 @@
 # ============================================================
 
 # ── Rust / Cargo ─────────────────────────────────────────────
+target/
 /target/
 **/*.rs.bk
 *.bk
 Cargo.lock.bk
 *.rmeta
+*.rlib
 *.d
+*.ll
+*.bc
+*.s
+cargo-timing*.html
+.cargo-ok
 
 # ── Distribution & Packaging ────────────────────────────────
+dist/
 /dist/
+portable/
 /portable/
+installer-output/
+/installer-output/
+Output/
+packaging/Output/
+*.iss.bak
 *.exe
 *.msi
+*.msix
+*.appx
+*.appxbundle
+*.msixbundle
+
+# Archives
 *.zip
+*.tar
 *.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.7z
+*.rar
+
+# Checksums & Digests
 *.sha256
-*.iss.bak
+*.sha256.txt
+*.sha512
+*.sha512.txt
+*.md5
 
-# ── Generated release-gate evidence ─────────────────────────
-# Produced by tools/make-source-manifest.ps1; the tool itself
-# excludes these outputs from the frozen source manifest.
-phase29-freeze.json
-phase29-freeze.json.sha256.txt
+# ── Generated release-gate evidence & reports ───────────────
+# Produced by tools/make-source-manifest.ps1 and validation gates;
+# excluded from frozen source manifests and git tracking.
+phase*-freeze.json
+phase*-freeze.json.sha256.txt
+phase*-report.json
+phase*-clean-vm-report.json
+*-release-smoke-*.json
+personal-release-smoke-*.json
+acceptance-report*.json
+build-metrics/
+*-gate-report.json
 
-# ── Binaries & Native Libraries ─────────────────────────────
+# ── Binaries, Native Libraries & Linker Artifacts ───────────
 *.dll
 *.so
 *.dylib
@@ -36,28 +74,80 @@ phase29-freeze.json.sha256.txt
 *.a
 *.o
 *.obj
+*.ilk
+*.idb
+*.map
+*.def
+*.node
 
-# ── Data, Cache & User State ────────────────────────────────
+# ── Windows Resource Build Artifacts ───────────────────────
+*.res
+*.rc.bak
+
+# ── Browser Runtime Data, Cache & User State ────────────────
+user_data/
 /user_data/
+.ghitabrowser_data/
+/.ghitabrowser_data/
+cache/
 /cache/
+downloads/
 /downloads/
+storage/
+/storage/
+local_storage/
+indexeddb/
+sessions/
+cookies/
+blob_storage/
+
+# Databases & WAL files
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
+*.sqlite3
 *.db
 *.db-shm
 *.db-wal
 *.db-journal
+*.db3
 
-# ── Environment & Secrets ───────────────────────────────────
+# Incomplete / Temp Downloads
+*.crdownload
+*.part
+*.download
+
+# Crash Dumps & Minidumps
+*.dmp
+*.dump
+crashdump/
+minidump/
+Crashpad/
+
+# ── Environment, Secrets & Cryptographic Keys ───────────────
 .env
 .env.*
 !.env.example
+
+keys/
+/keys/
 *.pem
 *.key
 *.p12
 *.pfx
+*.cer
+*.crt
+*.der
+*.asc
+*.gpg
+*.sig
+*private-key*.txt
+*private_key*.txt
+*.secret
+*.token
+secrets.json
+credentials.json
 
 # ── Logs & Temporary Files ──────────────────────────────────
 *.log
@@ -66,71 +156,136 @@ phase29-freeze.json.sha256.txt
 *.bak
 *.orig
 *.rej
+*.old
+*~
+crash-*.log
+
+# Package manager logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-crash-*.log
+pnpm-debug.log*
+lerna-debug.log*
 
-# ── IDE & Editor ────────────────────────────────────────────
+# Process runtime locks
+*.pid
+*.seed
+*.pid.lock
+
+# ── IDE & Editor Settings ───────────────────────────────────
+# JetBrains
 .idea/
 *.iml
+*.iws
+*.ipr
+cmake-build-*/
+.fleet/
+
+# Visual Studio / Visual Studio Code
 .vscode/
 .vs/
-.zed/
-*.swp
-*.swo
-*~
 *.code-workspace
 *.sln
 *.vcxproj
 *.vcxproj.*
 *.suo
 *.user
+*.userosv
+VisualStateManager/
 
-# ── OS Generated ────────────────────────────────────────────
-.DS_Store
+# Zed
+.zed/
+
+# Vim & Emacs
+*.swp
+*.swo
+*.swn
+*.swm
+.#*
+#*#
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Eclipse
+.project
+.classpath
+.settings/
+
+# ── Operating System Generated ──────────────────────────────
+# Windows
 Thumbs.db
+Thumbs.db:encryptable
 desktop.ini
 ehthumbs.db
 ehthumbs_vista.db
 $RECYCLE.BIN/
 *.lnk
-Icon?
 
-# ── Internal & Private (not for public distribution) ───────
-# AI-agent working/handoff documents and internal design docs.
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+Icon?
+Icon\r\r
+
+# Linux
+.directory
+.Trash-*
+.fuse_hidden*
+.nfs*
+
+# ── Internal, Private & AI Working Documents ────────────────
+# Internal handoff, review, and personal planning files.
 AI_HANDOFF/
 docs/
+COMPLETION_PLAN/
+QUY_TAC*
+PERSONAL_RELEASE_CHECKLIST*
+PERSONAL_CHECKLIST*
 
-# ── Tools & AI Agents ──────────────────────────────────────
-# Freebuff desktop app state (SQLite user database).
+# ── AI Agents & Local Developer Tools ───────────────────────
+# Freebuff desktop app state & assistant workspaces.
 .freebuff/
 .zcode/
 .history/
 .agents/
 .gemini/
-__pycache__/
-*.pyc
-*.pyo
+.claude/
+.cursor/
+.cursorrules.bak
+.windsurf/
+.copilot/
 sandbox/
 
-# ── Coverage, Profiling & Benchmarks ───────────────────────
+# ── Python Tools & Virtual Environments ─────────────────────
+# For utilities in tools/ (gen_wasm_fixtures.py, pack_ico.py, etc.)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+ENV/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── Code Coverage, Profiling & Benchmarks ───────────────────
+coverage/
 /coverage/
 *.profraw
 *.profdata
 lcov.info
-tarpaulin-report.html
+tarpaulin-report.*
+cobertura.xml
+criterion/
 /target/criterion/
-
-# ── Windows Resource Build Artifacts ───────────────────────
-*.res
-*.rc.bak
-
-# ── Completion Plan & Rules (AI working documents) ────────
-COMPLETION_PLAN/
-QUY_TAC
-keys/
-
-# ── Personal & Local-only Outputs ──────────────────────────
-PERSONAL_RELEASE_CHECKLIST.md
-/installer-output/

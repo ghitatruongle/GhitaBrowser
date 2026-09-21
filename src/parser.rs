@@ -578,14 +578,7 @@ pub fn parse_html(html: &str) -> Element {
                             // If we stopped on the length cap, skip to the
                             // closing quote so parsing stays in sync.
                             while pos < len && chars[pos] != quote && chars[pos] != '>' {
-                                // Avoid O(n^2) on hostile 10MB no-close values:
-                                // jump to the next quote or '>' in bulk.
-                                let mut next = pos + 1;
-                                while next < len && chars[next] != quote && chars[next] != '>' {
-                                    next += 1;
-                                }
-                                pos = next;
-                                break;
+                                pos += 1;
                             }
                             if pos < len && chars[pos] == quote {
                                 pos += 1;

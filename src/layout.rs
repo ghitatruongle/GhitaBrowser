@@ -487,6 +487,7 @@ fn resolve_box_dimension_signed(
     unit.map(|u| u.to_pixels(container_size, parent_font_size))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_layout_node(
     element: &Element,
     parent_style: Option<&ComputedStyle>,

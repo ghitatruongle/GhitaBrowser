@@ -3528,10 +3528,11 @@ impl GhitaBrowserApp {
                     }
                     let end = (index + MAX_CONCURRENT_IMAGES).min(pending_urls.len());
                     let mut set = tokio::task::JoinSet::new();
-                    for url in pending_urls[index..end].iter().cloned() {
+                    for url in &pending_urls[index..end] {
                         if cancel.is_cancelled() {
                             break;
                         }
+                        let url = url.clone();
                         set.spawn(async move {
                             crate::image_loader::fetch_and_decode_image_async(&url).await
                         });
@@ -3541,9 +3542,8 @@ impl GhitaBrowserApp {
                         if cancel.is_cancelled() {
                             break;
                         }
-                        match joined {
-                            Ok(Ok(image_data)) => loaded.push(image_data),
-                            _ => {}
+                        if let Ok(Ok(image_data)) = joined {
+                            loaded.push(image_data);
                         }
                     }
                     if cancel.is_cancelled() {

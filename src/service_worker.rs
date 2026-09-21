@@ -121,10 +121,9 @@ impl ServiceWorkerContainer {
         // via `transition_to` after install checks pass.
 
         self.registrations.insert(scope.clone(), reg);
-        Ok(self
-            .registrations
+        self.registrations
             .get(&scope)
-            .ok_or_else(|| "InvalidStateError: registration vanished".to_string())?)
+            .ok_or_else(|| "InvalidStateError: registration vanished".to_string())
     }
 
     pub fn unregister(&mut self, scope: &str) -> bool {

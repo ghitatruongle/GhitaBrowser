@@ -162,16 +162,32 @@ impl OptionalGpuAdapter for WgpuCompositor {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result.map_err(|error| error.to_string()));
         });
-        let _ = state
-            .device
-            // Non-blocking poll: never stall the render thread waiting for
-            // the GPU. If the readback is not ready within the budget below,
-            // return an error so the caller falls back to the CPU compositor
-            // immediately instead of blocking the frame.
-            .poll(wgpu::Maintain::Poll);
-        receiver
-            .recv_timeout(Duration::from_millis(100))
-            .map_err(|_| "GPU readback timed out".to_string())??;
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        // Non-blocking budget: never stall the render thread waiting for the
+        // GPU. If the readback is not ready within the deadline, return an
+        // error so the caller falls back to the CPU compositor immediately
+        // instead of blocking the frame. We keep polling until the deadline so
+        // the `map_async` callback is actively driven to completion — a single
+        // `Maintain::Poll` is not guaranteed to fire it under load, which made
+        // the readback intermittently time out even though the work was fine.
+        loop {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    result.map_err(|error| error.to_string())?;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("GPU readback channel closed".to_string());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("GPU readback timed out".to_string());
+                    }
+                    let _ = state.device.poll(wgpu::Maintain::Poll);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
         let rgba = slice.get_mapped_range().to_vec();
         readback.unmap();
         if state.faulted.load(Ordering::Acquire) {
